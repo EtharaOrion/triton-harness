@@ -101,3 +101,9 @@ Icon?
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# taskgen (triton/harness/src/taskgen)
+.taskgen_out/
+.venv-taskgen/
+src/taskgen/**/__pycache__/
+*.pyc

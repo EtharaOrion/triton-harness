@@ -1,0 +1,23 @@
+# Generation-time requirements for triton/harness/src/taskgen.
+#
+#   uv venv --python 3.12 .venv-taskgen
+#   VIRTUAL_ENV=.venv-taskgen uv pip install -r src/taskgen/requirements-dev.txt
+#
+# tree-sitter is PINNED, not floated. The harness parser under src/parser/ was
+# written against the 0.22.x Query.matches() contract; 0.24.0 is the newest
+# release that taskgen/_ts_compat.py is known to restore that contract for, and
+# tree_sitter_python 0.23.6 is the newest grammar wheel with an arm64 build that
+# links against it. Floating either one reintroduces
+# "AttributeError: 'list' object has no attribute 'text'" inside py_parser.
+tree_sitter==0.24.0
+tree_sitter_python==0.23.6
+
+# Undeclared import in triton/harness/src/parser/py_parser.py.
+tqdm
+
+# Required by harbor-tasks/shared/tooling/retrieval/dense_lsa.py (the seeded
+# randomized SVD behind the `embedding` and `mix` conditions).
+numpy
+
+# Unit tests only.
+pytest
