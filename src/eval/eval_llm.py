@@ -1,11 +1,28 @@
 import json
 import os
+import functools
 import pandas as pd
 import tqdm
 import time
 import argparse
+import tiktoken
 
-from AIClient import OpenAIClient, VertextAIClient, BaseAIClient
+from AIClient import OpenAIClient, VertextAIClient, BaseAIClient, AnthropicBridgeClient
+
+PROJECT_CONTEXT_TOKEN_LIMIT = 450000
+
+@functools.lru_cache(maxsize=1)
+def get_encoding():
+    return tiktoken.get_encoding("cl100k_base")
+
+def truncate_context(context, limit: int = PROJECT_CONTEXT_TOKEN_LIMIT):
+    encoding = get_encoding()
+    if isinstance(context, list):
+        return encoding.decode(context[:limit])
+    tokens = encoding.encode(context, disallowed_special=())
+    if len(tokens) <= limit:
+        return context
+    return encoding.decode(tokens[:limit])
 
 def check_response(response: dict):
     """
@@ -46,7 +63,7 @@ def build_final_prompt(context_type: str, query_data):
     query = query_data["comment"]
     task_id = query_data["task-id"]
     if context_type == "project":
-        return prompt_project_context.format(signature=signature, description=query, file_content=context_dict[task_id])
+        return prompt_project_context.format(signature=signature, description=query, file_content=truncate_context(context_dict[task_id]))
     elif context_type == "callee_func" or context_type == "callee_sig":
         return prompt_callee_context.format(signature=signature, description=query, callee_context=context_dict[task_id])
     elif context_type == "in_file":
@@ -55,6 +72,7 @@ def build_final_prompt(context_type: str, query_data):
     else:
         return prompt_no_context.format(signature=signature, description=query)
     
+@functools.lru_cache(maxsize=None)
 def load_context(context_type):
     if context_type == "no_context":
         return {}
@@ -64,9 +82,11 @@ def load_context(context_type):
     if context_type == "project":
         with open('../data/all_context_project_dict.json', 'r', encoding='utf-8') as f:
             project_context = json.load(f)
+        project_names = sorted(project_context.keys(), key=len, reverse=True)
         for k in all_context.keys():
-            project_name = k.split('-')[0]
-            result_context[k] = project_context[project_name]
+            pname = next((p for p in project_names if k.startswith(p)), None)
+            if pname is not None:
+                result_context[k] = project_context[pname]
     else:
         if context_type == "callee_func":
             key = "func"
@@ -77,7 +97,7 @@ def load_context(context_type):
         for k, v in all_context.items():
             result_context[k] = v[key]
     return result_context
-def eval_llm(llm: BaseAIClient, context_type: str, language_list: list):
+def eval_llm(llm: BaseAIClient, context_type: str, language_list: list, limit: int = 0):
     if context_type not in ["no_context", "callee_func", "callee_sig", "in_file", "project"]:
         raise NotImplementedError("Error context type")
     all_result = {}
@@ -85,6 +105,8 @@ def eval_llm(llm: BaseAIClient, context_type: str, language_list: list):
         if language not in ['py', 'java', 'go']:
             raise NotImplementedError("Error language type")
         data_df = pd.read_excel(f"../data/{language}_data_final.xlsx")
+        if limit and limit > 0:
+            data_df = data_df.head(limit)
         print(f"running {language}, data shape: {data_df.shape}")
         
         response_dict = {}
@@ -122,6 +144,7 @@ if __name__ == "__main__":
     parser.add_argument('-context_type', type=str, help='what context will be provide to the model, should be: callee_func, callee_sig, in_file, project or None')
     parser.add_argument('-lang_list', type=str, help='languages, comma separated, one or more in [py, java, go]')
     parser.add_argument('-model_name', type=str, help='model name, any model using open ai client')
+    parser.add_argument('-limit', type=int, default=0, help='if >0, only process the first N rows per language (quick test runs)')
     args = parser.parse_args()
     
     context_type = args.context_type
@@ -133,8 +156,11 @@ if __name__ == "__main__":
     config = config['ai_client']
     if config['url'] == "" or config['key'] == "":
         raise NotImplementedError("Please provide the url and key for the AI client in config.json")
-    llm = OpenAIClient(url=config['url'], key=config['key'], model=model_name)
-    all_result = eval_llm(llm, context_type, language_list)
+    if config.get('provider') == "anthropic_bridge":
+        llm = AnthropicBridgeClient(url=config['url'], key=config['key'], model=model_name)
+    else:
+        llm = OpenAIClient(url=config['url'], key=config['key'], model=model_name)
+    all_result = eval_llm(llm, context_type, language_list, limit=args.limit)
     for lan, gen_dict in all_result.items():
         with open(f"../data/llms/{model_name}_{context_type}_{lan}.json", 'w') as f:
             json.dump(gen_dict, f)

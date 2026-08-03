@@ -1,0 +1,6 @@
+# Runtime artifacts produced by claude_code_bridge.sh — never commit these.
+*.pid
+*.pid.lock
+logs/
+__pycache__/
+*.pyc

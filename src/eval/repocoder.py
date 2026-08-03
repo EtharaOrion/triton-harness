@@ -4,7 +4,6 @@ import pandas as pd
 import tiktoken
 import numpy as np
 
-from repocoder import RepoCoderIndex
 from AIClient import BaseAIClient
 
 

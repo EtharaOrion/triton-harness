@@ -1,0 +1,7 @@
+{
+  "model": "anthropic/claude-opus-4-8",
+  "base_url": "http://172.17.0.1:8765",
+  "api_key": "sk-ant-oauth-bridge-stub",
+  "timeout": 600,
+  "num_retries": 2
+}

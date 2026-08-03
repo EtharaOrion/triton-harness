@@ -10,7 +10,8 @@
         "k": 5
     },
     "ai_client": {
-        "url": "",
-        "key": ""
+        "provider": "anthropic_bridge",
+        "url": "http://127.0.0.1:8765",
+        "key": "sk-ant-oauth-bridge-stub"
     }
 }
