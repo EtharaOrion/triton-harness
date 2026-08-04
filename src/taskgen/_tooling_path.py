@@ -1,11 +1,17 @@
-"""Wire up the two external import roots taskgen borrows from, then shim tree-sitter.
+"""Wire up the two import roots taskgen borrows from, then shim tree-sitter.
 
-  HARNESS/src                     -> `from parser.py_parser import PyParser`
-  harbor-tasks/shared/tooling     -> `import sigextract`, `from retrieval... import`
+  HARNESS/src                  -> `from parser.py_parser import PyParser`
+  HARNESS/src/harbor_tooling   -> `import sigextract`, `from retrieval... import`
 
-Both are vendored trees we deliberately do NOT copy: sigextract/bm25/dense_lsa
-are the same implementations the shipped harbor dataset was generated with, and
-forking them would silently decouple generated tasks from the reference corpus.
+BOTH LIVE INSIDE THIS WORKTREE. Every taskgen import resolves from the harness
+tree; nothing is mapped in from outside it, so the harness is usable on its own.
+
+`harbor_tooling/` is a verbatim vendored copy of `harbor-tasks/shared/tooling`
+(its README.md records the upstream commit and the refresh command). Vendoring
+has a cost the previous out-of-tree sys.path injection did not: a copy that
+drifts from upstream would silently decouple generated tasks from the reference
+corpus the shipped harbor dataset was built with. It is therefore refreshed
+wholesale, never edited in place.
 
 Importing this module is the only supported way to reach either root. It calls
 `_ts_compat.install()` FIRST, because `parser.py_parser` imports tree_sitter at
@@ -21,8 +27,10 @@ from . import _ts_compat
 
 HARNESS_SRC = Path(__file__).resolve().parents[1]
 HARNESS = HARNESS_SRC.parent
+#: Checkout root. Retained for callers that locate external DATA (repos-src,
+#: the vendored wabt tarball); it is never used to resolve an import.
 ROOT = HARNESS.parent.parent
-TOOLING = ROOT / 'harbor-tasks' / 'shared' / 'tooling'
+TOOLING = HARNESS_SRC / 'harbor_tooling'
 
 
 def _prepend(path: Path) -> None:
@@ -37,8 +45,9 @@ def install() -> None:
     _ts_compat.install()
     if not TOOLING.is_dir():
         raise RuntimeError(
-            f'harbor shared tooling not found at {TOOLING}. taskgen reuses '
-            'sigextract/count_tokens/manifest/retrieval from there.'
+            f'vendored harbor tooling not found at {TOOLING}. taskgen imports '
+            'sigextract/count_tokens/manifest/retrieval from there; restore it '
+            'with the refresh command in src/harbor_tooling/README.md.'
         )
     _prepend(TOOLING)
     _prepend(HARNESS_SRC)

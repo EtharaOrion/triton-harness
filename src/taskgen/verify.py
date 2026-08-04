@@ -100,11 +100,11 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import _tooling_path
 from . import measure
 from .langs import base as langs_base
 
 REPOS_SRC_RELPATH = ('harbor-tasks', 'repos-src')
-HARBOR_TOOLING_RELPATH = ('harbor-tasks', 'shared', 'tooling')
 
 #: Written by emit.py next to the Dockerfile it describes. Its relpaths are
 #: resolved against that directory, so an entry stays relocatable.
@@ -471,15 +471,19 @@ def audit_image_layers(image, runner, patterns=(), digests=(), tmp_root=None,
 
 
 def harbor_tooling_dir() -> Path:
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent.joinpath(*HARBOR_TOOLING_RELPATH)
-        if candidate.is_dir():
-            return candidate
-    raise VerifyError(
-        f'harbor shared tooling not found under any ancestor of {here}; '
-        'leakscan.sh and three_state_gate.sh are wrapped, not reimplemented'
-    )
+    """The vendored harbor tooling directory, inside this worktree.
+
+    leakscan.sh and three_state_gate.sh are wrapped, not reimplemented. They
+    ship in src/harbor_tooling/ so the harness resolves them from its own tree
+    rather than from a sibling checkout.
+    """
+    tooling = _tooling_path.TOOLING
+    if not tooling.is_dir():
+        raise VerifyError(
+            f'vendored harbor tooling not found at {tooling}; leakscan.sh and '
+            'three_state_gate.sh are wrapped, not reimplemented'
+        )
+    return tooling
 
 
 def harbor_script(name: str) -> Path:
