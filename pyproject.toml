@@ -25,8 +25,11 @@ taskgen = "taskgen.cli:main"
 [dependency-groups]
 dev = ["pytest"]
 
+# harbor is the benchmarking runtime CLI (`harbor run -a oracle`, etc.).
+# It is pulled as an out-of-workspace uv path source: a git submodule of
+# github.com/harbor-framework/harbor pinned in triton/.gitmodules.
 [tool.uv.sources]
-harbor = { path = "../../harbor-tasks", editable = true }
+harbor = { path = "../../harbor" }
 
 # Package only taskgen: the sibling src/eval (MRGBench GPU) and src/parser are
 # deliberately excluded so uv never pulls the heavy inference stack. The parser
