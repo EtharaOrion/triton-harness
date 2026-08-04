@@ -101,7 +101,35 @@ STRONG_TRIPWIRE_CHARS = 40
 #: harbor's `PRUNE_DIRS` carries cpp-Rux's capitalised `Build/` and `Bin/` but no
 #: lowercase `build/`, which plan §(e).8 lists explicitly. Added here rather than
 #: edited into the harbor constant, so the wrapped tooling stays untouched.
+#:
+#: Applied WITH `_should_prune_extra_dir` below. `build/` unconditionally would
+#: strip java-tamboui's legitimate `dev.tamboui.build` Java package at
+#: `buildSrc/src/main/java/dev/tamboui/build/` -- the reference author flagged
+#: that exact failure mode with a specific error signature ("Unresolved reference
+#: 'dev'" at :buildSrc:compileKotlin). The refined predicate keeps `build/` when
+#: it sits inside a Java-style source root (`**/src/main/**` or `**/src/test/**`),
+#: where the name can only be a package identifier; everywhere else it stays
+#: pruned. python/rust/c/cpp/go carry `build/` at repo-top or beside project
+#: manifests, both of which are correctly outside `**/src/main|test/**`, so their
+#: pruning is byte-identical to before.
 EXTRA_PRUNE_DIRS = {'build'}
+_JAVA_SOURCE_ROOT_MARKERS = ('main', 'test')
+
+
+def _should_prune_extra_dir(dirpath: str, name: str) -> bool:
+    """Refine EXTRA_PRUNE_DIRS: `build/` inside Java src roots is a package."""
+    if name not in EXTRA_PRUNE_DIRS:
+        return False
+    if name == 'build':
+        parts = Path(dirpath).parts
+        for i, part in enumerate(parts):
+            if (
+                part == 'src'
+                and i + 1 < len(parts)
+                and parts[i + 1] in _JAVA_SOURCE_ROOT_MARKERS
+            ):
+                return False
+    return True
 
 
 class StagingError(RuntimeError):
@@ -184,7 +212,7 @@ def _prune_extra(root: Path) -> None:
         here = Path(dirpath)
         names = list(dirnames) + list(filenames)
         doomed = harbor_stage_carved.PRUNE(dirpath, names) | {
-            n for n in dirnames if n in EXTRA_PRUNE_DIRS
+            n for n in dirnames if _should_prune_extra_dir(dirpath, n)
         }
         for name in doomed:
             victim = here / name

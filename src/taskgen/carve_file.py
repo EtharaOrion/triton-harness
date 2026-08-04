@@ -101,6 +101,18 @@ _DEFAULT_STUB_BODY = {
     'python': 'raise NotImplementedError',
     'go': '{\n\tpanic("not implemented")\n}',
     'java': '{\n    throw new UnsupportedOperationException();\n}',
+    # rust always carves --delete-whole-file (whole src/ removed for whole-suite
+    # grading), so this stub is never actually spliced in; it exists only so
+    # the language check in build_carve_set does not need a rust special case.
+    'rust': '{\n    unimplemented!()\n}',
+    # c is likewise --delete-whole-file (entire src/runtime removed), so this
+    # never spliced. Kept so default_stub_body(language='c') resolves rather
+    # than raising, mirroring the rust special-case-avoidance.
+    'c': '{\n    /* not implemented */\n}',
+    # cpp is likewise --delete-whole-file (entire Compiler/{Semantic,Ir,CodeGen}
+    # removed), so this stub is never spliced. Kept so default_stub_body('cpp')
+    # resolves rather than raising, matching rust/c.
+    'cpp': '{\n    /* not implemented */\n}',
 }
 
 

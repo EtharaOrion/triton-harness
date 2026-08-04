@@ -87,9 +87,15 @@ _STUB_PHRASE = {
     'python': 'raise NotImplementedError',
     'go': 'panic("not implemented")',
     'java': 'throw new UnsupportedOperationException()',
+    'rust': 'the file being deleted outright',
+    'c': 'the file being deleted outright',
+    'cpp': 'the file being deleted outright',
 }
 
-_FENCE = {'python': 'python', 'go': 'go', 'java': 'java'}
+_FENCE = {
+    'python': 'python', 'go': 'go', 'java': 'java',
+    'rust': 'rust', 'c': 'c', 'cpp': 'cpp',
+}
 
 
 def stub_phrase(language: str) -> str:

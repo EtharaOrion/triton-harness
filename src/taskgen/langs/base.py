@@ -558,6 +558,40 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
         """Per-language additions -- e.g. the compiled-artifact scan of §(e).5."""
         return ()
 
+    def extra_ctx_assets(self) -> tuple[tuple[Path, str], ...]:
+        """Static plugin assets staged beside leakscan.sh in the tooling context.
+
+        Returns (host_absolute_path, dest_filename) pairs. `emit._copy_leakscan`
+        copies each into the entry's tooling/ directory so the shipped
+        Dockerfile can bind-mount them from the `tooling` named context. The
+        default is (): most languages need only harbor's own leakscan.sh.
+
+        Rust uses this for the wabt tarball: wast2json is a hard runtime
+        dependency of the graded harness and is not on any distro repo at the
+        pinned version.
+        """
+        return ()
+
+    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+        """The stripped Dockerfile for the never-ship measure image (phase 1).
+
+        Only a plugin with `parser_backed = False` needs one: parser-backed
+        languages derive their denominator from the parser, not from a run
+        against the intact tree, so the two-phase build does not apply. This
+        default raises for that reason.
+
+        A whole-suite plugin renders a MINIMAL Dockerfile here: toolchain,
+        intact COPY, whatever is needed to compile the tests, and a COPY of
+        measure.sh -- NO leak gate, NO strings-assert, NO tripwire scan (all
+        three would fire on the intact tree by construction).
+        """
+        raise LangError(
+            f'{self.name!r} does not render a measure dockerfile; whole-suite '
+            'languages must implement render_measure_dockerfile so measure.py '
+            'can build an intact-tree image to count the suite against '
+            '(parser_backed languages derive the denominator without one)'
+        )
+
     def render_dockerfile(self, env: EnvSpec) -> str:
         """The shipped image: the staged carved tree, and nothing that describes it."""
         blocks = [

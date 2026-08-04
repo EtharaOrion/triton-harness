@@ -47,6 +47,22 @@ __all__ = [
 DEFAULT_TEST_GLOBS: dict[str, tuple[str, ...]] = {
     'python': ('tests/**', 'test/**', '**/test_*.py', '**/*_test.py', 'conftest.py'),
     'go': ('**/*_test.go',),
+    # rust: the graded oracle is the integration harnesses under tests/ and the
+    # .wast conformance corpus they drive. A --include glob must never sweep them.
+    'rust': ('tests/**', 'benches/**', '**/*.wast'),
+    # c-xs: the graded oracle is tests/conformance/, tests/regression/ and
+    # tests/unit/. --include glob for the carve is 'src/runtime/**' and cannot
+    # match here, but the guard is enforced anyway so no scope can opt out.
+    'c': ('tests/**',),
+    # cpp-Rux: the graded oracle is Tests/Unit/*.cpp linked into rux-tests
+    # (capital T, per repo layout). --include for the carve is Compiler/**
+    # and cannot match here, but the guard is enforced anyway.
+    'cpp': ('Tests/**',),
+    # java-tamboui: the graded oracle is tamboui-widgets/src/test/java (49
+    # files). --include for the carve is tamboui-widgets/src/main/java/** and
+    # cannot match here (main and test live in different source roots), but
+    # the guard is enforced anyway so no scope can opt out.
+    'java': ('**/src/test/**',),
 }
 
 

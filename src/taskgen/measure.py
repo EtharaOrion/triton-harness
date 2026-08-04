@@ -90,7 +90,7 @@ class MeasureError(RuntimeError):
 
 
 def measure_image_tag(repo_name: str) -> str:
-    return f'{MEASURE_IMAGE_PREFIX}{repo_name}{MEASURE_IMAGE_SUFFIX}'
+    return f'{MEASURE_IMAGE_PREFIX}{repo_name.lower()}{MEASURE_IMAGE_SUFFIX}'
 
 
 def is_measure_image(image: str) -> bool:

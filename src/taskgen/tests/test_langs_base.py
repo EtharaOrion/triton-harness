@@ -173,10 +173,11 @@ def test_get_of_an_unknown_language_names_what_is_available():
 
 
 def test_get_of_an_unlanded_language_says_so_instead_of_raising_importerror():
-    """java/rust/c/cpp are later increments; the message must not be a bare
-    ImportError. python and go HAVE landed, so they are asserted the other way
-    round -- see test_lang_python.py / test_lang_go.py."""
-    for planned in ('java', 'rust', 'c', 'cpp', 'csharp'):
+    """csharp is a later increment; the message must not be a bare
+    ImportError. python, go, rust, c, cpp and java HAVE landed, so they are
+    asserted the other way round -- see test_lang_python.py / test_lang_go.py
+    / test_lang_rust.py / test_lang_c.py / test_lang_cpp.py / test_lang_java.py."""
+    for planned in ('csharp',):
         with pytest.raises(B.LangError, match='Wave 2'):
             B.get(planned)
 

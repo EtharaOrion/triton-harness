@@ -599,9 +599,6 @@ def load_entry(entry_dir: Path) -> EntrySpec:
     image = env.get('docker_image')
     if not image:
         raise VerifyError(f'{toml_path}: [environment].docker_image is missing')
-    graded = meta.get('graded_tests')
-    if not graded:
-        raise VerifyError(f'{toml_path}: [metadata].graded_tests is missing or empty')
 
     graded_path = entry_dir / 'tests' / 'graded.json'
     if not graded_path.is_file():
@@ -613,7 +610,12 @@ def load_entry(entry_dir: Path) -> EntrySpec:
         graded_doc = json.loads(graded_path.read_text())
     except json.JSONDecodeError as exc:
         raise VerifyError(f'{graded_path}: not valid json ({exc})') from exc
+
+    graded = meta.get('graded_tests', [])
     selectors = list(graded_doc.get('selectors') or ())
+    is_whole_suite = graded_doc.get('kind') == 'whole-suite'
+    if not is_whole_suite and not graded:
+        raise VerifyError(f'{toml_path}: [metadata].graded_tests is missing or empty')
     if selectors != list(graded):
         raise VerifyError(
             f'{entry_dir.name}: tests/graded.json ({len(selectors)} selectors) disagrees '
@@ -974,6 +976,34 @@ class DockerRunner:
         status, out = self._stream([self._binary, 'image', 'rm', image], quiet=True)
         if status != 0:
             self._echo(f'  warning: could not remove image {image} (exit {status})')
+        return out
+
+    def image_digest(self, image) -> str:
+        """The content-address of a locally-loaded image, for measure provenance."""
+        argv = [self._binary, 'inspect', '--format', '{{.Id}}', image]
+        status, out = self._stream(argv, quiet=True)
+        if status != 0:
+            raise VerifyError(
+                f'docker inspect --format Id failed for {image} (exit {status}); '
+                'is the image loaded locally?'
+            )
+        return out.strip()
+
+    def build_with_contexts(self, *, image, dockerfile, context, contexts) -> str:
+        """Build with a caller-supplied dict of named build contexts (measure.py)."""
+        env = dict(os.environ, DOCKER_BUILDKIT='1', BUILDKIT_PROGRESS='plain')
+        argv = [self._binary, 'build']
+        for name, target in sorted(contexts.items()):
+            argv += ['--build-context', f'{name}={target}']
+        argv += [
+            '-f', str(dockerfile),
+            '-t', image,
+            str(context),
+        ]
+        self._echo(f'$ DOCKER_BUILDKIT=1 {" ".join(argv[1:])}')
+        status, out = self._stream(argv, env=env)
+        if status != 0:
+            raise VerifyError(f'docker build failed (exit {status}) for image {image}')
         return out
 
     @property

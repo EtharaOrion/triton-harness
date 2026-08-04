@@ -32,13 +32,21 @@ from .base import (
     get,
     register,
 )
+from .c import CPlugin
+from .cpp import CppPlugin
 from .go import GoPlugin
+from .java import JavaPlugin
 from .python import PythonPlugin
+from .rust import RustPlugin
 
 __all__ = [
+    'CPlugin',
+    'CppPlugin',
     'DepWarmSpec',
     'GoPlugin',
+    'JavaPlugin',
     'PythonPlugin',
+    'RustPlugin',
     'EnvSpec',
     'FLOOR_MODES',
     'GradedSet',

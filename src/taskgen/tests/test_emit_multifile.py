@@ -239,7 +239,12 @@ def test_the_tripwire_file_is_staged_for_the_leak_gate(folder_scope):
     staged = next((out / '_staging').iterdir())
     trip = (staged / 'trip' / 'tripwires.txt').read_text()
     assert trip.strip(), 'an empty tripwire file downgrades the leak gate'
-    assert len(trip.strip().splitlines()) >= len(entries[0].carved_relpaths)
+    # Leak-gate coverage spans both rungs: a strong grep line here, or a content
+    # digest in tripwire-digests.txt when the only line is sub-strong (staging.py).
+    lines = [l for l in trip.strip().splitlines() if l.strip()]
+    digests = (staged / 'trip' / 'tripwire-digests.txt').read_text()
+    digest_lines = [l for l in digests.splitlines() if l.strip()]
+    assert len(lines) + len(digest_lines) == len(entries[0].carved_relpaths)
 
 
 def test_task_toml_records_the_scope_and_the_carve_set(folder_scope):

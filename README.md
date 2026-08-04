@@ -112,5 +112,181 @@ python run_test.py -df_path data/py_data_final.xlsx -result_path result/llms/you
 ```
 4. The test results will be saved in `result/llms/your_result.json_testresult.json`.
 
+---
+
+# taskgen: deterministic harbor task generator
+
+`taskgen` (under `src/taskgen/`) turns a real source repository into harbor evaluation tasks. It carves a target out of the repo, ships the carved tree in a Docker image, and proves two things with real container runs: the carved stub scores reward 0.0, and the original code (the oracle) scores reward 1.0. The generator is deterministic, and the verifier is leak-audited so the answer never reaches any Docker layer.
+
+## What a task is
+
+For each run, `generate` writes one output directory holding nine entries, one per retrieval context type (no_context, callee_func, callee_sig, in_file, project, bm25, embedding, mix, repo_coder). All nine share a single carved image and oracle; only the instruction context differs. Each entry contains:
+
+- `environment/Dockerfile` and `environment/contexts.json` (named build contexts: entry, repoctx, tooling, trip)
+- `solution/solve.sh` and `solution/carved/...` (the oracle payload, restored at run time from a read only mount)
+- `tests/test.sh`, `tests/graded.json`, and for the measured languages `tests/graded.lock.json`
+- `task.toml`, `instruction.md`
+
+## Languages and carve scopes
+
+Two families of language plugin live in `src/taskgen/langs/`.
+
+Parser-backed (tree-sitter), function / file / folder scope:
+
+- python
+- go
+
+Whole-suite (no parser), folder scope with `--delete-whole-file`:
+
+- rust
+- c
+- cpp
+- java
+
+csharp is planned but not yet implemented.
+
+A parser-backed language can carve a single function body, or every function body in a glob-selected set of files. A whole-suite language deletes a whole subtree and grades the entire test suite; its pass floor is measured once against the intact tree and pinned into `graded.lock.json`.
+
+## Environment
+
+The generator runs from this directory (`triton/harness`) against a pip-less uv virtualenv:
+
+```bash
+uv venv --python 3.12 .venv-taskgen
+uv pip install --python .venv-taskgen/bin/python \
+    tree_sitter==0.24.0 tree_sitter_python==0.23.6 tree_sitter_go==0.23.4 \
+    tqdm pytest numpy
+```
+
+Every command below assumes:
+
+```bash
+export PYTHONPATH=src
+PY=./.venv-taskgen/bin/python
+```
+
+Source repositories live under `../../harbor-tasks/repos-src/`. The harbor base image plus the per-repo images must be loaded into Docker for `verify`, and also for `generate` on the whole-suite languages, which build a throwaway measure image.
+
+## generate
+
+```bash
+$PY -m taskgen.cli generate --repo <repo> --out <dir> [options]
+```
+
+Key options:
+
+- `--repo PATH` source checkout to carve (required)
+- `--out DIR` output directory (required)
+- `--lang {python,go,rust,c,cpp,java,csharp}` language plugin (default: python)
+- `--carve-scope {function,file,folder}` how much to carve (default: function)
+- `--file PATH` target file, repo relative
+- `--func NAME` target function name
+- `--class NAME` target class name for methods
+- `--package-base DIR` import root inside the repo (default: `src/`)
+- `--include GLOB` file/folder scope carve glob, repeatable
+- `--exclude GLOB` subtract a glob from `--include`, repeatable
+- `--delete-whole-file` delete carved files outright instead of skeleton stubbing (required for whole-suite languages)
+- `--receiver TYPE` go method receiver disambiguation
+- `--project SEG` go.mod project segment (derived when omitted)
+- `--contexts all|bm25,mix,...` which context entries to write (default: all nine)
+- `--budget INT`, `--seed INT`
+
+For python and go, `generate` is fully offline and deterministic: run it twice into two directories and `diff -r` them. For rust, c, cpp, and java, `generate` builds a never-ship measure image once to count the intact test suite, pins that count into `graded.lock.json`, deletes the image, and reuses the lock on later runs when the repo and base image are unchanged. Those runs need Docker and network access.
+
+## verify
+
+```bash
+$PY -m taskgen.cli verify --all <out-dir> --lang <lang> --carve-scope <scope> --repo <repo>
+$PY -m taskgen.cli verify --entry <entry-dir> --lang <lang> --carve-scope <scope> --repo <repo>
+```
+
+`--all` builds the one image the nine entries share, proves they are byte identical, then runs the full gate on that image:
+
+1. oracle-integrity: every `solution/carved/...` file matches the upstream repo by sha256, checked on the host
+2. build the graded image from the named build contexts
+3. image hygiene: no oracle solution baked into the image
+4. RED run: the carved stub must score reward 0.0
+5. GREEN run: the oracle (bind mounted read only, restored by solve.sh) must score reward 1.0 and binary 1.0
+6. layer archaeology: `docker save` and scan every layer for carved bytes and tripwire digests
+
+The command exits non-zero if any bar is missed. `verify` does not auto-detect language or scope, so pass `--lang` and `--carve-scope` for every non-python entry. `--repo` is optional and is located under `../../harbor-tasks/repos-src/` from the entry when omitted. `--keep-image` keeps the built image for inspection.
+
+## Worked matrix
+
+python, function / file / folder scope:
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/python-a2a-python \
+    --package-base src/ --file src/a2a/utils/task.py --func apply_history_length \
+    --out .taskgen_out/py-fn
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/python-a2a-python \
+    --package-base src/ --carve-scope file --include 'src/a2a/utils/task.py' \
+    --out .taskgen_out/py-file
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/python-a2a-python \
+    --package-base src/ --carve-scope folder --include 'src/a2a/utils/**' \
+    --out .taskgen_out/py-folder
+$PY -m taskgen.cli verify --all .taskgen_out/py-fn --lang python --carve-scope function \
+    --repo ../../harbor-tasks/repos-src/python-a2a-python
+```
+
+go, function scope:
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/go-multigres --lang go \
+    --file go/common/pgprotocol/server/listener.go --func assignConnectionID \
+    --out .taskgen_out/go-fn
+$PY -m taskgen.cli verify --all .taskgen_out/go-fn --lang go --carve-scope function \
+    --repo ../../harbor-tasks/repos-src/go-multigres
+```
+
+rust, whole src tree:
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/rust-spacewasm --lang rust \
+    --carve-scope folder --include 'src/**' --delete-whole-file --out .taskgen_out/rust-folder
+$PY -m taskgen.cli verify --all .taskgen_out/rust-folder --lang rust --carve-scope folder \
+    --repo ../../harbor-tasks/repos-src/rust-spacewasm
+```
+
+c, whole runtime:
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/c-xs --lang c \
+    --carve-scope folder --include 'src/runtime/**' --delete-whole-file --out .taskgen_out/c-folder
+$PY -m taskgen.cli verify --all .taskgen_out/c-folder --lang c --carve-scope folder \
+    --repo ../../harbor-tasks/repos-src/c-xs
+```
+
+cpp, compiler middle-end (three narrow includes):
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/cpp-Rux --lang cpp \
+    --carve-scope folder \
+    --include 'Compiler/Semantic/**' --include 'Compiler/Ir/**' --include 'Compiler/CodeGen/**' \
+    --delete-whole-file --out .taskgen_out/cpp-folder
+$PY -m taskgen.cli verify --all .taskgen_out/cpp-folder --lang cpp --carve-scope folder \
+    --repo ../../harbor-tasks/repos-src/cpp-Rux
+```
+
+java, widget library:
+
+```bash
+$PY -m taskgen.cli generate --repo ../../harbor-tasks/repos-src/java-tamboui --lang java \
+    --carve-scope folder --include 'tamboui-widgets/src/main/java/**' --delete-whole-file \
+    --out .taskgen_out/java-folder
+$PY -m taskgen.cli verify --all .taskgen_out/java-folder --lang java --carve-scope folder \
+    --repo ../../harbor-tasks/repos-src/java-tamboui
+```
+
+Verified floors: python and go carry function-level graded sets; rust grades 92 tests, c grades 91, cpp grades 170 doctest cases, and java grades 823 tests across 69 suites. Each combo produces RED reward 0.0 and GREEN reward 1.0 with the leak and integrity gates passing.
+
+## Tests
+
+```bash
+PYTHONPATH=src ./.venv-taskgen/bin/python -m pytest src/taskgen/tests/ -q
+```
+
+The suite covers the carve, staging, emit, measure, and verify paths plus one plugin test module per language. Current count: 674 passing.
+
 
 

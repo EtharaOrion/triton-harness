@@ -56,6 +56,7 @@ __all__ = [
     'derive_graded_set',
     'parse_linked',
     'select_carved',
+    'whole_suite_selection',
 ]
 
 #: Which selector dialect a language speaks. Unknown languages raise rather
@@ -63,6 +64,22 @@ __all__ = [
 SELECTOR_KIND = {
     'python': 'pytest-allowlist',
     'go': 'go-run',
+    # A language with no tree-sitter parser cannot link tests to a carved
+    # function, so it grades the WHOLE suite against a measured denominator.
+    'rust': 'whole-suite',
+    # c-xs is the second whole-suite language: --delete-whole-file over the
+    # entire src/runtime directory, no parser, no per-test selectors. The
+    # grader IS the reference test.sh (three make targets, 91 units).
+    'c': 'whole-suite',
+    # cpp-Rux is the third: --delete-whole-file over Compiler/{Semantic,Ir,
+    # CodeGen}/**, no parser, no per-test selectors. The grader is the single
+    # rux-tests doctest binary registered by Tests/Unit/CMakeLists.txt.
+    'cpp': 'whole-suite',
+    # java-tamboui is the fourth: --delete-whole-file over
+    # tamboui-widgets/src/main/java (85 files, the whole dev.tamboui.widgets
+    # subsystem). The grader is `:tamboui-widgets:test` (49 test files, 69
+    # JUnit suite files, 823 tests), measured host-side against the intact tree.
+    'java': 'whole-suite',
 }
 
 
@@ -135,14 +152,27 @@ class GradedSelection:
     tests: tuple[LinkedTest, ...]
     carved_files: tuple[str, ...]
     carved_functions: tuple[str, ...]
+    #: Whole-suite only: a denominator MEASURED against the intact tree rather
+    #: than counted from selectors. None keeps python/go on len(selectors).
+    _expected: int | None = None
+    #: Whole-suite only: the literal grade-time command, carried to the plugin's
+    #: test.sh because a parser-less language has no selector list to render one.
+    test_command: str = ''
+    #: Whole-suite only: explicit relpaths to sha256-fingerprint. python/go
+    #: derive this from `tests` (one relpath per graded test); a whole-suite
+    #: language with no per-test tests entry still needs a way to declare its
+    #: grader-lock (c-xs pins 227 files under tests/ + Makefile), which this is.
+    _fingerprint_relpaths: tuple[str, ...] = ()
 
     @property
     def expected(self) -> int:
-        return len(self.selectors)
+        return self._expected if self._expected is not None else len(self.selectors)
 
     @property
     def fingerprint_relpaths(self) -> tuple[str, ...]:
         """The graded test FILES -- what the plugins sha256-lock."""
+        if self._fingerprint_relpaths:
+            return self._fingerprint_relpaths
         return tuple(sorted({t.relpath for t in self.tests}))
 
     def to_dict(self) -> dict:
@@ -212,6 +242,53 @@ def derive_graded_set(language: str, carved_functions, carved_files) -> GradedSe
         tests=tuple(graded),
         carved_files=files,
         carved_functions=tuple(sorted(f'{f.relpath}::{f.qualname}' for f in funcs)),
+    )
+
+
+def whole_suite_selection(
+    language: str,
+    *,
+    expected: int,
+    test_command: str,
+    carved_files=(),
+    fingerprint_relpaths=(),
+) -> GradedSelection:
+    """The graded set for a language with no parser: the WHOLE test suite.
+
+    python and go derive a denominator by parsing which tests link to the carved
+    function. A language without a tree-sitter parser (rust, c) cannot, so it
+    grades the entire integration suite against a denominator MEASURED on the
+    intact tree and passed in here, never len(selectors). There are no per-test
+    selectors; the anti-shrink defence is the equality floor over `expected`
+    plus, when the plugin opts in via `fingerprint_relpaths`, an sha256 lock
+    over the grader-owned files (c-xs pins 227 = tests/** + Makefile). rust
+    leaves it empty; the wast-corpus floor and harness-count guard in its
+    test.sh cover the same role.
+    """
+    kind = SELECTOR_KIND.get(language)
+    if kind != 'whole-suite':
+        raise GradedSetError(
+            f'whole_suite_selection is only for whole-suite languages; {language!r} '
+            f'has dialect {kind!r}'
+        )
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+        raise GradedSetError(
+            f'whole-suite expected must be a positive int, got {expected!r}'
+        )
+    if not test_command.strip():
+        raise GradedSetError('whole-suite grading needs a non-empty test command')
+    return GradedSelection(
+        kind=kind,
+        selectors=(),
+        packages=(),
+        tests=(),
+        carved_files=tuple(sorted({Path(f).as_posix() for f in carved_files})),
+        carved_functions=(),
+        _expected=int(expected),
+        test_command=test_command,
+        _fingerprint_relpaths=tuple(
+            sorted({Path(p).as_posix() for p in fingerprint_relpaths})
+        ),
     )
 
 
