@@ -149,20 +149,17 @@ A parser-backed language can carve a single function body, or every function bod
 
 ## Environment
 
-The generator runs from this directory (`triton/harness`) against a pip-less uv virtualenv:
+The generator is a uv project rooted at this directory (`triton/harness`). It pins the taskgen dependencies and pulls the shared harbor tooling as an editable path dependency. The MRGBench GPU stack in `requirement.txt` is separate and untouched.
 
 ```bash
-uv venv --python 3.12 .venv-taskgen
-uv pip install --python .venv-taskgen/bin/python \
-    tree_sitter==0.24.0 tree_sitter_python==0.23.6 tree_sitter_go==0.23.4 \
-    tqdm pytest numpy
+uv sync
 ```
 
-Every command below assumes:
+That creates `.venv` and installs the pinned dependencies (tree-sitter, numpy, tqdm), the harbor tooling package (editable, from `../../harbor-tasks`), and the dev tools (pytest). Run everything through `uv run`, which keeps the environment in sync:
 
 ```bash
-export PYTHONPATH=src
-PY=./.venv-taskgen/bin/python
+uv run taskgen --help    # console entry point
+PY="uv run python"       # the commands below use $PY -m taskgen.cli
 ```
 
 Source repositories live under `../../harbor-tasks/repos-src/`. The harbor base image plus the per-repo images must be loaded into Docker for `verify`, and also for `generate` on the whole-suite languages, which build a throwaway measure image.
@@ -283,7 +280,7 @@ Verified floors: python and go carry function-level graded sets; rust grades 92 
 ## Tests
 
 ```bash
-PYTHONPATH=src ./.venv-taskgen/bin/python -m pytest src/taskgen/tests/ -q
+uv run pytest -q
 ```
 
 The suite covers the carve, staging, emit, measure, and verify paths plus one plugin test module per language. Current count: 674 passing.

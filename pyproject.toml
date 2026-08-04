@@ -1,0 +1,43 @@
+# This project file governs ONLY the taskgen subsystem (src/taskgen).
+# The MRGBench GPU inference stack is still managed by requirement.txt and is untouched.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskgen"
+version = "0.1.0"
+description = "Deterministic harbor task generator (multi-language carve/measure/verify)."
+requires-python = ">=3.12"
+dependencies = [
+    "tree-sitter==0.24.0",
+    "tree-sitter-python==0.23.6",
+    "tree-sitter-go==0.23.4",
+    "tqdm",
+    "numpy>=1.26",
+    "harbor",
+]
+
+[project.scripts]
+taskgen = "taskgen.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv.sources]
+harbor = { path = "../../harbor-tasks", editable = true }
+
+# Package only taskgen: the sibling src/eval (MRGBench GPU) and src/parser are
+# deliberately excluded so uv never pulls the heavy inference stack. The parser
+# package is reached at runtime through taskgen/_tooling_path.py.
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["taskgen*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["src/taskgen/tests"]
