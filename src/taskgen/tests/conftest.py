@@ -15,8 +15,11 @@ HARNESS_SRC = Path(__file__).resolve().parents[2]
 if str(HARNESS_SRC) not in sys.path:
     sys.path.insert(0, str(HARNESS_SRC))
 
-ROOT = HARNESS_SRC.parents[2]
-REPO = ROOT / 'harbor-tasks' / 'repos-src' / 'python-a2a-python'
+#: Checkout root: `HARNESS_SRC` is `<root>/src`, so its parent IS the root.
+#: Sample repos are vendored under `<root>/repo/` -- never `../../harbor-tasks/`
+#: -- so the suite resolves every fixture inside this worktree.
+ROOT = HARNESS_SRC.parent
+REPO = ROOT / 'repo' / 'python-a2a-python'
 
 FROZEN_FILE = 'src/a2a/utils/task.py'
 FROZEN_FUNC = 'apply_history_length'

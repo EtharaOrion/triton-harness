@@ -39,12 +39,10 @@ FROZEN_TESTS = (
 
 @pytest.fixture(scope='session')
 def go_repo(request):
-    root = request.config.rootpath
-    for base in (root, *root.parents):
-        repo = base / 'harbor-tasks' / 'repos-src' / 'go-multigres'
-        if repo.is_dir():
-            return repo
-    pytest.skip('go-multigres checkout not present')
+    repo = request.config.rootpath / 'repo' / 'go-multigres'
+    if not repo.is_dir():
+        pytest.skip(f'go-multigres checkout not present: {repo}')
+    return repo
 
 
 @pytest.fixture(scope='session')
