@@ -120,12 +120,14 @@ python run_test.py -df_path data/py_data_final.xlsx -result_path result/llms/you
 
 ## What a task is
 
-For each run, `generate` writes one output directory holding nine entries, one per retrieval context type (no_context, callee_func, callee_sig, in_file, project, bm25, embedding, mix, repo_coder). All nine share a single carved image and oracle; only the instruction context differs. Each entry contains:
+For each run, `generate` writes one output directory holding eleven entries, one per retrieval context type (no_context, callee_func, callee_sig, caller_func, caller_sig, in_file, project, bm25, embedding, mix, repo_coder). caller_func and caller_sig inline the first-party functions that call the target, the deterministic inverse of the callee pair. All eleven share a single carved image and oracle; only the instruction context differs. Each entry contains:
 
 - `environment/Dockerfile` and `environment/contexts.json` (named build contexts: entry, repoctx, tooling, trip)
 - `solution/solve.sh` and `solution/carved/...` (the oracle payload, restored at run time from a read only mount)
 - `tests/test.sh`, `tests/graded.json`, and for the measured languages `tests/graded.lock.json`
 - `task.toml`, `instruction.md`
+
+The python `tests/test.sh` additionally persists its JUnit report as `results.xml` at run time. That file is runtime only, not an emitted asset, and the reward contract is unchanged. The other five languages are a follow-up.
 
 ## Languages and carve scopes
 
@@ -149,7 +151,7 @@ A parser-backed language can carve a single function body, or every function bod
 
 ## Environment
 
-The generator is a uv project rooted at this directory (`triton/harness`). It pins the taskgen dependencies and pulls the shared harbor tooling as an editable path dependency. The MRGBench GPU stack in `requirement.txt` is separate and untouched.
+The generator is a uv project rooted at this directory (the taskgen harness). It pins the taskgen dependencies and pulls the shared harbor tooling as an editable path dependency. The MRGBench GPU stack in `requirement.txt` is separate and untouched.
 
 ```bash
 uv sync
@@ -168,11 +170,19 @@ Source repositories live under `../../harbor-tasks/repos-src/`. The harbor base 
 
 ```bash
 $PY -m taskgen.cli generate --repo <repo> --out <dir> [options]
+$PY -m taskgen.cli generate --repo-url <src> --commit <sha> --out <dir> [options]
 ```
+
+The source is either a local checkout (`--repo`) or a clone (`--repo-url`); exactly one is required.
 
 Key options:
 
-- `--repo PATH` source checkout to carve (required)
+- `--repo PATH` source checkout to carve
+- `--repo-url SRC` clone source, a public HTTPS URL or a local git repo; mutually exclusive with `--repo`
+- `--commit SHA` commit to check out (required for a URL unless `--allow-floating`)
+- `--allow-floating` clone the default branch HEAD instead of a pin (non-reproducible)
+- `--repo-name NAME` override the derived repo basename (identity)
+- `--repos-cache DIR` where clones land (default: `../../harbor-tasks/repos-src`)
 - `--out DIR` output directory (required)
 - `--lang {python,go,rust,c,cpp,java,csharp}` language plugin (default: python)
 - `--carve-scope {function,file,folder}` how much to carve (default: function)
@@ -185,8 +195,19 @@ Key options:
 - `--delete-whole-file` delete carved files outright instead of skeleton stubbing (required for whole-suite languages)
 - `--receiver TYPE` go method receiver disambiguation
 - `--project SEG` go.mod project segment (derived when omitted)
-- `--contexts all|bm25,mix,...` which context entries to write (default: all nine)
+- `--contexts all|bm25,mix,...` which context entries to write (default: all eleven)
 - `--budget INT`, `--seed INT`
+- `--verifier` also author one sound verifier bundle per generate and copy it into each entry's `solution/verifier/` (opt-in; needs an LLM proxy; not `diff -r` reproducible)
+- `--llm-config PATH` path to the LLM config used by `--verifier` (default: repo-root `.llm_config`)
+- `--verifier-min-criteria INT` sound-rubric floor for the bundle (default: 6)
+
+### Cloning and provenance
+
+A pinned `--repo-url ... --commit ...` clone is deterministic, and the resolved `repo_url`, `commit`, and `clone_kind` are recorded in `task.toml` under `[provenance]`. `verify` self-clones the pinned commit when no local checkout exists.
+
+### Verifier bundle
+
+`--verifier` is off by default so a default `generate` stays offline and deterministic. The bundle lives only under `solution/verifier`, never in an image layer, so `verify` still passes every gate. Below the sound floor the task ships without a bundle, which is non-blocking; a missing or unreachable proxy fails loud. The LLM config is a git-ignored `.llm_config/claude-code-oauth.json` (copy the committed `.llm_config/example.json`).
 
 For python and go, `generate` is fully offline and deterministic: run it twice into two directories and `diff -r` them. For rust, c, cpp, and java, `generate` builds a never-ship measure image once to count the intact test suite, pins that count into `graded.lock.json`, deletes the image, and reuses the lock on later runs when the repo and base image are unchanged. Those runs need Docker and network access.
 
@@ -197,7 +218,7 @@ $PY -m taskgen.cli verify --all <out-dir> --lang <lang> --carve-scope <scope> --
 $PY -m taskgen.cli verify --entry <entry-dir> --lang <lang> --carve-scope <scope> --repo <repo>
 ```
 
-`--all` builds the one image the nine entries share, proves they are byte identical, then runs the full gate on that image:
+`--all` builds the one image the eleven entries share, proves they are byte identical, then runs the full gate on that image:
 
 1. oracle-integrity: every `solution/carved/...` file matches the upstream repo by sha256, checked on the host
 2. build the graded image from the named build contexts
@@ -283,7 +304,11 @@ Verified floors: python and go carry function-level graded sets; rust grades 92 
 uv run pytest -q
 ```
 
-The suite covers the carve, staging, emit, measure, and verify paths plus one plugin test module per language. Current count: 674 passing.
+The suite covers the carve, staging, emit, measure, and verify paths plus one plugin test module per language. Current count: 823 passing.
 
+## License
 
+Released under the MIT License; see the `LICENSE` file. Copyright (c) 2026 Ethara.AI.
+
+The vendored sample repositories under `../../harbor-tasks/repos-src/` and other third-party or upstream components retain their own original licenses.
 
