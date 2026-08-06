@@ -204,12 +204,21 @@ def test_default_measure_dockerfile_still_hashes_to_the_pre_seam_digest(plugin, 
 
 
 def test_emit_calls_the_default_path(plugin, env):
-    """`dep_plan` is opt-in: the generator's own call site passes no plan."""
+    """`dep_plan` is opt-in: the generator's DEFAULT call site passes no plan.
+
+    This once read `'dep_plan' not in inspect.getsource(emit)`, which held only
+    while emit could not thread a plan at all. `--resolve-env` gives it a way,
+    so the guarantee is restated where it actually lives -- the default of the
+    flag that reaches it -- and the behavioural half (default path renders the
+    pre-seam bytes and never calls a resolver) is proved against a real emission
+    in test_emit_resolve_env.py.
+    """
     from taskgen import emit
 
     source = inspect.getsource(emit)
     assert 'plugin.render_measure_dockerfile(env)' in source
-    assert 'dep_plan' not in source
+    for entry in (emit.emit_all, emit._measure_and_pin):
+        assert inspect.signature(entry).parameters['resolve_env'].default is False
 
 
 # ------------------------------------------------------------- the refusals --

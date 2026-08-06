@@ -59,6 +59,7 @@ from . import _tooling_path
 
 from gen_context import FRAMING_BLOCK, assert_no_leakage  # noqa: E402
 
+from . import depplan  # noqa: E402
 from . import scope as scope_mod  # noqa: E402
 from . import templates  # noqa: E402
 from .carve import CarveSet, build_carve_set  # noqa: E402
@@ -70,6 +71,8 @@ from .contexts import (  # noqa: E402
     fence,
     stub_phrase,
 )
+from .depplan import DepPlan  # noqa: E402
+from .env_resolver import EnvResolver, Refuse, ResolveRefused  # noqa: E402
 from .gradedset import (  # noqa: E402
     GradedSelection,
     derive_graded_set,
@@ -99,6 +102,31 @@ DEFAULT_VERIFIER_MIN_CRITERIA = 6
 #: Directory the bundle lands in, inside each entry. Under solution/, which is
 #: never COPYed into a layer, so the bundle inherits the oracle's exclusion.
 VERIFIER_SUBDIR = 'solution/verifier'
+
+#: Which languages `--resolve-env` will render a resolved gap for. It is a
+#: whitelist rather than a `hasattr(plugin, 'render_gap')` probe because every
+#: plugin HAS the method -- `langs.base` defines it to raise -- so a probe would
+#: green-light a language whose only implementation is the refusal.
+RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c'})
+
+
+def assert_resolve_env_supported(lang: str) -> None:
+    """Refuse `--resolve-env` for a language whose gap cannot be rendered yet.
+
+    Checked at the TOP of `emit_all`, not only in the measure phase: a
+    parser-backed language never reaches that phase, so a check living only
+    there would accept `--resolve-env --lang python` and then quietly ignore it.
+    A flag that silently does nothing is worse than one that refuses.
+    """
+    if lang in RESOLVE_ENV_LANGS:
+        return
+    raise langs_base.LangError(
+        f'--resolve-env is only supported for '
+        f'{", ".join(sorted(RESOLVE_ENV_LANGS))} in this slice, not {lang!r}: '
+        "rendering a measure image from a DepPlan needs the plugin's "
+        'render_gap, and only c has one proven byte-identical to the gap it '
+        'hardcodes today'
+    )
 
 #: Test/dev hook: `module:callable` returning a ModelClient, used INSTEAD of the
 #: configured proxy. It exists so the offline suite can drive the whole pipeline
@@ -806,14 +834,18 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
              clone_kind: str | None = None,
              verifier: bool = False, llm_config: str | Path | None = None,
              verifier_min_criteria: int = DEFAULT_VERIFIER_MIN_CRITERIA,
+             resolve_env: bool = False, resolver: EnvResolver | None = None,
              echo=print) -> list[Entry]:
     """Select, carve, stage, and write one full harbor entry per context type.
 
     `verifier=False` is the whole existing behaviour, byte-for-byte: nothing in
     the verifier package is imported, no LLM is contacted, and the run stays
-    offline and `diff -r`-reproducible.
+    offline and `diff -r`-reproducible. `resolve_env=False` is the same promise
+    for the measure phase's environment -- see `_measure_and_pin`.
     """
     out = Path(out)
+    if resolve_env:
+        assert_resolve_env_supported(lang)
     plugin = langs_base.get(lang)
     plan = plan_carve(
         repo, out, lang=lang, carve_scope=carve_scope, package_base=package_base,
@@ -823,7 +855,10 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
     )
 
     if not plugin.parser_backed:
-        plan = _measure_and_pin(plan, plugin, out, echo=echo)
+        plan = _measure_and_pin(
+            plan, plugin, out, echo=echo,
+            resolve_env=resolve_env, resolver=resolver,
+        )
 
     inp = ContextInputs.build(
         repo=plan.repo, repo_name=plan.repo_name, target=plan.target,
@@ -984,7 +1019,39 @@ def emit_verifier_bundle(plan: CarvePlan, entries, *, llm_config=None,
     return True
 
 
-def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> CarvePlan:
+def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
+                      base_image: str, *, echo) -> DepPlan:
+    """The injected resolver's answer, canonicalised and validated, or a raise.
+
+    A `Refuse` becomes a raise rather than a fallback to the hardcoded gap: the
+    fallback would emit a task whose environment nobody vouched for, which is
+    the silent degradation the whole disposition rule exists to forbid.
+    """
+    if resolver is None:
+        raise langs_base.LangError(
+            '--resolve-env was passed but no resolver was injected, so there is '
+            'nothing to resolve the environment WITH. emit does not construct '
+            'one itself -- that would make a generate run reach the network from '
+            'a call chain whose whole contract is that it does not -- so the '
+            'caller passes one in; binding the flag to a real model client is a '
+            'later slice'
+        )
+    resolution = resolver(lang=plan.lang, repo=plan.repo, base_image=base_image)
+    if isinstance(resolution, Refuse):
+        raise ResolveRefused(resolution.reason)
+
+    resolved = depplan.canonicalize(resolution)
+    depplan.validate(resolved)
+    echo(
+        f'resolved env: {resolved.package_manager} toolchain '
+        f'{resolved.toolchain_version} ({depplan.dep_plan_digest(resolved)[:12]})'
+    )
+    return resolved
+
+
+def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
+                     resolve_env: bool = False,
+                     resolver: EnvResolver | None = None) -> CarvePlan:
     """Phase 1 of the two-phase build for whole-suite languages.
 
     Builds a never-ship measure image against the INTACT tree, runs the
@@ -993,10 +1060,19 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> Carve
     denominator. Reuses `graded.lock.json` from a prior run when the tree hash
     and base-image digest still match, so a second `generate` is fast and
     byte-identical.
+
+    `resolve_env=False` is every byte of that, unchanged: no resolver is called,
+    no plan is rendered and the lock grows no key. With it on, the GAP of the
+    measure Dockerfile comes from the injected resolver's `DepPlan` instead of
+    the plugin's hardcoded lines, and that plan is pinned into the lock so the
+    next run reuses the environment rather than re-resolving it.
     """
     import dataclasses
     from . import measure as measure_mod
     from . import verify as verify_mod
+
+    if resolve_env:
+        assert_resolve_env_supported(plan.lang)
 
     staging_dir = Path(out).resolve() / '_staging' / plan.staging_key
     measure_ctx = staging_dir / 'measure'
@@ -1032,6 +1108,14 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> Carve
         except measure_mod.MeasureError as exc:
             echo(f're-measuring: {lock_path} unreadable ({exc})')
 
+    dep_plan = (
+        _resolve_env_plan(resolver, plan, base_image, echo=echo)
+        if resolve_env
+        else None
+    )
+    if dep_plan is not None:
+        dockerfile_text = plugin.render_measure_dockerfile(env, dep_plan=dep_plan)
+
     measure_ctx.mkdir(parents=True, exist_ok=True)
     dockerfile = measure_ctx / 'Dockerfile'
     dockerfile.write_text(dockerfile_text, encoding='utf-8')
@@ -1050,6 +1134,7 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> Carve
         fingerprint_sha256={},
         repo_url=plan.provenance.repo_url if plan.provenance else None,
         commit=plan.provenance.commit if plan.provenance else None,
+        dep_plan=dep_plan,
     )
 
     runner_with_tooling = _MeasureRunnerAdapter(runner, tooling_context_dir)

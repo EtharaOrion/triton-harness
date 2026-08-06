@@ -49,6 +49,7 @@ __all__ = [
     'canonicalize',
     'dep_plan_digest',
     'env_lock_key',
+    'env_lock_key_from_canonical_json',
     'to_canonical_json',
     'validate',
 ]
@@ -337,5 +338,23 @@ def env_lock_key(repo_tree_sha256: str, base_image_digest: str, plan: DepPlan) -
     INTENT that resolution produced. Downloaded dependency bytes are never
     hashed -- see the module docstring.
     """
-    material = f'{repo_tree_sha256}\n{base_image_digest}\n{dep_plan_digest(plan)}'
+    return env_lock_key_from_canonical_json(
+        repo_tree_sha256, base_image_digest, to_canonical_json(plan),
+    )
+
+
+def env_lock_key_from_canonical_json(
+    repo_tree_sha256: str, base_image_digest: str, canonical_json: str,
+) -> str:
+    """`env_lock_key` recomputed from an ALREADY-PINNED canonical plan json.
+
+    A lock pins the plan as the exact canonical string it was keyed over, so a
+    reader can re-derive the key from those bytes without first parsing them
+    back into a `DepPlan`. That matters: a deserializer is a second, independent
+    definition of what a plan is, and two definitions of one record is how a
+    lock starts validating against a plan nobody rendered. The string IS the
+    intent, so hashing it is the whole check.
+    """
+    digest = hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
+    material = f'{repo_tree_sha256}\n{base_image_digest}\n{digest}'
     return hashlib.sha256(material.encode('utf-8')).hexdigest()

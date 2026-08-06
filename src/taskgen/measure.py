@@ -37,14 +37,24 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from .depplan import (
+    DepPlan,
+    dep_plan_digest,
+    env_lock_key,
+    env_lock_key_from_canonical_json,
+    to_canonical_json,
+)
 from .langs import base as langs_base
 
 __all__ = [
+    'LOCK_ENV_BLOCK',
     'LOCK_FILENAME',
     'MeasureError',
     'MeasureRequest',
     'assert_never_shipped',
+    'check_env_lock_key',
     'check_provenance',
+    'dep_plan_from_lock',
     'graded_set_from_lock',
     'is_measure_image',
     'load_lock',
@@ -60,6 +70,12 @@ __all__ = [
 
 LOCK_FILENAME = 'graded.lock.json'
 LOCK_SCHEMA = 1
+
+#: The ONE key a resolved `DepPlan` adds to the lock, and only when a plan was
+#: actually resolved. A lock measured without one carries no `env` block at all
+#: -- not an empty one -- because the lock is a regeneration proof compared byte
+#: for byte, and an empty block would rewrite every lock ever emitted.
+LOCK_ENV_BLOCK = 'env'
 TOOL_VERSION = 'taskgen/1'
 
 MEASURE_IMAGE_PREFIX = 'harbor-'
@@ -174,6 +190,38 @@ def repo_tree_sha256(repo) -> str:
     return hasher.hexdigest()
 
 
+def check_env_lock_key(
+    lock: Mapping, repo_sha256: str, intact_image_digest: str,
+) -> list[str]:
+    """Reasons a lock's PINNED environment does not key to this repo/image.
+
+    A lock with no pinned plan returns no reasons at all. That is deliberate
+    back-compat, not an oversight: every lock measured before a resolver existed
+    describes a hardcoded gap that no key was ever taken over, and invalidating
+    those would re-measure every repo in the corpus to learn nothing.
+
+    When a plan IS pinned the key is confirmatory, since `check_provenance`
+    already compared the tree and the image directly. It catches the case those
+    two cannot: a lock whose plan was edited after it was written.
+    """
+    canonical = dep_plan_from_lock(lock)
+    if not canonical:
+        return []
+    env = dict(lock.get(LOCK_ENV_BLOCK, {}))
+    expected = env_lock_key_from_canonical_json(
+        repo_sha256, intact_image_digest, canonical,
+    )
+    pinned = str(env.get('env_lock_key', ''))
+    if pinned == expected:
+        return []
+    reason = (
+        f'lock pins env_lock_key {pinned[:12] or "?"} but its pinned DepPlan '
+        f'keys to {expected[:12]} against this repo and base image -- the '
+        'pinned environment is not the one that was measured'
+    )
+    return [reason]
+
+
 def check_provenance(lock: Mapping, repo_sha256: str, intact_image_digest: str) -> list[str]:
     """Reasons this lock does not describe the repo/image being generated from."""
     prov = dict(lock.get('provenance', {}))
@@ -190,6 +238,7 @@ def check_provenance(lock: Mapping, repo_sha256: str, intact_image_digest: str) 
             f'{prov.get("intact_image_digest", "?")} but the image now resolves to '
             f'{intact_image_digest} -- the toolchain moved under the floor'
         )
+    reasons.extend(check_env_lock_key(lock, repo_sha256, intact_image_digest))
     return reasons
 
 
@@ -307,6 +356,7 @@ def build_lock(
     tool_version: str = TOOL_VERSION,
     repo_url: str | None = None,
     commit: str | None = None,
+    dep_plan: DepPlan | None = None,
 ) -> dict:
     if floor_mode not in langs_base.FLOOR_MODES:
         raise MeasureError(f'unknown floor_mode {floor_mode!r}')
@@ -321,7 +371,7 @@ def build_lock(
     if repo_url is not None:
         provenance['repo_url'] = str(repo_url)
         provenance['commit'] = str(commit or '')
-    return {
+    lock = {
         'carve_set_sha256': carve_set_sha256,
         'expected': int(expected),
         'fingerprint_sha256': dict(sorted(dict(fingerprint_sha256).items())),
@@ -333,6 +383,34 @@ def build_lock(
         'scope': scope,
         'tool_version': tool_version,
     }
+    if dep_plan is not None:
+        lock[LOCK_ENV_BLOCK] = _env_block(
+            dep_plan, repo_sha256=repo_sha256, intact_image_digest=intact_image_digest,
+        )
+    return lock
+
+
+def _env_block(
+    dep_plan: DepPlan, *, repo_sha256: str, intact_image_digest: str,
+) -> dict[str, str]:
+    """The resolved environment, pinned as the exact bytes its key was taken over.
+
+    `graded` above is already the pinned enumeration of the denominator, so the
+    ids are NOT repeated here: two copies of one collected set is two answers to
+    `what does this grade`, and the second one drifts.
+    """
+    canonical = to_canonical_json(dep_plan)
+    return {
+        'dep_plan': canonical,
+        'dep_plan_digest': dep_plan_digest(dep_plan),
+        'env_lock_key': env_lock_key(repo_sha256, intact_image_digest, dep_plan),
+    }
+
+
+def dep_plan_from_lock(lock: Mapping) -> str:
+    """The canonical plan json a lock pins, or `''` for a lock with no plan."""
+    env = lock.get(LOCK_ENV_BLOCK)
+    return str(env.get('dep_plan', '')) if isinstance(env, Mapping) else ''
 
 
 def render_lock(lock: Mapping) -> str:
@@ -386,6 +464,7 @@ class MeasureRequest:
     tool_version: str = TOOL_VERSION
     repo_url: str | None = None
     commit: str | None = None
+    dep_plan: DepPlan | None = None
 
     @property
     def image(self) -> str:
@@ -465,4 +544,5 @@ def measure(request: MeasureRequest, plugin, runner, echo=print) -> dict:
         tool_version=request.tool_version,
         repo_url=request.repo_url,
         commit=request.commit,
+        dep_plan=request.dep_plan,
     )

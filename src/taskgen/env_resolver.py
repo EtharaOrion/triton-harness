@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from taskgen.depplan import (
@@ -38,8 +39,10 @@ from taskgen.depplan import (
 )
 
 __all__ = [
+    'EnvResolver',
     'MAX_RESPONSE_TOKENS',
     'Refuse',
+    'ResolveRefused',
     'ResolverClient',
     'ResolverError',
     'SYSTEM_PROMPT',
@@ -69,6 +72,21 @@ class Refuse:
     reason: str
 
 
+class ResolveRefused(RuntimeError):
+    """A `Refuse` raised by a caller that had to either ship or stop.
+
+    `Refuse` is a VALUE a resolution can take; this is what happens when the
+    generator asked for an environment it cannot proceed without. It exists so
+    the refusal cannot be mistaken for a measurement failure and quietly retried
+    into a task with a floor of zero -- the plan's governing rule is SHIP or
+    REFUSE, never silently degrade.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _Response(Protocol):
     """Just the field this module reads off a completion."""
 
@@ -86,6 +104,21 @@ class ResolverClient(Protocol):
         max_tokens: int = 8192,
         reasoning_effort: str | None = None,
     ) -> _Response: ...
+
+
+class EnvResolver(Protocol):
+    """What `emit` injects when `--resolve-env` is on: repo facts in, plan out.
+
+    Deliberately NOT a `ResolverClient`. `emit` must be able to run this without
+    importing a model SDK or reading a config, so the seam it depends on is the
+    ANSWER, not the thing that answers. Binding this to an actual client -- and
+    with it the manifest gathering `build_user_prompt` needs -- is a later
+    slice; a test binds it to a canned plan.
+    """
+
+    def __call__(
+        self, *, lang: str, repo: Path, base_image: str,
+    ) -> DepPlan | Refuse: ...
 
 
 # --------------------------------------------------------------------------

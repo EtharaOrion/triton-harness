@@ -109,6 +109,7 @@ def cmd_generate(args) -> int:
         verifier=args.verifier,
         llm_config=args.llm_config,
         verifier_min_criteria=args.verifier_min_criteria,
+        resolve_env=args.resolve_env,
     )
     first = entries[0]
     print(f'language    {first.lang}')
@@ -218,6 +219,13 @@ def build_parser() -> argparse.ArgumentParser:
                           'golden-pass AND stub-fail before a bundle ships (default: '
                           f'{emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA}). Below the floor '
                           'the task ships WITHOUT a bundle -- additive and non-blocking')
+    gen.add_argument('--resolve-env', action='store_true',
+                     help='resolve the measure image\'s toolchain and dependency '
+                          'block from a structured DepPlan instead of the plugin\'s '
+                          'hardcoded lines, and pin that plan into graded.lock.json. '
+                          'OFF by default: without it the emitted bytes and the lock '
+                          'are exactly what they always were. c only in this slice; a '
+                          'reused lock never re-resolves')
     gen.set_defaults(func_impl=cmd_generate)
 
     ver = sub.add_parser(
