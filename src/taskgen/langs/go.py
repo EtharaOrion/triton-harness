@@ -36,10 +36,17 @@ from typing import ClassVar, Mapping
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
-__all__ = ['GoPlugin', 'GO_VERSION', 'GOROOT', 'MODCACHE']
+__all__ = ['GoPlugin', 'GO_VERSION', 'GOROOT', 'MODCACHE', 'BASE_IMAGE']
 
 GO_VERSION = '1.26.5'
-GOROOT = '/opt/go1.26'
+#: mise owns the install prefix, so GOROOT is derived from the selected version
+#: rather than a fixed path: a hardcoded prefix silently disagrees with the pin
+#: the moment the two differ, which is the failure a pin exists to prevent.
+GOROOT = f'/opt/mise/installs/go/{GO_VERSION}'
+
+#: Per-language base carrying every baked toolchain, so a task build no longer
+#: downloads a ~250MB tarball from go.dev in both the warm and the graded stage.
+BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-go@sha256:abdab54f9db151b240adf233cd03a931c4b90e9600767d7c56d33d6f7c4063db'
 MODCACHE = '/opt/go/pkg/mod'
 GOCACHE = '/opt/go/cache'
 MODWARM = '/opt/modwarm'
@@ -63,33 +70,34 @@ class GoPlugin(B.LangPlugin):
     # --- axis 1 -----------------------------------------------------------
 
     def toolchain_spec(self) -> ToolchainSpec:
-        """The pinned tarball, unpacked to a versioned prefix.
+        """Select one of the toolchains the base bakes, and prove the selection.
 
         Not `apt install golang`: the distro's go is whatever the base image's
         release froze, and the benchmark's whole premise is that two runs a year
-        apart compile the same way.
+        apart compile the same way. Not a tarball download either -- the base
+        already carries the versions, and fetching one per task build is a
+        network dependency and a ~250MB layer in both stages.
+
+        The assertion runs under `bash -lc` because the base re-exports its own
+        PATH from /etc/profile.d ahead of the mise shims, so a plain RUN can
+        report the pin holding while the graded run uses the base default.
         """
-        install = f'''# go{self.go_version}, from the pinned tarball. The archive is unpacked to a
-# VERSIONED prefix so that a second toolchain could coexist rather than
-# overwrite -- silently overwriting is how a pin stops being a pin.
+        install = f'''# go{self.go_version} is baked into the base; select it rather than downloading.
+RUN set -eux; mise use -g go@{self.go_version}
 RUN set -eux; \\
-    arch="$(uname -m)"; \\
-    case "${{arch}}" in \\
-      x86_64|amd64) goarch=amd64 ;; \\
-      aarch64|arm64) goarch=arm64 ;; \\
-      *) echo "unsupported architecture: ${{arch}}" >&2; exit 1 ;; \\
-    esac; \\
-    curl -fsSL "https://go.dev/dl/go{self.go_version}.linux-${{goarch}}.tar.gz" \\
-      -o /tmp/go.tar.gz; \\
-    mkdir -p {self.goroot}; \\
-    tar -C {self.goroot} --strip-components=1 -xzf /tmp/go.tar.gz; \\
-    rm -f /tmp/go.tar.gz; \\
-    {self.goroot}/bin/go version'''
+    printf 'export PATH="/opt/mise/shims:$PATH"\\n' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\
+    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh
+RUN set -eux; \\
+    v="$(bash -lc 'go version')"; \\
+    case "$v" in \\
+        *"go{self.go_version}"*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\
+        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want go{self.go_version}" >&2; exit 42 ;; \\
+    esac'''
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image=BASE_IMAGE,
             install_block=install,
             env={
-                'PATH': f'{self.goroot}/bin:/usr/local/bin:/usr/bin:/bin',
+                'PATH': '/opt/mise/shims:/usr/local/bin:/usr/bin:/bin',
                 'GOROOT': self.goroot,
                 # `local` forbids go from fetching another toolchain for a
                 # `go 1.2x` directive: offline that is a build failure, online

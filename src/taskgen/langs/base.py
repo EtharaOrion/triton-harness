@@ -121,7 +121,10 @@ class LangError(RuntimeError):
 class ToolchainSpec:
     """Axis 1: how the language's compiler/runtime gets into the image."""
 
-    base_image: str = 'harbor-base:local'
+    #: No default. A plugin that forgets to name its base would otherwise
+    #: silently inherit whichever image the default happened to hold, which is
+    #: how a task lands on the wrong toolchain without anything failing.
+    base_image: str
     install_block: str = ''
     env: Mapping[str, str] = field(default_factory=dict)
     workdir: str = WORKDIR

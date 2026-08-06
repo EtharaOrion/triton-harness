@@ -84,11 +84,12 @@ def test_plugin_is_registered_under_its_name():
 # ------------------------------------------------------- axis 1: toolchain --
 
 
-def test_toolchain_installs_the_pinned_go_tarball(plugin):
+def test_toolchain_selects_the_pinned_go_the_base_already_carries(plugin):
+    """The tarball fetch is gone because the base bakes the toolchains, but the
+    version pin it used to enforce still has to be explicit in the block."""
     block = plugin.toolchain()
     assert 'go1.26.5' in block
-    assert '/opt/go1.26' in block
-    assert '.tar.gz' in block
+    assert '.tar.gz' not in block, 'the base carries the toolchain; do not re-download it'
 
 
 def test_toolchain_puts_go_on_path_and_pins_the_toolchain_to_local(plugin):
@@ -96,8 +97,8 @@ def test_toolchain_puts_go_on_path_and_pins_the_toolchain_to_local(plugin):
     which offline is a build failure, and online is an unpinned toolchain."""
     env = plugin.toolchain_spec().env
     assert env['GOTOOLCHAIN'] == 'local'
-    assert '/opt/go1.26/bin' in env['PATH']
-    assert env['GOROOT'] == '/opt/go1.26'
+    assert '/opt/mise/shims' in env['PATH']
+    assert env['GOROOT'] == '/opt/mise/installs/go/1.26.5'
 
 
 def test_the_graded_image_is_offline_by_environment_not_by_convention(plugin):
@@ -486,10 +487,41 @@ def test_the_warm_stage_never_sees_the_repo(plugin):
     """invariant 7/2: a warm stage with the sources has the answer in a layer."""
     env = B.EnvSpec(repo_name='go-multigres')
     text = plugin.render_dockerfile(env)
-    warm, _, graded = text.partition(f'FROM harbor-base:local AS {env.stage}')
+    base = plugin.toolchain_spec().base_image
+    warm, _, graded = text.partition(f'FROM {base} AS {env.stage}')
     assert 'AS warm' in warm
     assert f'COPY --from={env.repo_context} repo/ ' not in warm, 'warm stage got the tree'
     for manifest in plugin.dep_warm_spec().files_needed:
         assert manifest in warm, f'{manifest} never reaches the warm stage'
     directives = [ln for ln in graded.splitlines() if ln.startswith('FROM ')]
     assert not any(ln.startswith('FROM warm') for ln in directives)
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_go_builds_on_the_versioned_per_language_base(plugin):
+    """The base bakes the toolchains, so the task build stops downloading one.
+
+    go.py fetched a ~250MB tarball from go.dev in BOTH the warm and the graded
+    stage of every task build -- two large downloads and a hard network
+    dependency for a toolchain the base can simply carry.
+    """
+    assert plugin.toolchain_spec().base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-go@sha256:')
+
+
+def test_go_does_not_download_a_toolchain_the_base_already_carries(plugin):
+    assert 'go.dev/dl' not in plugin.toolchain()
+    assert 'curl' not in plugin.toolchain()
+
+
+def test_go_pins_the_runtime_and_proves_it_under_a_login_shell(plugin):
+    """Same failure mode python has: the base re-exports its own PATH from
+    /etc/profile.d ahead of the mise shims, so a pin can pass at build time
+    while the graded run executes on the base default.
+    """
+    tc = plugin.toolchain()
+    assert 'mise use -g go@' in tc
+    assert '/etc/profile.d/zz-harbor-toolchain-pin.sh' in tc
+    assert 'TOOLCHAIN PIN FAILED' in tc
+    assert 'bash -lc' in tc

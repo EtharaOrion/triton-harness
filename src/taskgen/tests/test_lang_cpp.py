@@ -151,13 +151,13 @@ def test_default_stub_body_resolves_for_cpp():
 
 def test_toolchain_uses_harbor_base(plugin):
     tc = plugin.toolchain_spec()
-    assert tc.base_image == 'harbor-base:local'
+    assert tc.base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-cpp@sha256:')
     assert tc.workdir == B.WORKDIR
     assert tc.env['CC'] == 'gcc-14'
     assert tc.env['CXX'] == 'g++-14'
 
 
-def test_toolchain_installs_ninja_g14_and_clang_from_apt(plugin):
+def test_toolchain_relies_on_the_base_for_ninja_g14_and_clang(plugin):
     """cpp is the first plugin whose install actually apt-installs at build time.
 
     harbor-base lacks cmake 4.4, g++-14, ninja and clang; all four have to be
@@ -165,12 +165,12 @@ def test_toolchain_installs_ninja_g14_and_clang_from_apt(plugin):
     """
     tc = plugin.toolchain_spec()
     block = tc.install_block
-    assert 'apt-get install' in block
-    assert 'ninja-build' in block
+    assert 'apt-get install' not in block, 'the base carries the toolchain'
+    assert 'apt.kitware.com' not in block, 'no Kitware key import per task build'
     assert 'g++-14' in block
     assert 'clang' in block
-    assert 'apt.kitware.com' in block
     assert 'cmake' in block
+    assert 'TOOLCHAIN PIN FAILED' in block
 
 
 def test_toolchain_uses_update_alternatives_for_c14_default(plugin):
@@ -373,7 +373,7 @@ def test_render_dockerfile_asserts_invariants():
     instructions = '\n'.join(
         ln for ln in text.splitlines() if not ln.lstrip().startswith('#')
     )
-    assert 'FROM harbor-base:local AS graded' in text
+    assert f'FROM {plugin.toolchain_spec().base_image} AS graded' in text
     assert 'repos-src' not in instructions
     assert 'repo-src' not in instructions
     assert 'FROM warm' not in instructions
@@ -387,7 +387,7 @@ def test_render_dockerfile_installs_toolchain_before_leak_gate():
     plugin = CPP.CppPlugin()
     env = B.EnvSpec(repo_name='cpp-Rux')
     text = plugin.render_dockerfile(env)
-    assert text.index('apt-get install') < text.index('leakscan.sh')
+    assert text.index('TOOLCHAIN PIN FAILED') < text.index('leakscan.sh')
 
 
 def test_render_measure_dockerfile_uses_intact_tree(plugin):
@@ -405,9 +405,9 @@ def test_render_measure_dockerfile_includes_toolchain_install(plugin):
     """Same apt install as the shipped image -- measure needs cmake/ninja/g++-14 too."""
     env = B.EnvSpec(repo_name='cpp-Rux')
     text = plugin.render_measure_dockerfile(env)
-    assert 'ninja-build' in text
     assert 'g++-14' in text
-    assert 'apt.kitware.com' in text
+    assert 'cmake' in text
+    assert 'apt.kitware.com' not in text
 
 
 def test_plan_carve_expands_grader_fingerprint_globs(tmp_path):
@@ -439,3 +439,18 @@ def test_plan_carve_expands_grader_fingerprint_globs(tmp_path):
     assert 'Tests/Unit/ThirdParty/doctest.h' in fps
     assert not any(fp.startswith('Compiler/') for fp in fps)
     assert 'CMakeLists.txt' not in fps
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_cpp_builds_on_the_versioned_per_language_base(plugin):
+    assert plugin.toolchain_spec().base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-cpp@sha256:')
+
+
+def test_cpp_does_not_apt_install_a_toolchain_the_base_already_carries(plugin):
+    """The base ships cmake 4.4.2, g++-14 14.2.0, ninja 1.12.1 and clang 19.1.7 --
+    exactly the set this block used to apt-install on every task build, at the
+    cost of two `apt-get update`s and an unpinned package resolution."""
+    assert 'apt-get install' not in plugin.toolchain()
+    assert 'apt-get update' not in plugin.toolchain()

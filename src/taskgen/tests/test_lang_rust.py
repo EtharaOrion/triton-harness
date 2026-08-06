@@ -92,11 +92,12 @@ def test_selector_kind_registered_for_rust():
 # ------------------------------------------------------- axis 1: toolchain --
 
 
-def test_toolchain_installs_pinned_rustc(plugin):
+def test_toolchain_selects_pinned_rustc_from_the_base(plugin):
     block = plugin.toolchain()
     assert '1.87.0' in block
-    assert 'rustup toolchain install 1.87.0' in block
-    assert 'rustup default 1.87.0' in block
+    assert 'TOOLCHAIN PIN FAILED' in block
+    assert '1.87.0' in block
+    assert 'rustup' not in block, 'the base carries rustc; do not reinstall it'
 
 
 def test_toolchain_does_not_set_cargo_net_offline_true_in_env(plugin):
@@ -313,16 +314,21 @@ def test_dockerfile_includes_strings_target_leak_assert(plugin):
     assert 'LEAK' in df
 
 
-def test_dockerfile_bind_mounts_wabt_from_the_tooling_context(plugin):
-    """The tarball reaches the image via bind mount, not COPY, so it does not
-    leave a layer of its own."""
+def test_dockerfile_still_binds_leakscan_from_the_tooling_context(plugin):
+    """Dropping the wabt asset must not disturb the OTHER tooling-context user.
+
+    leakscan.sh reaches the image by bind mount so it leaves no layer of its
+    own; removing the wabt tarball from the same context is exactly the kind of
+    change that could take leakscan with it.
+    """
     df = _df(plugin)
-    assert f'--mount=type=bind,from={B.TOOLING_CONTEXT},source={R.WABT_TARBALL}' in df
+    assert f'--mount=type=bind,from={B.TOOLING_CONTEXT}' in df
+    assert 'leakscan.sh' in df
 
 
 def test_dockerfile_declares_the_graded_stage(plugin):
     df = _df(plugin)
-    assert 'FROM harbor-base:local AS graded' in df
+    assert f'FROM {plugin.toolchain_spec().base_image} AS graded' in df
 
 
 def test_measure_dockerfile_has_no_leak_gate_or_strings_assert(plugin):
@@ -342,7 +348,7 @@ def test_measure_dockerfile_has_no_leak_gate_or_strings_assert(plugin):
 
 def test_measure_dockerfile_includes_toolchain_and_wabt_and_vendor(plugin):
     df = plugin.render_measure_dockerfile(B.EnvSpec(repo_name='rust-spacewasm'))
-    assert 'rustup toolchain install 1.87.0' in df
+    assert 'rustc' in df and '1.87.0' in df
     assert 'wast2json --version' in df
     assert 'cargo vendor' in df
     assert 'measure.sh' in df
@@ -357,12 +363,10 @@ def test_measure_dockerfile_tags_the_stage_as_never_ship(plugin):
 # ---------------------------------------------- plugin static assets --------
 
 
-def test_extra_ctx_assets_returns_wabt_tarball(plugin):
-    assets = plugin.extra_ctx_assets()
-    assert len(assets) == 1
-    src, name = assets[0]
-    assert Path(src).is_file()
-    assert name == R.WABT_TARBALL
+def test_extra_ctx_assets_is_empty_now_the_base_carries_wabt(plugin):
+    """rust used to stage a per-architecture tarball here; the base ships the
+    wabt suite, so rust stages nothing and matches python and go."""
+    assert plugin.extra_ctx_assets() == ()
 
 
 def test_extra_ctx_assets_base_default_is_empty():
@@ -707,3 +711,53 @@ def test_plan_carve_takes_the_no_parser_branch_for_rust(tmp_path):
     assert plan.graded.expected == 1  # placeholder before measure
     assert 'src/lib.rs' in plan.carve.carved_relpaths
     assert 'src/util.rs' in plan.carve.carved_relpaths
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_rust_builds_on_the_versioned_per_language_base(plugin):
+    assert plugin.toolchain_spec().base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-rust@sha256:')
+
+
+def test_rust_does_not_rustup_install_a_toolchain_the_base_carries(plugin):
+    """The base ships rustc/cargo 1.87.0, so `rustup toolchain install` is a
+    network reach and a layer for a compiler already present."""
+    assert 'rustup' not in plugin.toolchain()
+
+
+def test_rust_wabt_is_not_architecture_hardcoded(plugin):
+    """`wabt-1.0.41-linux-arm64.tar.gz` names one architecture, so a task image
+    could only ever build on arm64. The base ships wasm2wat 1.0.41 already, so
+    the vendored tarball -- and its arch literal -- can go entirely."""
+    assert 'linux-arm64' not in plugin.toolchain()
+    assert 'arm64' not in plugin.toolchain()
+
+
+def test_rust_pins_the_runtime_and_proves_it_under_a_login_shell(plugin):
+    tc = plugin.toolchain()
+    assert "bash -lc" in tc, 'the pin must be proven as a login shell'
+    assert '/etc/profile.d/zz-harbor-toolchain-pin.sh' in tc
+    assert 'TOOLCHAIN PIN FAILED' in tc
+    assert 'bash -lc' in tc
+
+
+def test_rust_dockerfile_carries_no_architecture_locked_wabt_tarball(plugin):
+    """`wabt-1.0.41-linux-arm64.tar.gz` names one architecture in the emitted
+    Dockerfile, so the image could only ever build on arm64. The base ships the
+    whole wabt suite -- wast2json included -- at the pinned 1.0.41, so both the
+    vendored tarball and its arch literal are unnecessary. The dependency must
+    still be ASSERTED, just not installed.
+    """
+    env = B.EnvSpec(repo_name='rust-spacewasm')
+    df = plugin.render_dockerfile(env)
+    assert 'linux-arm64' not in df
+    assert 'wabt.tar.gz' not in df
+    assert 'wast2json' in df
+
+
+def test_rust_stages_no_wabt_asset_into_the_tooling_context(plugin):
+    """The tooling context still carries leakscan.sh; it must no longer carry a
+    per-architecture tarball the base already provides."""
+    assets = plugin.extra_ctx_assets()
+    assert not any('wabt' in name for _, name in assets)

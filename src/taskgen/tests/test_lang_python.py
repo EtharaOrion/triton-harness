@@ -81,12 +81,19 @@ def test_plugin_is_registered_under_its_name():
 # ---------------------------------------------- axis 1-2: parity of the env --
 
 
-def test_toolchain_installs_the_same_pinned_uv_as_the_proven_entry(plugin):
+def test_toolchain_keeps_the_same_pinned_uv_as_the_proven_entry(plugin):
+    """The pin is now a claim about the BASE rather than an install line.
+
+    The base ships uv, so the task build no longer installs it; the parity with
+    emit.UV_VERSION still has to hold, because it is the same resolver either
+    way and a drift between them would resolve a different lockfile.
+    """
     from taskgen import emit
 
-    assert f'uv=={PY.UV_VERSION}' in plugin.toolchain()
     assert PY.UV_VERSION == emit.UV_VERSION, \
         'the pin must match the entry this plugin replaces'
+    assert PY.UV_VERSION in plugin.toolchain(), \
+        'the emitted block must name the uv version the base is expected to ship'
 
 
 def test_toolchain_keeps_the_uv_environment_of_the_proven_entry(plugin):
@@ -363,3 +370,35 @@ def test_a_tampered_test_file_fails_the_fingerprint_gate(plugin, graded, tmp_pat
     got = _run(plugin.render_test_sh(graded), tmp_path,
                selected=5, tests=5, failures=0, sha='ff' * 32)
     assert got['reward'] == 0.0
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_python_builds_on_the_versioned_per_language_base(plugin):
+    """The one-size-fits-all harbor-base carries a single fixed python and no
+    version manager, so every task that needs another runtime has to patch the
+    base at build time. The per-language base bakes the versions instead.
+    """
+    assert plugin.toolchain_spec().base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-python@sha256:')
+
+
+def test_python_does_not_reinstall_the_uv_the_base_already_ships(plugin):
+    """`pip install uv` was there because harbor-base shipped none. The
+    versioned base ships uv 0.12.1, so re-installing it is a network reach and a
+    layer on every single task build, for a binary already present.
+    """
+    assert 'pip install' not in plugin.toolchain()
+
+
+def test_python_pins_the_runtime_and_proves_it_under_a_login_shell(plugin):
+    """A build-time-only assertion is not enough: the base re-exports its own
+    PATH from /etc/profile.d, so a pin can pass at build time and the graded run
+    still execute on the base default. harbor's test.sh runs as a login shell,
+    so the assertion has to run as one too.
+    """
+    tc = plugin.toolchain()
+    assert 'mise use -g python@' in tc
+    assert '/etc/profile.d/zz-harbor-toolchain-pin.sh' in tc
+    assert 'TOOLCHAIN PIN FAILED' in tc
+    assert 'bash -lc' in tc

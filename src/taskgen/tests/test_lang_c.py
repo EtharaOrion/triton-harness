@@ -135,7 +135,7 @@ def test_rust_whole_suite_selection_stays_byte_identical_with_empty_fingerprints
 
 def test_toolchain_uses_harbor_base(plugin):
     tc = plugin.toolchain_spec()
-    assert tc.base_image == 'harbor-base:local'
+    assert tc.base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-c@sha256:')
     assert tc.workdir == B.WORKDIR
     assert tc.env['LC_ALL'] == 'C.UTF-8'
     assert tc.env['MAKEFLAGS'] == '-j4'
@@ -336,7 +336,7 @@ def test_render_dockerfile_asserts_invariants():
     instructions = '\n'.join(
         ln for ln in text.splitlines() if not ln.lstrip().startswith('#')
     )
-    assert 'FROM harbor-base:local AS graded' in text
+    assert f'FROM {plugin.toolchain_spec().base_image} AS graded' in text
     assert 'repos-src' not in instructions
     assert 'repo-src' not in instructions
     assert 'FROM warm' not in instructions
@@ -414,3 +414,25 @@ def test_plan_carve_expands_grader_fingerprint_globs(tmp_path):
     assert 'tests/conformance/hello.xs' in fps
     assert 'tests/unit/lexer_test.c' in fps
     assert not any(fp.startswith('src/runtime/') for fp in fps)
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_c_proves_its_compiler_under_a_login_shell(plugin):
+    """c had no toolchain assertion at all, which made it the one language where
+    a base shipping a different gcc would go unnoticed until the numbers moved.
+
+    There is no mise selection to make here -- gcc comes from the base's apt
+    layer, not from a shim -- but the ASSERTION is what turns a silent
+    substitution into a build failure, so it is emitted regardless.
+    """
+    tc = plugin.toolchain()
+    assert 'TOOLCHAIN PIN FAILED' in tc, 'c emits no toolchain assertion'
+    assert "bash -lc" in tc, 'the assertion must run as a login shell, as test.sh does'
+    assert '13.3' in tc
+
+
+def test_c_builds_on_a_digest_pinned_base(plugin):
+    """A tag can be moved under the benchmark; a digest cannot."""
+    assert '@sha256:' in plugin.toolchain_spec().base_image

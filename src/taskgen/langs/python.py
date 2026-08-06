@@ -46,10 +46,19 @@ from typing import ClassVar, Mapping
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
-__all__ = ['PythonPlugin', 'UV_VERSION']
+__all__ = ['PythonPlugin', 'UV_VERSION', 'PYTHON_VERSION', 'BASE_IMAGE']
 
 #: Matches emit.UV_VERSION. An unpinned resolver is a reproducibility hole.
 UV_VERSION = '0.12.1'
+
+#: The runtime this task is graded on, selected from the several the base bakes.
+#: Pinning here rather than inheriting the base default is what stops a rebuild
+#: of the base from silently moving the interpreter under the benchmark.
+PYTHON_VERSION = '3.10.20'
+
+#: Per-language base: every baked runtime plus uv and mise, so no task build has
+#: to reach the network to patch its own toolchain.
+BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-python@sha256:dd204a8e01253845e88953524f4e3078583b95f6652d5c099cce18491d33d707'
 
 _ALLOWLIST = f'{B.TESTS_DIR}/allowlist.txt'
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
@@ -65,20 +74,34 @@ class PythonPlugin(B.LangPlugin):
     synthesizes_git: ClassVar[bool] = True
 
     uv_version: ClassVar[str] = UV_VERSION
+    python_version: ClassVar[str] = PYTHON_VERSION
 
     # --- axis 1 -----------------------------------------------------------
 
     def toolchain_spec(self) -> ToolchainSpec:
-        """uv from the PyPI wheel, not the official installer.
+        """Select one baked runtime, and prove the selection survives a login shell.
 
-        The installer pulls from github.com, which harbor-base blackholes.
+        A build-time assertion alone is not sound. The base re-exports its own
+        PATH from /etc/profile.d/harbor-toolchain.sh, ahead of the mise shims;
+        profile.d is sourced in sorted order, so only a zz- file keeps the pin in
+        front. harbor's test.sh and solve.sh run as login shells, so an
+        assertion that is not itself a login shell can pass while the graded run
+        executes on the base default -- observed, not theorised.
         """
-        install = f'''# harbor-base ships no uv. The official installer pulls from github.com,
-# which the base image blackholes, so install the PyPI wheel instead.
-RUN pip install --no-cache-dir uv=={self.uv_version} \\
- && uv --version'''
+        install = f'''# The base bakes several runtimes and ships uv {self.uv_version}; select one.
+RUN set -eux; mise use -g python@{self.python_version}
+RUN set -eux; \\
+    printf 'export PATH="/opt/mise/shims:$PATH"\\n' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\
+    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh
+RUN set -eux; \\
+    v="$(bash -lc 'python3 --version')"; \\
+    case "$v" in \\
+        *"{self.python_version}"*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\
+        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want {self.python_version}" >&2; exit 42 ;; \\
+    esac
+RUN uv --version'''
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image=BASE_IMAGE,
             install_block=install,
             env={
                 'HARBOR_REPO': B.WORKDIR,

@@ -88,10 +88,20 @@ class CPlugin(B.LangPlugin):
             '# The c-xs repo compiles with -lm -lpthread -ldl only (libc6-dev), so\n'
             '# there is nothing to install here; the version echo makes the layer\n'
             '# non-empty and prints the exact toolchain grades will use.\n'
-            'RUN gcc --version | head -1 && make --version | head -1'
+            'RUN gcc --version | head -1 && make --version | head -1\n'
+            '# gcc is baked into the base image, so there is no shim to reorder --\n'
+            '# but an UNASSERTED compiler is how a base swap moves the published\n'
+            '# numbers with nothing failing. Run as a login shell because that is\n'
+            "# how harbor's test.sh resolves the compiler at grade time.\n"
+            'RUN set -eux; \\\n'
+            '    g="$(bash -lc \'gcc --version | head -1\')"; \\\n'
+            '    case "$g" in \\\n'
+            '      *13.3*) echo "TOOLCHAIN PIN OK (login shell): $g" ;; \\\n'
+            '      *) echo "TOOLCHAIN PIN FAILED (login shell): got $g want gcc 13.3" >&2; exit 42 ;; \\\n'
+            '    esac'
         )
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image='426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-c@sha256:3adb49fa8da50672faa73062b9c27a5f5c5d9e79c5806f17aa4655c70f715497',
             install_block=install,
             env={
                 'LC_ALL': 'C.UTF-8',

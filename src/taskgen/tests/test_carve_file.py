@@ -308,3 +308,24 @@ def test_carve_files_fails_closed_on_a_missing_file(repo):
 def test_carve_files_fails_closed_on_an_empty_set(repo):
     with pytest.raises(CarveFileError):
         carve_files(repo, [], mode=CarveFileMode.SKELETON, stub_body=STUB, language='python')
+
+
+def test_partition_carveable_reports_why_the_parser_refused(tmp_path):
+    """A parser refusal must not masquerade as 'this file has no functions'.
+
+    Two very different causes -- a tree-sitter grammar that is not installed,
+    and a language the carve layer does not support at all -- were both being
+    swallowed into `carveable = False`, so the caller reported
+    'none of the N glob-matched file(s) holds a <lang> function body'. That
+    sends the reader hunting for a better --include when the real fix is
+    installing a wheel or using --delete-whole-file.
+    """
+    from taskgen.carve import _partition_carveable
+
+    (tmp_path / 'a.c').write_text('int main(void) { return 0; }\n', encoding='utf-8')
+    keep, skipped, reasons = _partition_carveable(tmp_path, ('a.c',), 'c')
+
+    assert not keep
+    assert skipped == ('a.c',)
+    assert reasons, 'the parser refusal reason must reach the caller'
+    assert 'unsupported language' in reasons[0]

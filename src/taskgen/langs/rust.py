@@ -53,17 +53,19 @@ __all__ = [
     'HARNESSES',
     'INTEGRITY_HARNESS_FILES',
     'MIN_WAST',
+    'BASE_IMAGE',
     'RUST_VERSION',
     'RustPlugin',
     'TEST_COMMAND',
-    'WABT_TARBALL',
     'WABT_VERSION',
-    'wabt_tarball_path',
 ]
 
 RUST_VERSION = '1.87.0'
+
+#: Per-language base carrying rustc/cargo and wasm2wat already, so no task build
+#: reaches static.rust-lang.org for a compiler the image can simply hold.
+BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-rust@sha256:9bb61cf220efe0c7c8236841c3cb985aa2ce744c414e1fbeaab858832daae911'
 WABT_VERSION = '1.0.41'
-WABT_TARBALL = f'wabt-{WABT_VERSION}-linux-arm64.tar.gz'
 
 #: The four graded integration harnesses. They survive the src/ carve because
 #: every symbol they touch is either a compilable test-side helper (in
@@ -106,25 +108,6 @@ _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
 _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 
 
-def wabt_tarball_path() -> Path:
-    """Locate the vendored wabt tarball: the in-repo `repo/vendor/` copy first,
-    then the external `harbor-tasks/shared/vendor/`. Walks up from this file's
-    location rather than baking a host path.
-    """
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        for candidate in (
-            parent / 'repo' / 'vendor' / WABT_TARBALL,
-            parent / 'harbor-tasks' / 'shared' / 'vendor' / WABT_TARBALL,
-        ):
-            if candidate.is_file():
-                return candidate
-    raise B.LangError(
-        f'wabt tarball {WABT_TARBALL} not found under any ancestor of {here}; '
-        'expected under repo/vendor/ or harbor-tasks/shared/vendor/'
-    )
-
-
 class RustPlugin(B.LangPlugin):
     """rustc 1.87 + wabt 1.0.41, whole-suite equality floor, measured denominator."""
 
@@ -141,7 +124,7 @@ class RustPlugin(B.LangPlugin):
     # --- axis 1 -----------------------------------------------------------
 
     def toolchain_spec(self) -> ToolchainSpec:
-        """rustc 1.87.0 via rustup, on top of harbor-base:local's older toolchain.
+        """Select the rustc the base bakes, and prove it under a login shell.
 
         harbor-base ships rustc 1.79 per the reference Dockerfile, but the
         crate under test declares edition 2024 / rust-version 1.87. The install
@@ -156,17 +139,23 @@ class RustPlugin(B.LangPlugin):
         make it un-overridable and break the vendor step.
         """
         install = (
-            f'# rustc {self.rust_version} via rustup. Edition 2024 needs >=1.85; the\n'
-            f'# spacewasm crate declares rust-version {self.rust_version}. harbor-base\n'
-            '# ships rustc 1.79 (per the reference Dockerfile), so a newer toolchain\n'
-            '# must be installed here rather than assumed. Network is allowed at\n'
-            '# build time only.\n'
-            f'RUN rustup toolchain install {self.rust_version} --profile minimal \\\n'
-            f' && rustup default {self.rust_version} \\\n'
-            ' && rustc --version && cargo --version'
+            f'# rustc {self.rust_version} is baked into the base; select it rather\n'
+            '# than reaching static.rust-lang.org on every task build.\n'
+            '# profile.d is sourced in sorted order and the base re-exports its own\n'
+            '# PATH ahead of the mise shims, so only a zz- file keeps the pin in front\n'
+            "# for the login shells harbor's test.sh and solve.sh run as.\n"
+            'RUN set -eux; \\\n'
+            '    printf \'export PATH="/opt/mise/shims:$PATH"\\n\' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\\n'
+            '    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh\n'
+            'RUN set -eux; \\\n'
+            '    v="$(bash -lc \'rustc --version\')"; \\\n'
+            '    case "$v" in \\\n'
+            f'        *"{self.rust_version}"*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\\n'
+            f'        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want {self.rust_version}" >&2; exit 42 ;; \\\n'
+            '    esac'
         )
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image=BASE_IMAGE,
             install_block=install,
             env={
                 'CARGO_TERM_COLOR': 'never',
@@ -383,20 +372,11 @@ class RustPlugin(B.LangPlugin):
     # --- axis 8 + the image ----------------------------------------------
 
     def extra_ctx_assets(self) -> tuple[tuple[Path, str], ...]:
-        """The wabt tarball, staged into each entry's tooling/ context.
-
-        The Dockerfile bind-mounts it out of the tooling context so it does not
-        leave a layer of its own. `_copy_leakscan` in emit.py copies these
-        beside leakscan.sh so both are available under the same named context.
+        """Nothing. The base carries wabt, so the tooling context holds only
+        leakscan.sh. The vendored tarball it used to stage was named for one
+        architecture, which pinned every rust task image to arm64.
         """
-        tarball = wabt_tarball_path()
-        if not tarball.is_file():
-            raise B.LangError(
-                f'wabt tarball missing at {tarball}. rust plugin needs '
-                f'wast2json {self.wabt_version} for the graded .wast harness; '
-                'check the harbor-tasks/shared/vendor/ tree'
-            )
-        return ((tarball, WABT_TARBALL),)
+        return ()
 
     def pre_leakgate_blocks(self, env: EnvSpec) -> tuple[str, ...]:
         """The four RUN blocks that turn a bare rustc image into a graded one.
@@ -415,15 +395,14 @@ class RustPlugin(B.LangPlugin):
         wabt_install = '\n'.join([
             f'# wabt {self.wabt_version}: wast2json is a HARD runtime dependency of the graded',
             "# harness (tests/util/spectest.rs shells out to it for every .wast file).",
-            "# Ubuntu's 1.0.34 rejects --enable-custom-page-sizes; the repo's own CI",
-            f'# pins {self.wabt_version}. The tarball is a plugin asset, bind-mounted from the',
-            '# tooling context so it does not leave a layer of its own.',
-            f'RUN --mount=type=bind,from={env.tooling_context},'
-            f'source={WABT_TARBALL},target=/tmp/wabt.tar.gz \\',
-            '    tar -xzf /tmp/wabt.tar.gz -C /tmp \\',
-            f' && cp /tmp/wabt-{self.wabt_version}/bin/* /usr/local/bin/ \\',
-            f' && rm -rf /tmp/wabt-{self.wabt_version} \\',
-            ' && wast2json --version',
+            f'# The base ships the wabt suite at {self.wabt_version}, so this ASSERTS the',
+            '# dependency rather than installing it. Asserted under a login shell because',
+            "# that is how harbor's test.sh resolves it at grade time.",
+            'RUN set -eux; \\',
+            "    v=\"$(bash -lc 'wast2json --version')\"; \\",
+            f'    case \"$v\" in *{self.wabt_version}*) echo \"WABT OK (login shell): $v\" ;; \\',
+            f'      *) echo \"TOOLCHAIN PIN FAILED (login shell): wast2json $v want {self.wabt_version}\" >&2; exit 42 ;; \\',
+            '    esac',
         ])
 
         # Prune out-of-scope workspace members so cargo vendor covers only the

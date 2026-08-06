@@ -364,13 +364,14 @@ def build_carve_set(
 
     keep, skipped = rels, ()
     if mode is CarveFileMode.SKELETON:
-        keep, skipped = _partition_carveable(repo, rels, language)
+        keep, skipped, reasons = _partition_carveable(repo, rels, language)
         if not keep:
+            detail = f' The parser refused every file: {reasons[0]}' if reasons else ''
             raise CarveError(
                 f'none of the {len(rels)} glob-matched file(s) holds a {language} '
                 'function body, so a skeleton carve would remove nothing. Narrow '
                 '--include, or pass --delete-whole-file if removing the files '
-                'outright is the intent.'
+                f'outright is the intent.{detail}'
             )
 
     result = carve_files(repo, keep, mode=mode, stub_body=stub, language=language)
@@ -394,8 +395,16 @@ def build_carve_set(
     )
 
 
-def _partition_carveable(repo, rels, language) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    keep, skipped = [], []
+def _partition_carveable(
+    repo, rels, language
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Split the glob-matched files into carveable and not, and say WHY not.
+
+    The third element carries the distinct parser refusals. Without it a missing
+    tree-sitter grammar and an unsupported language are indistinguishable from a
+    file that genuinely holds no function body, and the caller blames the glob.
+    """
+    keep, skipped, reasons = [], [], []
     for rel in rels:
         path = Path(repo) / rel
         if not path.is_file():
@@ -407,7 +416,8 @@ def _partition_carveable(repo, rels, language) -> tuple[tuple[str, ...], tuple[s
             continue
         try:
             carveable = has_carveable_functions(text, language)
-        except CarveFileError:
+        except CarveFileError as exc:
             carveable = False
+            reasons.append(str(exc))
         (keep if carveable else skipped).append(rel)
-    return tuple(keep), tuple(skipped)
+    return tuple(keep), tuple(skipped), tuple(dict.fromkeys(reasons))

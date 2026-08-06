@@ -117,32 +117,29 @@ GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('Tests/**',)
 #: environment/Dockerfile (rux-lang/Rux, MIT) -- rendered here as a module
 #: constant so the shipped Dockerfile, the measure Dockerfile and any test
 #: that inspects the install text all see byte-identical content.
+#: Per-language base carrying cmake/g++-14/ninja/clang already.
+BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-cpp@sha256:3e2450a37081e6fa480f2a09de01620d9dba3578d49b281629f36c6dbd9ce074'
+
 _INSTALL_BLOCK = (
-    '# harbor-base:local ships cmake 3.28.3, g++ 13.3, no ninja, no clang.\n'
-    '# Rux declares cmake_minimum_required(VERSION 3.30...4.3) and\n'
-    '# CMAKE_CXX_STANDARD 26; the AArch64 backend shells out to `clang` at\n'
-    '# link time. All four have to be present before the leak gate runs, and\n'
-    '# grading itself is --network=none, so the install lives HERE.\n'
-    '# apt.kitware.com is reachable at build time (github.com is blackholed).\n'
-    'RUN apt-get update -qq \\\n'
-    ' && apt-get install -y --no-install-recommends \\\n'
-    '      ninja-build gcc-14 g++-14 clang lld ca-certificates curl gpg \\\n'
-    ' && curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc \\\n'
-    '      | gpg --dearmor -o /usr/share/keyrings/kitware-archive-keyring.gpg \\\n'
-    ' && echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg]'
-    ' https://apt.kitware.com/ubuntu/ noble main" \\\n'
-    '      > /etc/apt/sources.list.d/kitware.list \\\n'
-    ' && apt-get update -qq \\\n'
-    ' && apt-get install -y --no-install-recommends cmake \\\n'
-    ' && rm -rf /var/lib/apt/lists/*\n'
+    '# The base ships cmake 4.4.2, g++-14 14.2.0, ninja 1.12.1 and clang 19.1.7 --\n'
+    '# exactly the set this block used to apt-install on every task build, at the\n'
+    '# cost of two package-index refreshes, a Kitware key import and an unpinned\n'
+    '# package resolution inside a network the grade step forbids.\n'
     '# Make the C++26-capable compiler the default so a plain `g++`/`cc` picks\n'
-    '# up 14 rather than 13. `cc`/`c++` are already MASTER alternatives on\n'
-    '# Debian/Ubuntu, so they cannot be attached as slaves of the gcc group.\n'
+    '# up 14 rather than the distro default. `cc`/`c++` are already MASTER\n'
+    '# alternatives, so they cannot be attached as slaves of the gcc group.\n'
     'RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \\\n'
     '      --slave /usr/bin/g++ g++ /usr/bin/g++-14 \\\n'
     ' && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-14 100 \\\n'
-    ' && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100 \\\n'
-    ' && cmake --version && ninja --version && clang --version'
+    ' && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-14 100\n'
+    '# Assert under a login shell: the base re-exports its own PATH from\n'
+    "# /etc/profile.d, which is how harbor's test.sh resolves these binaries.\n"
+    'RUN set -eux; \\\n'
+    '    c="$(bash -lc \'cmake --version | head -1\')"; \\\n'
+    '    g="$(bash -lc \'g++-14 --version | head -1\')"; \\\n'
+    '    case "$c" in *4.4.2*) ;; *) echo "TOOLCHAIN PIN FAILED (login shell): $c" >&2; exit 42;; esac; \\\n'
+    '    case "$g" in *14.2.0*) ;; *) echo "TOOLCHAIN PIN FAILED (login shell): $g" >&2; exit 42;; esac; \\\n'
+    '    bash -lc \'ninja --version && clang --version | head -1\''
 )
 
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
@@ -171,7 +168,7 @@ class CppPlugin(B.LangPlugin):
     def toolchain_spec(self) -> ToolchainSpec:
         """apt+kitware install to close the four gaps described in the module docstring."""
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image=BASE_IMAGE,
             install_block=_INSTALL_BLOCK,
             env={
                 'CC': 'gcc-14',

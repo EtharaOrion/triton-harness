@@ -111,3 +111,7 @@ src/taskgen/**/__pycache__/
 # verifier LLM endpoint config (D7): points at the local proxy, never committed
 .llm_config/*
 !.llm_config/example.json
+# base-image pilot handoff artifacts (multi-GB binaries; never commit)
+base-image-pilot-handoff.zip
+pilot-docker-base-triton/dockerImages/
+pilot-docker-base-triton/harness/.extract/

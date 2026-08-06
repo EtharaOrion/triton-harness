@@ -24,7 +24,7 @@ apt and is NOT one of the blackholed hosts, so it is reachable at BUILD time
 byte-identical across warm / graded / measure so BuildKit reuses the JDK layer
 across all three images (see the reference's own comment on this).
 
-DEP-WARM: separate `FROM harbor-base:local AS warm` stage that COPYs the
+DEP-WARM: separate `FROM harbor-base-java AS warm` stage that COPYs the
 CARVED repoctx (widget src/main/java is empty by construction), warms the
 gradle-home cache via `:buildSrc:build` + a resolve-only init script that
 `.resolve()`s every configuration in every project, then scrubs the cache of
@@ -84,15 +84,26 @@ from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 __all__ = [
     'EXPECTED_SUITES',
     'GRADER_FINGERPRINT_GLOBS',
+    'BASE_IMAGE',
     'JAVA_HOME',
+    'JAVA_VERSION',
     'JavaPlugin',
     'TEST_COMMAND',
     'WIDGETS_MODULE',
 ]
 
-#: JDK 25's ARM64 install path on Ubuntu noble (the harbor-base flavour). The
-#: reference Dockerfile bakes the same literal.
-JAVA_HOME = '/usr/lib/jvm/java-25-openjdk-arm64'
+#: The JDK the base bakes and this task selects. settings.gradle.kts hard-fails
+#: on any launcher JVM older than 25, so the pin cannot go below it.
+JAVA_VERSION = 'temurin-25.0.4+7.0.LTS'
+
+#: Derived from the mise install rather than a distro path. The old literal
+#: `/usr/lib/jvm/java-25-openjdk-arm64` does not exist on amd64, so it pinned the
+#: whole pipeline to one architecture.
+JAVA_HOME = f'/opt/mise/installs/java/{JAVA_VERSION}'
+
+#: Per-language base carrying temurin 17/21/25 and gradle, so no task build has
+#: to apt-install a ~700MB JDK.
+BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-java@sha256:41679c33cc35b89771757cbfac358c0e678f3da165505fed52880ffaf7d8d1d1'
 
 #: Where harbor-base already exports the Gradle home. Written into the
 #: toolchain env dict for redundancy (base already exports it) so the plugin
@@ -149,26 +160,22 @@ _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 #: install_block BEFORE the ENV lines, so shell expansion of $JAVA_HOME here
 #: would resolve to empty.
 _INSTALL_BLOCK = (
-    '# JDK 25: settings.gradle.kts hard-fails on any launcher JVM older than\n'
-    '# 25 ("This project ... requires Java 25+ JDK for building"). harbor-base\n'
-    '# ships JDK 21 and gradle 9.2.1, so a newer JDK must be added here.\n'
-    '# openjdk-25-jdk-headless 25.0.x comes from Ubuntu noble-updates and is\n'
-    '# NOT one of the blackholed hosts; grading itself is --network=none, so\n'
-    "# the install must land in a build-time layer before the leak gate.\n"
-    '# Byte-identical between warm / graded / measure Dockerfiles so BuildKit\n'
-    '# reuses this ~700 MB layer across all three images.\n'
+    '# The base bakes temurin 17/21/25 and gradle; select one rather than\n'
+    '# apt-installing a JDK on every task build.\n'
+    f'RUN set -eux; mise use -g java@{JAVA_VERSION}\n'
+    '# profile.d is sourced in sorted order and the base re-exports its own PATH\n'
+    '# ahead of the mise shims, so only a zz- file keeps the pin in front for the\n'
+    "# login shells harbor's test.sh and solve.sh actually run as.\n"
     'RUN set -eux; \\\n'
-    '    apt-get update -qq; \\\n'
-    '    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \\\n'
-    '        openjdk-25-jdk-headless; \\\n'
-    '    rm -rf /var/lib/apt/lists/*; \\\n'
-    f'    test -x {JAVA_HOME}/bin/javac\n'
-    "# Point Gradle's daemon JVM at 25 too. settings.gradle.kts's\n"
-    '# JavaVersion.current() gate reads the LAUNCHER JVM (the one running\n'
-    '# gradle itself, not org.gradle.java.home), so PATH-precedence handles\n'
-    '# that; org.gradle.java.home pins the COMPILE JVM for --release=8 too.\n'
-    '# $GRADLE_USER_HOME is already exported by harbor-base at /opt/gradle-home;\n'
-    '# the properties file travels forward as part of the cache COPY.\n'
+    '    printf \'export PATH="/opt/mise/shims:$PATH"\\n\' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\\n'
+    '    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh\n'
+    'RUN set -eux; \\\n'
+    '    v="$(bash -lc \'java -version 2>&1 | head -1\')"; \\\n'
+    '    case "$v" in \\\n'
+    '        *\\"25.*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\\n'
+    '        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want 25.x" >&2; exit 42 ;; \\\n'
+    '    esac\n'
+    "# org.gradle.java.home pins the COMPILE JVM; the launcher JVM comes from PATH.\n"
     'RUN set -eux; \\\n'
     f'    mkdir -p {GRADLE_USER_HOME}; \\\n'
     f"    printf 'org.gradle.java.home=%s\\n' {JAVA_HOME} \\\n"
@@ -204,7 +211,7 @@ class JavaPlugin(B.LangPlugin):
     def toolchain_spec(self) -> ToolchainSpec:
         """JDK 25 apt install + gradle.properties, byte-identical across stages."""
         return ToolchainSpec(
-            base_image='harbor-base:local',
+            base_image=BASE_IMAGE,
             install_block=_INSTALL_BLOCK,
             env={
                 'DEBIAN_FRONTEND': 'noninteractive',
@@ -214,7 +221,7 @@ class JavaPlugin(B.LangPlugin):
                 # after JAVA_HOME and can reference it. Bake JAVA_HOME's literal
                 # anyway rather than $JAVA_HOME so a base image that unsets it
                 # cannot silently break the prepend.
-                'PATH': f'{JAVA_HOME}/bin:${{PATH}}',
+                'PATH': '/opt/mise/shims:${PATH}',
             },
             workdir=B.WORKDIR,
         )

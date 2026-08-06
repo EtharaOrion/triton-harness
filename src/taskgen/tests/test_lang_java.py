@@ -167,22 +167,21 @@ def test_default_stub_body_for_java_is_a_java_body():
 
 def test_toolchain_uses_harbor_base_and_declares_java_home(plugin):
     tc = plugin.toolchain_spec()
-    assert tc.base_image == 'harbor-base:local'
+    assert tc.base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-java@sha256:')
     assert tc.workdir == B.WORKDIR
-    assert tc.env['JAVA_HOME'] == '/usr/lib/jvm/java-25-openjdk-arm64'
-    assert '/usr/lib/jvm/java-25-openjdk-arm64/bin' in tc.env['PATH']
+    assert tc.env['JAVA_HOME'] == f'/opt/mise/installs/java/{JAVA.JAVA_VERSION}'
+    assert '/opt/mise/shims' in tc.env['PATH']
     assert tc.env['GRADLE_USER_HOME'] == '/opt/gradle-home'
 
 
-def test_toolchain_installs_jdk25_from_apt(plugin):
+def test_toolchain_selects_jdk25_the_base_already_bakes(plugin):
     """harbor-base ships JDK 21; settings.gradle.kts hard-fails on <25.
 
     JDK 25 has to be installed here at build time (grading is --network=none).
     """
     block = plugin.toolchain_spec().install_block
-    assert 'apt-get install' in block
-    assert 'openjdk-25-jdk-headless' in block
-    assert '/usr/lib/jvm/java-25-openjdk-arm64/bin/javac' in block
+    assert 'mise use -g java@temurin-25' in block
+    assert 'TOOLCHAIN PIN FAILED' in block
 
 
 def test_toolchain_writes_gradle_properties_pointing_at_jdk25(plugin):
@@ -190,7 +189,7 @@ def test_toolchain_writes_gradle_properties_pointing_at_jdk25(plugin):
     block = plugin.toolchain_spec().install_block
     assert 'gradle.properties' in block
     assert 'org.gradle.java.home' in block
-    assert '/usr/lib/jvm/java-25-openjdk-arm64' in block
+    assert '/opt/mise/installs/java/temurin-25' in block
 
 
 def test_toolchain_install_block_is_byte_identical_across_calls(plugin):
@@ -394,9 +393,9 @@ def test_render_measure_dockerfile_is_stripped(plugin):
     """Measure image has NO leak gate, NO tripwire, NO carve-metadata assert."""
     env = B.EnvSpec(repo_name='java-tamboui')
     df = plugin.render_measure_dockerfile(env)
-    assert 'FROM harbor-base:local AS measure' in df
+    assert f'FROM {plugin.toolchain_spec().base_image} AS measure' in df
     assert 'NEVER SHIP' in df
-    assert 'openjdk-25-jdk-headless' in df
+    assert 'mise use -g java@temurin-25' in df
     assert 'leakscan.sh' not in df
     assert 'TRIPWIRE_FILE' not in df
     assert 'carve_receipt.json' not in df
@@ -435,7 +434,7 @@ def test_render_dockerfile_ships_no_solution_no_warm_from_no_git_init(plugin):
     df = plugin.render_dockerfile(env)
     # Only comments may name these tokens; the invariant checker inspects
     # INSTRUCTIONS. Verify it did not raise.
-    assert 'FROM harbor-base:local AS graded' in df
+    assert f'FROM {plugin.toolchain_spec().base_image} AS graded' in df
     assert 'COPY --from=warm /opt/gradle-home /opt/gradle-home' in df
     # FROM warm as bare instruction (not COPY --from=warm) is banned. Grep it.
     for line in df.splitlines():
@@ -452,9 +451,9 @@ def test_render_dockerfile_includes_the_dep_warm_stage_header(plugin):
     needs a stage named 'warm' to exist)."""
     env = B.EnvSpec(repo_name='java-tamboui')
     df = plugin.render_dockerfile(env)
-    assert 'FROM harbor-base:local AS warm' in df
-    warm_at = df.index('FROM harbor-base:local AS warm')
-    graded_at = df.index('FROM harbor-base:local AS graded')
+    assert f'FROM {plugin.toolchain_spec().base_image} AS warm' in df
+    warm_at = df.index(f'FROM {plugin.toolchain_spec().base_image} AS warm')
+    graded_at = df.index(f'FROM {plugin.toolchain_spec().base_image} AS graded')
     assert warm_at < graded_at, 'warm stage must precede graded'
 
 
@@ -466,3 +465,35 @@ def test_render_dockerfile_ships_leak_gate_and_carve_receipt_absence(plugin):
     df = plugin.render_dockerfile(env)
     assert 'leakscan.sh' in df
     assert 'carve_receipt.json' in df
+
+
+# ------------------------------------------ wave 1-2: versioned per-lang base --
+
+
+def test_java_builds_on_the_versioned_per_language_base(plugin):
+    assert plugin.toolchain_spec().base_image.startswith('426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-java@sha256:')
+
+
+def test_java_home_is_not_architecture_hardcoded(plugin):
+    """`/opt/mise/installs/java/temurin-25` does not exist on amd64.
+
+    The base README documents this exact literal as a multi-arch defect it
+    fixed; taskgen still carried it, so a task image could only ever build on
+    arm64. Deriving JAVA_HOME from the mise install keeps it arch-neutral.
+    """
+    env = plugin.toolchain_spec().env
+    assert 'arm64' not in env['JAVA_HOME']
+    assert 'amd64' not in env['JAVA_HOME']
+    assert 'arm64' not in plugin.toolchain()
+
+
+def test_java_does_not_apt_install_a_jdk_the_base_already_carries(plugin):
+    assert 'apt-get install' not in plugin.toolchain()
+
+
+def test_java_pins_the_runtime_and_proves_it_under_a_login_shell(plugin):
+    tc = plugin.toolchain()
+    assert 'mise use -g java@' in tc
+    assert '/etc/profile.d/zz-harbor-toolchain-pin.sh' in tc
+    assert 'TOOLCHAIN PIN FAILED' in tc
+    assert 'bash -lc' in tc
