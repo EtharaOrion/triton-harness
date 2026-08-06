@@ -11,6 +11,7 @@ import pytest
 
 from taskgen.contexts import CONTEXT_TYPES
 from taskgen.emit import emit_all
+from taskgen.langs.python import BASE_IMAGE
 
 from taskgen import templates
 
@@ -299,7 +300,7 @@ def test_dockerfile_builds_from_the_host_staged_carve(emitted):
     _out, entries = emitted
     for e in entries:
         df = (e.path / 'environment/Dockerfile').read_text()
-        assert 'FROM harbor-base:local AS graded' in df
+        assert f'FROM {BASE_IMAGE} AS graded' in df
         assert 'COPY --from=repoctx repo/ /opt/harbor/repo' in df
         assert 'FROM intact' not in df
         assert 'repo-src' not in df and 'repos-src' not in df
