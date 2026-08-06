@@ -76,19 +76,26 @@ step could have left carved bytes.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan
+from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
+    'BAKED_CAPABILITIES',
+    'BASE_IMAGE',
     'EXPECTED_SUITES',
     'GRADER_FINGERPRINT_GLOBS',
-    'BASE_IMAGE',
     'JAVA_HOME',
+    'JAVA_MEASURE_DEP_PLAN',
     'JAVA_VERSION',
     'JavaPlugin',
+    'MEASURE_NO_WARM_COMMENT',
+    'REQUIRED_BUILD_FLAGS',
+    'REQUIRED_PLAN_SLOTS',
+    'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
     'WIDGETS_MODULE',
 ]
@@ -97,10 +104,15 @@ __all__ = [
 #: on any launcher JVM older than 25, so the pin cannot go below it.
 JAVA_VERSION = 'temurin-25.0.4+7.0.LTS'
 
+#: Where mise unpacks every JDK it installs. Named separately from `JAVA_HOME`
+#: because `render_gap` derives the home of the JDK a PLAN selected, which is
+#: not necessarily the one this module's default pins.
+JAVA_INSTALL_ROOT = '/opt/mise/installs/java'
+
 #: Derived from the mise install rather than a distro path. The old literal
 #: `/usr/lib/jvm/java-25-openjdk-arm64` does not exist on amd64, so it pinned the
 #: whole pipeline to one architecture.
-JAVA_HOME = f'/opt/mise/installs/java/{JAVA_VERSION}'
+JAVA_HOME = f'{JAVA_INSTALL_ROOT}/{JAVA_VERSION}'
 
 #: Per-language base carrying temurin 17/21/25 and gradle, so no task build has
 #: to apt-install a ~700MB JDK.
@@ -183,6 +195,157 @@ _INSTALL_BLOCK = (
     f'        >> {GRADLE_USER_HOME}/gradle.properties'
 )
 
+#: The measure image's dep-warm slot. java warms its own gradle cache inside the
+#: measure image (see `render_measure_dockerfile`), so there is no separate warm
+#: stage to COPY from and this comment IS the slot's content.
+MEASURE_NO_WARM_COMMENT = '# no separate warm stage (measure warms its own cache below)'
+
+#: The JDK majors the base image bakes, as the gap states them. A base that
+#: stopped shipping one of these would still render, which is why the pin assert
+#: below is on the SELECTED version rather than on this list.
+BAKED_JDKS = '17/21/25'
+
+#: What the base image already provides, as `--resolve-env` states it to a
+#: model. Sorted and version-exact, so the same prompt is built on every run.
+BAKED_CAPABILITIES: tuple[str, ...] = (
+    'apt-get (build time only; the graded run has no network)',
+    f'gradle, with its cache home already exported as {GRADLE_USER_HOME}',
+    'mise, which selects among the baked JDKs',
+    f'temurin JDK {BAKED_JDKS}',
+)
+
+#: Every `build_flags` key `render_gap` interpolates. Enumerated once, read by
+#: BOTH the renderer and `JavaPlugin.validate_dep_plan`, so a flag added to the
+#: rendered text without being added here is the only way the two can disagree.
+REQUIRED_BUILD_FLAGS: tuple[str, ...] = ('baked_jdks',)
+
+#: Every `test_invocation` key the java measure path needs. `render_gap` itself
+#: does not interpolate one -- the measure script runs the graded task -- but a
+#: plan that does not state the command it was resolved FOR is a plan nobody can
+#: check against the image it produced, so it is required at the same gate.
+REQUIRED_TEST_INVOCATION_KEYS: tuple[str, ...] = ('command',)
+
+#: The same requirements as the resolver is told them, before it answers. Kept
+#: adjacent to the checks above so the ask and the rejection cannot drift apart.
+#: Leak-safe: slot names, shapes and toolchain versions only -- never a repo
+#: path, a module name or a source body.
+REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
+    'build_flags["baked_jdks"] must be a non-empty string: the JDK majors the '
+    'base image already bakes, e.g. "17/21/25". The gap states them in the '
+    'comment that explains why nothing apt-installs a JDK',
+    'install_commands must NOT compile the graded sources -- test_invocation '
+    'builds and runs the suite itself -- so for a gradle-driven repo this list '
+    'is USUALLY EMPTY. Add a step only to PREPARE the environment (fetch or '
+    'vendor a dependency); never a bare "gradle build". A build step that '
+    'cannot succeed makes the whole plan unbuildable, not merely suboptimal',
+    'apt_packages lists ONLY system libraries the sources need that the base '
+    'image lacks; the JDK and gradle are already baked in, so naming them here '
+    'buys nothing and costs a network fetch',
+    'package_manager must be gradle: the gap writes gradle.properties and pins '
+    'the compile JVM through it',
+    'test_invocation["command"] must be a non-empty list of argv tokens: the '
+    'command that runs the whole graded suite, e.g. ["gradle", "test"]',
+    'toolchain_version must be the mise JDK identifier, '
+    'distribution-then-version, e.g. "temurin-25.0.4+7.0.LTS": the gap selects '
+    'it by that exact string and derives the runtime pin from its major',
+)
+
+#: The one package manager java's gap has prose (and a properties file) for.
+#: `maven` is schema-legal for java but this gap writes gradle.properties and
+#: exports a gradle cache home; rendering it for maven would emit a pin nothing
+#: reads.
+_SUPPORTED_MANAGERS: frozenset[str] = frozenset({'gradle'})
+
+
+def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
+    """A build flag the gap's rendered text needs, or a refusal to render at all."""
+    for name, value in build_flags:
+        if name == key:
+            if isinstance(value, str) and value:
+                return value
+            break
+    raise B.LangError(
+        f'the java gap needs build_flags[{key!r}]: it must be a non-empty '
+        'string. A plan without it would render a Dockerfile comment with a '
+        'hole in it, and a hole in the toolchain description is how a base swap '
+        'goes unnoticed'
+    )
+
+
+def _test_tokens(
+    test_invocation: tuple[tuple[str, TestValue], ...], key: str,
+) -> tuple[str, ...]:
+    """A test_invocation entry the java measure path needs, as argv tokens."""
+    for name, value in test_invocation:
+        if name == key:
+            tokens = (value,) if isinstance(value, str) else tuple(value)
+            if tokens and all(token.strip() for token in tokens):
+                return tokens
+            break
+    raise B.LangError(
+        f'the java plan needs test_invocation[{key!r}]: it must be a non-empty '
+        'list of argv tokens naming the command that runs the graded suite. A '
+        'plan that does not state what it was resolved to RUN cannot be checked '
+        'against the image it produced'
+    )
+
+
+def _jdk_parts(toolchain_version: str) -> tuple[str, str]:
+    """`(distribution, major)` of a mise JDK identifier, or a refusal to render.
+
+    `mise use -g java@X` takes the whole identifier, but the login-shell pin
+    asserts the MAJOR only (`java -version` prints `"25.0.4"`, never the mise
+    spelling), and the comment above it names the distribution. A version with
+    neither part is not renderable: an assert derived from a non-numeric major
+    would either match nothing or -- worse -- match everything.
+    """
+    distribution, sep, version = toolchain_version.partition('-')
+    major = version.partition('.')[0]
+    if not sep or not distribution or not major.isdigit():
+        raise B.LangError(
+            f'toolchain_version {toolchain_version!r} is not a mise JDK '
+            'identifier of the form distribution-major.minor.patch, e.g. '
+            '"temurin-25.0.4+7.0.LTS"; the java gap selects the JDK by that '
+            'exact string and derives its runtime pin from the major'
+        )
+    return distribution, major
+
+
+def _java_measure_dep_plan() -> DepPlan:
+    """java's own environment as the record a resolver would have to produce.
+
+    The fixed point of the exercise: fed to `JavaPlugin.render_gap`, this plan
+    reproduces the gap bytes `render_measure_dockerfile` hardcodes today.
+
+    `apt_packages` and `install_commands` are EMPTY and must stay empty. The JDK
+    and gradle are BAKED into the per-language base -- that is precisely why the
+    install block selects one with mise instead of apt-installing ~700 MB -- and
+    these two fields mean "what the gap INSTALLS". Listing a baked component
+    would make the gap emit an `apt-get` line today's bytes do not contain.
+
+    The warm stage and the pre-leakgate blocks are NOT described here: they are
+    fixed scaffolding (a resolve-only gradle pass plus its leak assert), not
+    provisioning a resolver may vary, and they stay hardcoded.
+    """
+    plan = DepPlan(
+        lang='java',
+        toolchain_version=JAVA_VERSION,
+        package_manager='gradle',
+        manifest_files=('build.gradle.kts', 'settings.gradle.kts'),
+        apt_packages=(),
+        install_commands=(),
+        build_flags=(('baked_jdks', BAKED_JDKS),),
+        test_invocation=(('command', tuple(TEST_COMMAND.split())),),
+        needs_git_metadata=False,
+    )
+    validate(plan)
+    return canonicalize(plan)
+
+
+#: java's canonical, validated environment plan. Module-level so a test can
+#: assert the rendered gap against it without re-deriving the facts it states.
+JAVA_MEASURE_DEP_PLAN: DepPlan = _java_measure_dep_plan()
+
 
 class JavaPlugin(B.LangPlugin):
     """gradle 9 + JDK25 + JUnit5, whole-suite equality floor, measured denominator."""
@@ -200,6 +363,17 @@ class JavaPlugin(B.LangPlugin):
     #: globs to fingerprint. Empty for rust; ('tests/**','Makefile') for c;
     #: ('Tests/**',) for cpp; ('tamboui-widgets/src/test/**',) for java.
     grader_fingerprint_globs: ClassVar[tuple[str, ...]] = GRADER_FINGERPRINT_GLOBS
+
+    #: The same facts `toolchain_spec().install_block` asserts at build time,
+    #: as the capability list `--resolve-env` shows the model. apt is listed
+    #: because principle 5 allows apt and ONLY apt, and a model not told so
+    #: reaches for curl.
+    baked_capabilities: ClassVar[tuple[str, ...]] = BAKED_CAPABILITIES
+
+    #: What `render_gap` reads and `depplan.validate` cannot know about. Stated
+    #: to the model in the prompt, enforced by `validate_dep_plan` before a
+    #: build; the two read the same tuple.
+    required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
     widgets_module: ClassVar[str] = WIDGETS_MODULE
@@ -689,6 +863,118 @@ class JavaPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
+    def validate_dep_plan(self, plan: DepPlan) -> None:
+        """Every precondition `render_gap` has, checked before a container exists.
+
+        The same set of checks `render_gap` makes, hoisted to where they cost
+        nothing and can still be repaired: same helpers, same messages, so a
+        plan accepted here cannot then fail to render. Enumerated from the
+        renderer below -- the JDK identifier's distribution and major, the
+        manager whose properties file it writes, the baked-JDK list and the
+        graded command -- because a slot the renderer reads and this gate does
+        not is exactly the crash this exists to prevent.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the java gap cannot render a {plan.lang!r} plan; a gap is the '
+                'one part of a Dockerfile that is language-specific by definition'
+            )
+        _jdk_parts(plan.toolchain_version)
+        if plan.package_manager not in _SUPPORTED_MANAGERS:
+            raise B.LangError(
+                f'the java gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_SUPPORTED_MANAGERS))}'
+            )
+        for key in REQUIRED_BUILD_FLAGS:
+            _flag_str(plan.build_flags, key)
+        for key in REQUIRED_TEST_INVOCATION_KEYS:
+            _test_tokens(plan.test_invocation, key)
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """java's toolchain bytes, rendered from a plan instead of a literal.
+
+        The SCAFFOLDING stays fixed and stays hardcoded: the zz- profile.d file
+        that keeps the mise shims ahead of the base's own PATH, the login-shell
+        pin assert, the gradle cache home, and -- crucially -- the whole
+        `dep_warm_spec` warm stage and its leak assert, which are not
+        provisioning a resolver may vary but the proof that no carved bytecode
+        survives. What comes from the PLAN is the JDK the image selects, the
+        baked-JDK list the comment states, the manager whose properties file is
+        written, and the apt/install lines a repo needing system libraries adds.
+
+        The apt and install blocks are unreachable for `JAVA_MEASURE_DEP_PLAN`
+        (both fields are empty by construction, because the base BAKES the JDK)
+        and are rendered from the plan for the case where a resolved plan does
+        declare them. They are the only lines here that are not in today's image.
+
+        `JAVA_HOME` is re-derived from the plan's JDK rather than taken from
+        `toolchain_spec()`: it is the very path the gradle.properties line
+        writes, so a plan that moved the JDK and left that ENV behind would ship
+        an image whose compile JVM and whose environment disagree.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the java gap cannot render a {plan.lang!r} plan; a gap is the '
+                'one part of a Dockerfile that is language-specific by definition'
+            )
+        if plan.package_manager not in _SUPPORTED_MANAGERS:
+            raise B.LangError(
+                f'the java gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_SUPPORTED_MANAGERS))}'
+            )
+
+        distribution, major = _jdk_parts(plan.toolchain_version)
+        java_home = f'{JAVA_INSTALL_ROOT}/{plan.toolchain_version}'
+        lines = [
+            f'# The base bakes {distribution} '
+            f'{_flag_str(plan.build_flags, "baked_jdks")} and '
+            f'{plan.package_manager}; select one rather than',
+            '# apt-installing a JDK on every task build.',
+            f'RUN set -eux; mise use -g java@{plan.toolchain_version}',
+            '# profile.d is sourced in sorted order and the base re-exports its own PATH',
+            '# ahead of the mise shims, so only a zz- file keeps the pin in front for the',
+            "# login shells harbor's test.sh and solve.sh actually run as.",
+            'RUN set -eux; \\',
+            '    printf \'export PATH="/opt/mise/shims:$PATH"\\n\' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\',
+            '    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh',
+            'RUN set -eux; \\',
+            '    v="$(bash -lc \'java -version 2>&1 | head -1\')"; \\',
+            '    case "$v" in \\',
+            f'        *\\"{major}.*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\',
+            f'        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want '
+            f'{major}.x" >&2; exit 42 ;; \\',
+            '    esac',
+            '# org.gradle.java.home pins the COMPILE JVM; the launcher JVM comes from PATH.',
+            'RUN set -eux; \\',
+            f'    mkdir -p {GRADLE_USER_HOME}; \\',
+            f"    printf 'org.gradle.java.home=%s\\n' {java_home} \\",
+            f'        >> {GRADLE_USER_HOME}/gradle.properties',
+        ]
+        if plan.apt_packages:
+            lines.append(
+                'RUN apt-get update && apt-get install -y --no-install-recommends '
+                + ' '.join(plan.apt_packages)
+                + ' && rm -rf /var/lib/apt/lists/*'
+            )
+        lines += [
+            ' '.join((f'RUN {command.tool}', *command.args)).rstrip()
+            for command in plan.install_commands
+        ]
+
+        spec = self.toolchain_spec()
+        toolchain = replace(
+            spec,
+            install_block='\n'.join(lines),
+            env={**spec.env, 'JAVA_HOME': java_home},
+        ).render()
+        return '\n'.join([toolchain, '', MEASURE_NO_WARM_COMMENT])
+
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
     ) -> str:
@@ -706,15 +992,18 @@ class JavaPlugin(B.LangPlugin):
         exemption -- all three would fire by construction on the intact tree).
         `measure_image_tag` marks the image as never-ship and `measure.py`
         deletes it in a finally block.
+
+        `dep_plan` swaps the hardcoded gap for `render_gap(dep_plan)` in the
+        SAME slot and touches nothing else -- notably NOT the warm-and-run block
+        below, which is scaffolding. `dep_plan=None` is what emit.py passes and
+        renders the bytes it always did.
         """
-        if dep_plan is not None:
-            raise B.LangError(
-                f'the {self.name!r} measure image does not render its gap from a '
-                'DepPlan yet; only c does. Passing one here would silently '
-                'ignore it, which is worse than refusing it'
-            )
         base_image = self.toolchain_spec().base_image
-        toolchain = self.toolchain()
+        gap = (
+            '\n'.join([self.toolchain(), '', MEASURE_NO_WARM_COMMENT])
+            if dep_plan is None
+            else self.render_gap(dep_plan)
+        )
         return '\n'.join([
             '# syntax=docker/dockerfile:1.7',
             f'# Harbor MEASURE image -- {env.repo_name} ({self.name}). NEVER SHIP.',
@@ -727,9 +1016,7 @@ class JavaPlugin(B.LangPlugin):
             '',
             f'FROM {base_image} AS measure',
             '',
-            toolchain,
-            '',
-            '# no separate warm stage (measure warms its own cache below)',
+            gap,
             '',
             f'# The measure phase points {env.repo_context} at the INTACT repo',
             '# directly, not a staging tree, so there is no repo/ prefix to copy',

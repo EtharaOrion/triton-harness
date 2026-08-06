@@ -65,16 +65,23 @@ symbols could survive).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan
+from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
+    'BAKED_CAPABILITIES',
+    'CPP_MEASURE_DEP_PLAN',
     'CppPlugin',
     'GRADER_FINGERPRINT_GLOBS',
     'HARNESS_FILES',
+    'MEASURE_NO_WARM_COMMENT',
+    'REQUIRED_BUILD_FLAGS',
+    'REQUIRED_PLAN_SLOTS',
+    'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
 ]
 
@@ -146,6 +153,185 @@ _INSTALL_BLOCK = (
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
 _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 
+#: The measure image's dep-warm slot. cpp has no warm stage (the toolchain is
+#: baked and the repo vendors doctest), so this comment IS the slot's content --
+#: it is not `DepWarmSpec.render()`, which speaks about a COPY that never
+#: happens here.
+MEASURE_NO_WARM_COMMENT = '# no warmed dependencies (cpp installs its toolchain via apt above)'
+
+#: What the base image already provides, as `--resolve-env` states it to a
+#: model. Sorted and version-exact, so the same prompt is built on every run.
+#: Declared, never probed: the same four facts the pin assert in `render_gap`
+#: checks at build time.
+BAKED_CAPABILITIES: tuple[str, ...] = (
+    'apt-get (build time only; the graded run has no network)',
+    'clang 19.1.7 (the AArch64 backend shells out to it at link time)',
+    'cmake 4.4.2',
+    'g++-14 14.2.0 (C++26-capable)',
+    'ninja 1.12.1',
+)
+
+#: Every `build_flags` key `render_gap` interpolates. Enumerated once, read by
+#: BOTH the renderer and `CppPlugin.validate_dep_plan`, so a flag added to the
+#: rendered text without being added here is the only way the two can disagree.
+REQUIRED_BUILD_FLAGS: tuple[str, ...] = (
+    'clang_version', 'cmake_version', 'ninja_version',
+)
+
+#: Every `test_invocation` key the cpp measure path needs. `render_gap` does not
+#: interpolate them -- the measure script runs the three steps itself -- but a
+#: plan that does not state what it was resolved FOR is a plan nobody can check
+#: against the image it produced, so they are required at the same gate.
+#: THREE keys rather than c's one: cpp's graded command is `configure && build
+#: && test`, and `&&` is a shell metacharacter `depplan.validate` refuses, so
+#: the one shell string is carried as the three argv vectors it really is.
+REQUIRED_TEST_INVOCATION_KEYS: tuple[str, ...] = ('build', 'configure', 'test')
+
+#: The same requirements as the resolver is told them, before it answers. Kept
+#: adjacent to the checks above so the ask and the rejection cannot drift apart.
+#: Leak-safe: slot names, shapes and toolchain versions only -- never a repo
+#: path, a target name or a source body.
+REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
+    'build_flags["clang_version"] must be a non-empty string: the clang version '
+    'the base image ships, e.g. "19.1.7"',
+    'build_flags["cmake_version"] must be a non-empty string: the version of the '
+    'package_manager binary the base image ships, e.g. "4.4.2"; the build-time '
+    'pin assert matches it verbatim',
+    'build_flags["ninja_version"] must be a non-empty string: the ninja version '
+    'the base image ships, e.g. "1.12.1"',
+    'install_commands must NOT compile the graded sources -- test_invocation '
+    'configures, builds and runs the suite itself -- so for a cmake-driven repo '
+    'this list is USUALLY EMPTY. Add a step only to PREPARE the environment '
+    '(fetch or vendor a dependency); never a bare "cmake --build". A build step '
+    'that cannot succeed makes the whole plan unbuildable, not merely suboptimal',
+    'apt_packages lists ONLY system libraries the sources need that the base '
+    'image lacks; the compiler, the generator and cmake are already baked in, so '
+    'naming them here buys nothing and costs a network fetch',
+    'package_manager must be cmake: the gap runs its version pin against that '
+    'binary and the repo is configured through it',
+    'test_invocation["build"] must be a non-empty list of argv tokens: the '
+    'command that compiles the configured tree, e.g. ["cmake", "--build", '
+    '"Build"]',
+    'test_invocation["configure"] must be a non-empty list of argv tokens: the '
+    'command that configures the build tree, e.g. ["cmake", "-S", ".", "-B", '
+    '"Build"]',
+    'test_invocation["test"] must be a non-empty list of argv tokens: the '
+    'command that runs the whole graded suite, e.g. ["ctest", "--test-dir", '
+    '"Build"]',
+    'toolchain_version must carry at least major.minor.patch, e.g. "14.2.0": it '
+    'is the C++ compiler version, the build-time pin asserts it verbatim, and '
+    'its major component selects the gcc-N/g++-N binaries',
+)
+
+#: The one package manager cpp's gap has prose (and a version pin) for. `make`
+#: is schema-legal for cpp but this gap runs `cmake --version` and configures a
+#: build tree; rendering it for `make` would emit an assert that cannot pass.
+_SUPPORTED_MANAGERS: frozenset[str] = frozenset({'cmake'})
+
+
+def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
+    """A build flag the gap's rendered text needs, or a refusal to render at all."""
+    for name, value in build_flags:
+        if name == key:
+            if isinstance(value, str) and value:
+                return value
+            break
+    raise B.LangError(
+        f'the cpp gap needs build_flags[{key!r}]: it must be a non-empty string. '
+        'A plan without it would render a Dockerfile pin with a hole in it, and '
+        'a hole in a version assert is how a base swap goes unnoticed'
+    )
+
+
+def _test_tokens(
+    test_invocation: tuple[tuple[str, TestValue], ...], key: str,
+) -> tuple[str, ...]:
+    """A test_invocation entry the cpp measure path needs, as argv tokens."""
+    for name, value in test_invocation:
+        if name == key:
+            tokens = (value,) if isinstance(value, str) else tuple(value)
+            if tokens and all(token.strip() for token in tokens):
+                return tokens
+            break
+    raise B.LangError(
+        f'the cpp plan needs test_invocation[{key!r}]: it must be a non-empty '
+        'list of argv tokens. The graded command is configure, build and run, '
+        'and a plan that does not state all three cannot be checked against the '
+        'image it produced'
+    )
+
+
+def _compiler_major(toolchain_version: str) -> str:
+    """The `N` in the `gcc-N`/`g++-N` the alternatives group points at.
+
+    A version whose first component is not a number cannot name a binary, and a
+    Dockerfile that installs an alternative for `gcc-` is a build failure with
+    no diagnostic, so an unusable version is refused before it is rendered.
+    """
+    major = toolchain_version.partition('.')[0]
+    if not major.isdigit():
+        raise B.LangError(
+            f'toolchain_version {toolchain_version!r} has no numeric major '
+            'component, so there is no gcc-N to make the default compiler; the '
+            'cpp gap cannot render an alternatives group without one'
+        )
+    return major
+
+
+def _cpp_measure_dep_plan() -> DepPlan:
+    """cpp's own environment as the record a resolver would have to produce.
+
+    The fixed point of the exercise: fed to `CppPlugin.render_gap`, this plan
+    reproduces the gap bytes `render_measure_dockerfile` hardcodes today.
+
+    `apt_packages` and `install_commands` are EMPTY and must stay empty. cmake,
+    g++-14, ninja and clang are all BAKED into the per-language base (that is
+    the whole point of the base swap the install block's comment describes), and
+    these two fields mean "what the gap INSTALLS" -- listing a baked component
+    would make the gap emit an `apt-get` line today's bytes do not contain, and
+    that line would want network in the measure build.
+
+    `test_invocation` carries the graded command as three argv vectors rather
+    than one string: `&&` is a shell metacharacter and `depplan.validate` refuses
+    it, correctly -- a plan describes tokens, not a command line.
+    """
+    plan = DepPlan(
+        lang='cpp',
+        toolchain_version='14.2.0',
+        package_manager='cmake',
+        manifest_files=('CMakeLists.txt',),
+        apt_packages=(),
+        install_commands=(),
+        build_flags=(
+            ('clang_version', '19.1.7'),
+            ('cmake_version', '4.4.2'),
+            ('ninja_version', '1.12.1'),
+        ),
+        test_invocation=(
+            ('build', (
+                'cmake', '--build', 'Build', '--config', 'Release',
+                '--parallel', '4',
+            )),
+            ('configure', (
+                'cmake', '-S', '.', '-B', 'Build', '-G', 'Ninja',
+                '-DCMAKE_BUILD_TYPE=Release', '-DRUX_WERROR=ON',
+                '-DRUX_BUILD_TESTS=ON',
+            )),
+            ('test', (
+                'ctest', '--test-dir', 'Build', '--output-on-failure',
+                '-C', 'Release',
+            )),
+        ),
+        needs_git_metadata=False,
+    )
+    validate(plan)
+    return canonicalize(plan)
+
+
+#: cpp's canonical, validated environment plan. Module-level so a test can
+#: assert the rendered gap against it without re-deriving the facts it states.
+CPP_MEASURE_DEP_PLAN: DepPlan = _cpp_measure_dep_plan()
+
 
 class CppPlugin(B.LangPlugin):
     """cmake+ninja+g++-14+doctest, whole-suite equality floor, measured denominator."""
@@ -160,6 +346,17 @@ class CppPlugin(B.LangPlugin):
     #: tree globs to fingerprint. Empty for rust; ('tests/**', 'Makefile')
     #: for c; ('Tests/**',) for cpp (Rux uses capital Tests/ per repo layout).
     grader_fingerprint_globs: ClassVar[tuple[str, ...]] = GRADER_FINGERPRINT_GLOBS
+
+    #: The same facts `toolchain_spec().install_block` asserts at build time,
+    #: as the capability list `--resolve-env` shows the model. apt is listed
+    #: because principle 5 allows apt and ONLY apt, and a model not told so
+    #: reaches for curl.
+    baked_capabilities: ClassVar[tuple[str, ...]] = BAKED_CAPABILITIES
+
+    #: What `render_gap` reads and `depplan.validate` cannot know about. Stated
+    #: to the model in the prompt, enforced by `validate_dep_plan` before a
+    #: build; the two read the same tuple.
+    required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
     harness_files: ClassVar[tuple[str, ...]] = HARNESS_FILES
@@ -514,6 +711,122 @@ class CppPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
+    def validate_dep_plan(self, plan: DepPlan) -> None:
+        """Every precondition `render_gap` has, checked before a container exists.
+
+        The same set of checks `render_gap` makes, hoisted to where they cost
+        nothing and can still be repaired: same helpers, same messages, so a
+        plan accepted here cannot then fail to render. Enumerated from the
+        renderer below -- `toolchain_version`'s major, the manager the pin runs,
+        the three version flags and the three argv vectors -- because a slot the
+        renderer reads and this gate does not is exactly the crash this exists
+        to prevent.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the cpp gap cannot render a {plan.lang!r} plan; a gap is the '
+                'one part of a Dockerfile that is language-specific by definition'
+            )
+        _compiler_major(plan.toolchain_version)
+        if plan.package_manager not in _SUPPORTED_MANAGERS:
+            raise B.LangError(
+                f'the cpp gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_SUPPORTED_MANAGERS))}'
+            )
+        for key in REQUIRED_BUILD_FLAGS:
+            _flag_str(plan.build_flags, key)
+        for key in REQUIRED_TEST_INVOCATION_KEYS:
+            _test_tokens(plan.test_invocation, key)
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """cpp's toolchain bytes, rendered from a plan instead of a literal.
+
+        Same seam as c, one size up. What stays FIXED is the plugin's own
+        SCAFFOLDING -- the update-alternatives group that makes the C++26
+        compiler the default, the login-shell pin assert, the ENV/WORKDIR
+        placement tail -- because those are how harbor resolves a compiler at
+        grade time, not facts about this repo. What comes from the PLAN is every
+        version those lines assert, the manager they run, and the apt/install
+        lines a repo needing system libraries would add.
+
+        The apt and install blocks are unreachable for `CPP_MEASURE_DEP_PLAN`
+        (both fields are empty by construction, because the base BAKES the
+        toolchain) and are rendered from the plan for the case where a resolved
+        plan does declare them. They are the only lines here that are not in
+        today's image.
+
+        `CC`/`CXX` are re-derived from the plan's compiler major rather than
+        taken from `toolchain_spec()`: they name the very binaries the
+        alternatives group installs, so a plan that moved the compiler and left
+        those ENVs behind would ship an image whose environment contradicts its
+        own alternatives.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the cpp gap cannot render a {plan.lang!r} plan; a gap is the '
+                'one part of a Dockerfile that is language-specific by definition'
+            )
+        if plan.package_manager not in _SUPPORTED_MANAGERS:
+            raise B.LangError(
+                f'the cpp gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_SUPPORTED_MANAGERS))}'
+            )
+
+        major = _compiler_major(plan.toolchain_version)
+        cc, cxx = f'gcc-{major}', f'g++-{major}'
+        manager = plan.package_manager
+        manager_version = _flag_str(plan.build_flags, 'cmake_version')
+        lines = [
+            f'# The base ships {manager} {manager_version}, {cxx} '
+            f'{plan.toolchain_version}, ninja '
+            f'{_flag_str(plan.build_flags, "ninja_version")} and clang '
+            f'{_flag_str(plan.build_flags, "clang_version")} --',
+            '# exactly the set this block used to apt-install on every task build, at the',
+            '# cost of two package-index refreshes, a Kitware key import and an unpinned',
+            '# package resolution inside a network the grade step forbids.',
+            '# Make the C++26-capable compiler the default so a plain `g++`/`cc` picks',
+            f'# up {major} rather than the distro default. `cc`/`c++` are already MASTER',
+            '# alternatives, so they cannot be attached as slaves of the gcc group.',
+            f'RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/{cc} 100 \\',
+            f'      --slave /usr/bin/g++ g++ /usr/bin/{cxx} \\',
+            f' && update-alternatives --install /usr/bin/cc  cc  /usr/bin/{cc} 100 \\',
+            f' && update-alternatives --install /usr/bin/c++ c++ /usr/bin/{cxx} 100',
+            '# Assert under a login shell: the base re-exports its own PATH from',
+            "# /etc/profile.d, which is how harbor's test.sh resolves these binaries.",
+            'RUN set -eux; \\',
+            f'    c="$(bash -lc \'{manager} --version | head -1\')"; \\',
+            f'    g="$(bash -lc \'{cxx} --version | head -1\')"; \\',
+            f'    case "$c" in *{manager_version}*) ;; *) echo "TOOLCHAIN PIN '
+            'FAILED (login shell): $c" >&2; exit 42;; esac; \\',
+            f'    case "$g" in *{plan.toolchain_version}*) ;; *) echo "TOOLCHAIN '
+            'PIN FAILED (login shell): $g" >&2; exit 42;; esac; \\',
+            "    bash -lc 'ninja --version && clang --version | head -1'",
+        ]
+        if plan.apt_packages:
+            lines.append(
+                'RUN apt-get update && apt-get install -y --no-install-recommends '
+                + ' '.join(plan.apt_packages)
+                + ' && rm -rf /var/lib/apt/lists/*'
+            )
+        lines += [
+            ' '.join((f'RUN {command.tool}', *command.args)).rstrip()
+            for command in plan.install_commands
+        ]
+
+        spec = self.toolchain_spec()
+        toolchain = replace(
+            spec,
+            install_block='\n'.join(lines),
+            env={**spec.env, 'CC': cc, 'CXX': cxx},
+        ).render()
+        return '\n'.join([toolchain, '', MEASURE_NO_WARM_COMMENT])
+
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
     ) -> str:
@@ -524,15 +837,17 @@ class CppPlugin(B.LangPlugin):
         NO leak gate, NO tripwire scan, NO carve-receipt assert: on the intact
         tree all three would fire by construction (they exist to catch carved
         bytes, and the intact tree IS carved bytes).
+
+        `dep_plan` swaps the hardcoded gap for `render_gap(dep_plan)` in the
+        SAME slot and touches nothing else. `dep_plan=None` is what emit.py
+        passes and renders the bytes it always did.
         """
-        if dep_plan is not None:
-            raise B.LangError(
-                f'the {self.name!r} measure image does not render its gap from a '
-                'DepPlan yet; only c does. Passing one here would silently '
-                'ignore it, which is worse than refusing it'
-            )
         base_image = self.toolchain_spec().base_image
-        toolchain = self.toolchain()
+        gap = (
+            '\n'.join([self.toolchain(), '', MEASURE_NO_WARM_COMMENT])
+            if dep_plan is None
+            else self.render_gap(dep_plan)
+        )
         return '\n'.join([
             '# syntax=docker/dockerfile:1.7',
             f'# Harbor MEASURE image -- {env.repo_name} ({self.name}). NEVER SHIP.',
@@ -544,9 +859,7 @@ class CppPlugin(B.LangPlugin):
             '',
             f'FROM {base_image} AS measure',
             '',
-            toolchain,
-            '',
-            '# no warmed dependencies (cpp installs its toolchain via apt above)',
+            gap,
             '',
             f'# The measure phase points {env.repo_context} at the INTACT repo directly,',
             f'# not a staging tree, so there is no repo/ prefix to copy from. That is',

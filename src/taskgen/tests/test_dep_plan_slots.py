@@ -33,6 +33,8 @@ from taskgen import depplan, env_resolver as R, refine, resolver_inputs
 from taskgen.env_resolver import ResolveRefused
 from taskgen.langs import base as B
 from taskgen.langs import c as C
+from taskgen.langs import cpp as CPP
+from taskgen.langs import java as JAVA
 
 GOOD_PLAN = C.C_MEASURE_DEP_PLAN
 
@@ -143,10 +145,147 @@ def test_a_rejection_names_the_slot_and_never_a_repo_body():
     assert 'xs_gc' not in message and '#include' not in message
 
 
-def test_the_base_hook_is_a_no_op_so_other_languages_are_untouched():
-    for lang in ('python', 'go', 'rust', 'cpp', 'java'):
+def test_the_base_hook_is_a_no_op_so_gapless_languages_are_untouched():
+    """python, go and rust still have no gap, so they still have no gate."""
+    for lang in ('python', 'go', 'rust'):
         assert B.get(lang).validate_dep_plan(GOOD_PLAN) is None
         assert B.get(lang).required_plan_slots == ()
+
+
+@pytest.mark.parametrize('lang', ('c', 'cpp', 'java'))
+def test_a_language_with_a_gap_gates_every_plan_including_a_foreign_one(lang: str):
+    """The overriding half: a gap and a no-op gate is the crash this slice fixed."""
+    assert B.get(lang).required_plan_slots != ()
+    if lang != 'c':
+        with pytest.raises(B.LangError, match='cannot render'):
+            B.get(lang).validate_dep_plan(GOOD_PLAN)
+
+
+# ------------------------------------------------ the same gate, cpp + java --
+
+#: One row per plan-rendered language: its plugin's canonical plan and the two
+#: enumerations its gate reads. Driven off the plugin modules so a slot added to
+#: a renderer and not to its `REQUIRED_*` tuple has nowhere to hide.
+GATED_LANGS = (
+    ('c', C.C_MEASURE_DEP_PLAN, C.REQUIRED_BUILD_FLAGS,
+     C.REQUIRED_TEST_INVOCATION_KEYS, C.REQUIRED_PLAN_SLOTS),
+    ('cpp', CPP.CPP_MEASURE_DEP_PLAN, CPP.REQUIRED_BUILD_FLAGS,
+     CPP.REQUIRED_TEST_INVOCATION_KEYS, CPP.REQUIRED_PLAN_SLOTS),
+    ('java', JAVA.JAVA_MEASURE_DEP_PLAN, JAVA.REQUIRED_BUILD_FLAGS,
+     JAVA.REQUIRED_TEST_INVOCATION_KEYS, JAVA.REQUIRED_PLAN_SLOTS),
+)
+
+
+def _rows(index: int):
+    return [
+        pytest.param(lang, plan, key, id=f'{lang}-{key}')
+        for lang, plan, *tuples in GATED_LANGS
+        for key in tuples[index]
+    ]
+
+
+@pytest.mark.parametrize('lang,plan,key', _rows(0))
+def test_a_missing_or_empty_build_flag_is_rejected_by_name_for_every_gap(
+    lang: str, plan, key: str,
+):
+    stripped = dataclasses.replace(
+        plan, build_flags=tuple((k, v) for k, v in plan.build_flags if k != key),
+    )
+    blanked = dataclasses.replace(
+        plan,
+        build_flags=tuple((k, '' if k == key else v) for k, v in plan.build_flags),
+    )
+    for candidate in (stripped, blanked):
+        with pytest.raises(B.LangError) as excinfo:
+            B.get(lang).validate_dep_plan(candidate)
+        message = str(excinfo.value)
+        assert f'build_flags[{key!r}]' in message
+        assert 'must be a non-empty string' in message
+
+
+@pytest.mark.parametrize('lang,plan,key', _rows(1))
+def test_a_missing_or_empty_test_invocation_key_is_rejected_for_every_gap(
+    lang: str, plan, key: str,
+):
+    missing = dataclasses.replace(
+        plan,
+        test_invocation=tuple((k, v) for k, v in plan.test_invocation if k != key),
+    )
+    empty = dataclasses.replace(
+        plan,
+        test_invocation=tuple(
+            (k, () if k == key else v) for k, v in plan.test_invocation
+        ),
+    )
+    for candidate in (missing, empty):
+        with pytest.raises(B.LangError) as excinfo:
+            B.get(lang).validate_dep_plan(candidate)
+        assert f'test_invocation[{key!r}]' in str(excinfo.value)
+
+
+@pytest.mark.parametrize('lang,plan,flags,test_keys,slots', GATED_LANGS)
+def test_every_enforced_slot_is_announced_for_every_gap(
+    lang: str, plan, flags, test_keys, slots,
+):
+    """No unannounced rejection: each enforced slot appears in the ask."""
+    stated = '\n'.join(slots)
+    for key in (*flags, *test_keys):
+        assert key in stated
+    assert 'toolchain_version' in stated
+    assert 'package_manager' in stated
+
+
+@pytest.mark.parametrize('lang,plan,flags,test_keys,slots', GATED_LANGS)
+def test_an_unrenderable_toolchain_version_is_rejected_for_every_gap(
+    lang: str, plan, flags, test_keys, slots,
+):
+    """The version drives a binary name or a pin, so an unusable one is refused."""
+    with pytest.raises(B.LangError):
+        B.get(lang).validate_dep_plan(
+            dataclasses.replace(plan, toolchain_version='latest')
+        )
+
+
+@pytest.mark.parametrize(
+    'lang,plan,manager',
+    (
+        ('cpp', CPP.CPP_MEASURE_DEP_PLAN, 'make'),
+        ('java', JAVA.JAVA_MEASURE_DEP_PLAN, 'maven'),
+    ),
+)
+def test_a_manager_the_gap_has_no_prose_for_is_rejected(lang: str, plan, manager: str):
+    """Schema-legal for the language, unrenderable by THIS gap.
+
+    `depplan.PACKAGE_MANAGERS` allows cpp `make` and java `maven`, and neither
+    gap can render one: the cpp pin runs `cmake --version` and the java gap
+    writes gradle.properties. That is precisely the class of gap the generic
+    validator structurally cannot see.
+    """
+    swapped = dataclasses.replace(plan, package_manager=manager)
+    depplan.validate(swapped)
+
+    with pytest.raises(B.LangError, match='has no prose for package_manager'):
+        B.get(lang).validate_dep_plan(swapped)
+
+
+@pytest.mark.parametrize('lang,plan,flags,test_keys,slots', GATED_LANGS)
+def test_every_gap_rejection_names_the_slot_and_never_a_repo_body(
+    lang: str, plan, flags, test_keys, slots,
+):
+    """The message becomes a prompt, so it may carry no source and no path."""
+    key = flags[0]
+    with pytest.raises(B.LangError) as excinfo:
+        B.get(lang).validate_dep_plan(
+            dataclasses.replace(
+                plan,
+                build_flags=tuple((k, v) for k, v in plan.build_flags if k != key),
+            )
+        )
+
+    message = str(excinfo.value)
+    assert key in message
+    for secret in ('#include', 'src/runtime', 'Compiler/', 'tamboui', 'Tests/'):
+        assert secret not in message
 
 
 # ----------------------------------------------------------- the loop ------

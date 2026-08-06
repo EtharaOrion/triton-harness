@@ -63,6 +63,21 @@ UNRENDERABLE_PLAN = dataclasses.replace(
 
 LINKER_ERROR = "undefined reference to `xs_gc_mark'"
 
+#: A repo whose suite needs a SERVICE the sandbox cannot provide, as the failure
+#: actually arrives: libpq's connect diagnostic, two lines, verbatim. Nothing in
+#: a `DepPlan` can fix it -- there is no apt package that is a running postgres,
+#: and the graded run is `--network=none` regardless -- so it is the cleanest
+#: available case of "the plan is fine, the environment is impossible".
+SERVICE_STDERR = (
+    'could not connect to server: Connection refused\n'
+    '\tIs the server running on host localhost (127.0.0.1) and accepting\n'
+    '\tTCP/IP connections on port 5432?'
+)
+
+#: The one line of it that survives `measure.scrub_stderr`: it carries a signal
+#: marker ("could not"), the host/port lines do not.
+SERVICE_SIGNAL = 'could not connect to server: Connection refused'
+
 
 def fake_lock(expected: int = 3, graded: tuple[str, ...] = ('u::a', 'u::b', 'u::c')):
     if expected < 1:
@@ -242,6 +257,62 @@ def test_three_failures_refuse_and_there_is_no_fourth_ask(tmp_path):
     assert len(measure_cb.builds) == 3
     assert 'exhausted 3 attempts' in excinfo.value.reason
     assert 'error three' in excinfo.value.reason
+
+
+def test_a_service_the_sandbox_cannot_provide_exhausts_the_cap_and_refuses(tmp_path):
+    """The service-dependency case reaches the SAME invariant as a build miss.
+
+    Every ingredient here is the OPPOSITE of the failures above: the model never
+    refuses, every answer is plausible and schema-valid, each is a genuinely
+    different environment (so the dedupe gate never fires), and every build gets
+    as far as running the suite. The only thing wrong is that the suite wants a
+    server, and no `DepPlan` can express one -- there is no apt package that is
+    a running postgres.
+
+    A loop that "degraded gracefully" here would pin the last attempt's lock and
+    ship a task whose every solver scores 0.0 for a reason that has nothing to
+    do with the carve. So the assertion is that all three attempts are spent and
+    the exit is a REFUSE carrying the connection signal -- which is what makes
+    the refusal actionable by a human rather than a mystery zero.
+    """
+    resolver = ScriptedResolver(GOOD_PLAN, OTHER_PLAN, THIRD_PLAN)
+    measure_cb = ScriptedMeasure(*(
+        M.MeasureError('measure failed', stderr=SERVICE_STDERR) for _ in range(3)
+    ))
+
+    with pytest.raises(ResolveRefused) as excinfo:
+        run(resolver, measure_cb, repo=tmp_path)
+
+    reason = excinfo.value.reason
+    assert 'exhausted 3 attempts' in reason
+    assert SERVICE_SIGNAL in reason
+    assert refine.NO_PROGRESS_REASON not in reason
+
+    assert resolver.calls == refine.RESOLVE_ATTEMPT_CAP == 3
+    assert len(measure_cb.builds) == 3
+    assert resolver.repairs == [None, SERVICE_SIGNAL, SERVICE_SIGNAL]
+
+
+def test_the_service_refusal_carries_the_signal_and_not_the_host_and_port(tmp_path):
+    """Scrubbed, not merely forwarded: the diagnostic crosses as one signal line.
+
+    The host/port line is dropped by the same rule that drops every other
+    non-signal line, so the repair the model sees -- and the reason a human
+    reads -- names the failure without carrying the sandbox's own topology.
+    """
+    resolver = ScriptedResolver(GOOD_PLAN, OTHER_PLAN, THIRD_PLAN)
+    measure_cb = ScriptedMeasure(*(
+        M.MeasureError('measure failed', stderr=SERVICE_STDERR) for _ in range(3)
+    ))
+
+    with pytest.raises(ResolveRefused) as excinfo:
+        run(resolver, measure_cb, repo=tmp_path)
+
+    reason = excinfo.value.reason
+    assert '127.0.0.1' not in reason
+    assert '5432' not in reason
+    assert 'Is the server running' not in reason
+    assert reason.rstrip().endswith(SERVICE_SIGNAL)
 
 
 def test_an_identical_second_plan_is_refused_without_a_second_build(tmp_path):
@@ -559,6 +630,60 @@ def test_an_unrenderable_plan_the_model_never_fixes_is_a_clean_refusal(
     assert 'make_version' in excinfo.value.reason
     assert not lock_path(out, plan).exists()
     assert FailThenBuildRunner.instances[-1].builds == []
+
+
+class ServiceDependentRunner(FailThenBuildRunner):
+    """docker for a repo whose suite needs a server: EVERY build dies the same way.
+
+    The failure is scripted at the build, not at the run, because that is where
+    a measure image that has to reach a service dies -- and it proves the loop
+    reads the runner's own message when there is no captured suite stderr to
+    read (`measure._measure_failed`).
+    """
+
+    def build_with_contexts(self, *, image, dockerfile, context, contexts):
+        self.builds.append(Path(dockerfile).read_text())
+        raise RuntimeError(SERVICE_STDERR)
+
+
+@pytest.fixture
+def docker_that_needs_a_service(monkeypatch):
+    monkeypatch.setattr('taskgen.verify.DockerRunner', ServiceDependentRunner)
+    return ServiceDependentRunner
+
+
+def test_a_service_dependency_refuses_the_task_instead_of_pinning_a_zero(
+    plan, tmp_path, docker_that_needs_a_service,
+):
+    """SHIP or REFUSE, end to end, for the one failure no plan can repair.
+
+    The whole slice in one assertion pair: the environment is impossible, so the
+    output directory keeps NO lock -- and without a lock there is no floor, no
+    graded.json and therefore no shippable entry. The alternative a degrading
+    loop would produce is far worse than an error: a task that builds, grades
+    and hands every solver 0.0 because a database was never there.
+
+    `emit._measure_and_pin` is the frame under test rather than `refine`, so the
+    no-lock half is proved against the real writer instead of a stand-in.
+    """
+    out = tmp_path / 'out'
+    resolver = ScriptedResolver(GOOD_PLAN, OTHER_PLAN, THIRD_PLAN)
+
+    with pytest.raises(ResolveRefused) as excinfo:
+        emit._measure_and_pin(
+            plan, B.get('c'), out, echo=lambda *_: None,
+            resolve_env=True, resolver=resolver,
+        )
+
+    assert SERVICE_SIGNAL in excinfo.value.reason
+    assert 'exhausted 3 attempts' in excinfo.value.reason
+    assert not lock_path(out, plan).exists()
+
+    runner = ServiceDependentRunner.instances[-1]
+    assert len(runner.builds) == 3
+    assert resolver.calls == 3
+    assert resolver.repairs[1] == SERVICE_SIGNAL
+    assert str(plan.repo) not in excinfo.value.reason
 
 
 def test_a_refine_that_refuses_writes_no_lock_at_all(plan, tmp_path):
