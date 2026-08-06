@@ -246,7 +246,7 @@ def test_generate_pytest_feeds_the_import_hint_and_feedback():
     _, user = client.calls[0]
 
     assert 'src/pkg/core.py' in user
-    assert 'from core import *' in user
+    assert 'from pkg.core import *' in user
     assert 'FIX it' in user
 
 

@@ -85,13 +85,15 @@ def extract_code(text: str) -> str:
 
 
 def infer_import_hint(stub_files: list[str]) -> str:
-    """Best-effort module import path from a stubbed file (slugify/slugify.py -> slugify)."""
+    """Best-effort package-qualified import path from a stubbed file
+    (src/itsdangerous/encoding.py -> 'from itsdangerous.encoding import *')."""
     for f in stub_files or []:
         if f.endswith(".py"):
-            parts = f[:-3].split("/")
-            # drop a leading src dir if it duplicates the package name
-            mod = ".".join(p for p in parts if p not in ("src",))
-            return f"from {parts[-1]} import *   # module: {mod}"
+            parts = [p for p in f[:-3].split("/") if p not in ("src",) and p != "__init__"]
+            if not parts:
+                continue
+            mod = ".".join(parts)
+            return f"from {mod} import *   # module: {mod}"
     return ""
 
 
