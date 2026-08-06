@@ -5,7 +5,7 @@ Layout written per entry (directory name = the uuid5 entry id):
     <entry_id>/
       task.toml                          the plugin's family (A for python/go)
       instruction.md                     only the pre-loaded context block and
-                                         the condition differ between the nine
+                                         the condition differ between the eleven
       environment/Dockerfile             from the plugin; consumes the STAGED
                                          carved tree, never the intact one
       environment/Dockerfile.dockerignore
@@ -33,21 +33,23 @@ byte-identical to the pristine checkout. reward=1 then reduces to "the graded
 tests pass on the pristine repo AND the selector selects exactly them", which is
 a property of the target selection, not of the emission.
 
-Why the staged tree is shared: all nine conditions of one target carve the same
-files and share one image and one oracle. Staging nine copies of a 33MB
-repository would be nine times the disk for zero additional proof.
+Why the staged tree is shared: all eleven conditions of one target carve the
+same files and share one image and one oracle. Staging eleven copies of a 33MB
+repository would be eleven times the disk for zero additional proof.
 
 DETERMINISM: no timestamps, no host paths, no dict iteration order in output.
-The token budget handed to all nine context builders is computed from the WIDEST
-of the nine headers, so every condition packs against the same budget.
+The token budget handed to all eleven context builders is computed from the
+WIDEST of the eleven headers, so every condition packs against the same budget.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
+import tempfile
 import tomllib
 import uuid
 from dataclasses import dataclass
@@ -59,7 +61,7 @@ from gen_context import FRAMING_BLOCK, assert_no_leakage  # noqa: E402
 
 from . import scope as scope_mod  # noqa: E402
 from . import templates  # noqa: E402
-from .carve import build_carve_set  # noqa: E402
+from .carve import CarveSet, build_carve_set  # noqa: E402
 from .contexts import (  # noqa: E402
     CONTEXT_TYPES,
     ContextInputs,
@@ -68,16 +70,41 @@ from .contexts import (  # noqa: E402
     fence,
     stub_phrase,
 )
-from .gradedset import derive_graded_set, parse_linked, select_carved  # noqa: E402
+from .gradedset import (  # noqa: E402
+    GradedSelection,
+    derive_graded_set,
+    parse_linked,
+    select_carved,
+)
 from .ids import entry_id, slug as make_slug  # noqa: E402
 from .langs import base as langs_base  # noqa: E402
 from .scope import CarveScope  # noqa: E402
-from .staging import stage_carved_tree  # noqa: E402
+from .staging import (  # noqa: E402
+    StagedTree,
+    merge_bundle_tripwires,
+    stage_carved_tree,
+)
 
 DEFAULT_BUDGET = 100000
 DEFAULT_SEED = 0
 TOKENIZER = 'chars4'
 UV_VERSION = '0.12.1'
+
+#: Mirrors verifier.generators.verifier_loop.MIN_SOUND_CRITERIA. Duplicated as a
+#: literal so `--verifier-min-criteria`'s default costs no import: the verifier
+#: package (and litellm behind it) must stay unimported unless --verifier is set.
+#: test_emit_verifier.py asserts the two never drift.
+DEFAULT_VERIFIER_MIN_CRITERIA = 6
+
+#: Directory the bundle lands in, inside each entry. Under solution/, which is
+#: never COPYed into a layer, so the bundle inherits the oracle's exclusion.
+VERIFIER_SUBDIR = 'solution/verifier'
+
+#: Test/dev hook: `module:callable` returning a ModelClient, used INSTEAD of the
+#: configured proxy. It exists so the offline suite can drive the whole pipeline
+#: with a MockClient; it announces itself loudly on every run precisely because a
+#: bundle authored by anything but a real model is not a real bundle.
+VERIFIER_FAKE_CLIENT_ENV = 'TASKGEN_VERIFIER_FAKE_CLIENT'
 
 #: uuid5 namespace for the shared staging directory name. Keyed on the carve,
 #: so two scopes over one repo stage side by side instead of overwriting.
@@ -147,16 +174,51 @@ def _image_name(repo_name: str) -> str:
 
 
 @dataclass(frozen=True)
+class Provenance:
+    """Where the carved checkout came from, when it came from a clone.
+
+    Absent (`None`) for a directory handed to `--repo`: that path is a host
+    detail, not a reproducible source, and recording it would put a host path in
+    every emitted task.toml.
+    """
+
+    repo_url: str
+    commit: str
+    clone_kind: str
+
+    @property
+    def pinned(self) -> bool:
+        return self.clone_kind == 'pinned'
+
+
+def make_provenance(repo_url, commit, clone_kind) -> Provenance | None:
+    if repo_url is None:
+        return None
+    kind = clone_kind or ('pinned' if commit else 'floating')
+    if kind not in ('pinned', 'floating'):
+        raise SystemExit(f'unknown clone_kind {kind!r}; expected pinned or floating')
+    if kind == 'pinned' and not commit:
+        raise SystemExit(
+            'a pinned clone must record its commit; that sha is the only thing '
+            'that makes the emitted task reproducible'
+        )
+    return Provenance(
+        repo_url=str(repo_url), commit=str(commit or ''), clone_kind=kind,
+    )
+
+
+@dataclass(frozen=True)
 class CarvePlan:
     lang: str
     scope: CarveScope
     repo: Path
     repo_name: str
     target: object
-    carve: object
-    graded: object
-    staged: object
+    carve: CarveSet
+    graded: GradedSelection
+    staged: StagedTree
     staging_key: str
+    provenance: Provenance | None = None
 
 
 def _resolve_target(lang: str, repo: Path, *, package_base, file, func, cls, receiver,
@@ -223,6 +285,7 @@ def plan_carve(
     include=(),
     exclude=(),
     delete_whole_file=False,
+    provenance: Provenance | None = None,
 ) -> CarvePlan:
     """Everything that is independent of the context type, done exactly once."""
     plugin = langs_base.get(lang)
@@ -255,6 +318,7 @@ def plan_carve(
         carve = build_carve_set(
             repo, scope, carved_relpaths=carved, language=lang, target=target,
             delete_whole_file=delete_whole_file, carved_functions=carved_functions,
+            all_functions=parsed,
         )
         # A skeleton carve drops files that hold no function body at all, so the
         # graded set must be derived from what was ACTUALLY carved -- deriving
@@ -315,6 +379,7 @@ def plan_carve(
     return CarvePlan(
         lang=lang, scope=scope, repo=repo, repo_name=repo_name, target=carve.target_view,
         carve=carve, graded=graded, staged=staged, staging_key=key,
+        provenance=provenance,
     )
 
 
@@ -684,6 +749,7 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
         carve_scope=plan.scope.value,
         carved_files=json.dumps(list(carve.carved_relpaths)),
         docker_image=image,
+        provenance=templates.render_provenance(plan.provenance),
     ))
 
     _write(path / 'tests/graded.json',
@@ -736,14 +802,24 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
              lang: str = 'python', carve_scope: str = 'function',
              receiver: str | None = None, project: str | None = None,
              include=(), exclude=(), delete_whole_file: bool = False,
+             repo_url: str | None = None, commit: str | None = None,
+             clone_kind: str | None = None,
+             verifier: bool = False, llm_config: str | Path | None = None,
+             verifier_min_criteria: int = DEFAULT_VERIFIER_MIN_CRITERIA,
              echo=print) -> list[Entry]:
-    """Select, carve, stage, and write one full harbor entry per context type."""
+    """Select, carve, stage, and write one full harbor entry per context type.
+
+    `verifier=False` is the whole existing behaviour, byte-for-byte: nothing in
+    the verifier package is imported, no LLM is contacted, and the run stays
+    offline and `diff -r`-reproducible.
+    """
     out = Path(out)
     plugin = langs_base.get(lang)
     plan = plan_carve(
         repo, out, lang=lang, carve_scope=carve_scope, package_base=package_base,
         file=file, func=func, cls=cls, receiver=receiver, project=project,
         include=include, exclude=exclude, delete_whole_file=delete_whole_file,
+        provenance=make_provenance(repo_url, commit, clone_kind),
     )
 
     if not plugin.parser_backed:
@@ -754,7 +830,7 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
         carve=plan.carve, nodeids=plan.graded.selectors, budget=budget, seed=seed,
         tokenizer=TOKENIZER, language=lang,
     )
-    # One budget for all nine: reserve the WIDEST header so a longer condition
+    # One budget for all eleven: reserve the WIDEST header so a longer condition
     # name can never buy a condition fewer context tokens than its neighbours.
     inp.header_tokens = max(
         inp.counter.count(render_head(inp, ct, plan)) for ct in context_types
@@ -763,10 +839,149 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
     meta = repo_metadata(plan.repo)
     graded_spec = _graded_spec(plan, plugin)
     out.mkdir(parents=True, exist_ok=True)
-    return [
+    entries = [
         _write_entry(inp, ct, out, meta, plan, plugin, graded_spec)
         for ct in context_types
     ]
+    if verifier:
+        emit_verifier_bundle(
+            plan, entries, llm_config=llm_config,
+            min_criteria=verifier_min_criteria, echo=echo,
+        )
+    return entries
+
+
+# --------------------------------------------------------------------------
+# --verifier: ONE bundle per invocation, copied into all eleven entries
+# --------------------------------------------------------------------------
+
+
+def _load_fake_client(spec: str, echo):
+    """Resolve `module:callable` from VERIFIER_FAKE_CLIENT_ENV into a ModelClient."""
+    import importlib
+
+    module_name, _, attr = spec.partition(':')
+    if not module_name or not attr:
+        raise SystemExit(
+            f'{VERIFIER_FAKE_CLIENT_ENV}={spec!r} is not "module:callable"'
+        )
+    try:
+        factory = getattr(importlib.import_module(module_name), attr)
+    except (ImportError, AttributeError) as exc:
+        raise SystemExit(
+            f'{VERIFIER_FAKE_CLIENT_ENV}={spec!r} could not be resolved: {exc}'
+        ) from exc
+    echo(
+        f'verifier: WARNING -- authoring with the FAKE client hook {spec!r} '
+        f'({VERIFIER_FAKE_CLIENT_ENV}), NOT a model. The resulting bundle is a '
+        'test fixture and must not be shipped as a real verifier.'
+    )
+    return factory()
+
+
+def resolve_verifier_client(llm_config, *, echo=print):
+    """The authoring client, or a LOUD failure (PLAN V4).
+
+    An unreachable or unconfigured proxy when `--verifier` was explicitly asked
+    for is NOT the non-blocking case: the non-blocking case is "the soundness
+    floor was not met", which is a real answer. A missing config is no answer at
+    all, and quietly shipping the task without a bundle would hide it.
+    """
+    hook = os.environ.get(VERIFIER_FAKE_CLIENT_ENV)
+    if hook:
+        return _load_fake_client(hook, echo)
+
+    from verifier.llm_config import LLMConfigError, client_from_config, resolve_config
+
+    try:
+        cfg = resolve_config(llm_config)
+    except LLMConfigError as exc:
+        raise SystemExit(f'--verifier: {exc}') from exc
+    return client_from_config(cfg)
+
+
+def _copy_bundle(src_dir: Path, dest_dir: Path) -> list[str]:
+    """Copy one frozen bundle into an entry, through the emitter's own discipline.
+
+    `_write` is reused rather than `shutil.copy` so the copies land with LF
+    endings and no mode/timestamp carried over from the temporary build.
+    """
+    written: list[str] = []
+    for path in sorted(src_dir.rglob('*')):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src_dir).as_posix()
+        _write(dest_dir / rel, path.read_text(encoding='utf-8'))
+        written.append(rel)
+    return written
+
+
+def emit_verifier_bundle(plan: CarvePlan, entries, *, llm_config=None,
+                         min_criteria: int = DEFAULT_VERIFIER_MIN_CRITERIA,
+                         echo=print) -> bool:
+    """Generate ONE bundle for the carve and copy it into every entry. (D4/D6)
+
+    Everything here is imported lazily: `--verifier` is the only path that may
+    pull litellm and the generator stack into a taskgen process.
+
+    Two failure shapes, deliberately different:
+      * the soundness floor was not met -> log, ship the task WITHOUT a bundle,
+        return False (D5: additive, non-blocking);
+      * the client/config/proxy is unusable, or the language has no soundness
+        executor -> raise. An unproven bundle is worse than no bundle, and a
+        silent skip would make `--verifier` a no-op that looks like success.
+    """
+    client = resolve_verifier_client(llm_config, echo=echo)
+
+    from verifier.bundle import build_verifier_bundle
+    from verifier.exec_env import make_exec_env
+    from verifier.inputs import build_truth_inputs, solution_code
+
+    inputs = build_truth_inputs(
+        plan.carve, plan.target, plan.lang,
+        repo_name=plan.repo_name, fail_to_pass=list(plan.graded.selectors),
+    )
+    code = solution_code(plan.carve)
+
+    with tempfile.TemporaryDirectory(prefix='taskgen-verifier-') as tmp:
+        tmp_root = Path(tmp)
+        try:
+            env = make_exec_env(
+                plan.lang, repo=plan.repo, carve=plan.carve,
+                work_dir=tmp_root / 'trees',
+            )
+        except NotImplementedError as exc:
+            raise SystemExit(f'--verifier: {exc}') from exc
+
+        base_dir = tmp_root / 'bundle'
+        try:
+            shipped = build_verifier_bundle(
+                inputs, client, base_dir,
+                exec_runner=env.as_run_pytest(),
+                golden_code=code.golden, stub_code=code.stub,
+                min_criteria=min_criteria, echo=echo,
+            )
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(
+                f'--verifier: bundle generation FAILED '
+                f'({type(exc).__name__}: {exc}). This is not a soundness abort -- '
+                'nothing was written, and a task is never shipped with a bundle '
+                'that could not be authored and validated.'
+            ) from exc
+
+        if not shipped:
+            echo('verifier: shipping the task WITHOUT a bundle (non-blocking)')
+            return False
+
+        for entry in entries:
+            _copy_bundle(base_dir, entry.path / VERIFIER_SUBDIR)
+        echo(f'verifier: bundle copied into {len(entries)} entry solution/verifier/')
+
+        added = merge_bundle_tripwires(plan.staged, base_dir)
+        echo(f'verifier: merged {len(added)} bundle tripwire line(s) into the leak gate')
+    return True
 
 
 def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> CarvePlan:
@@ -833,6 +1048,8 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print) -> Carve
         scope=plan.scope.value,
         floor_mode=plugin.floor_mode,
         fingerprint_sha256={},
+        repo_url=plan.provenance.repo_url if plan.provenance else None,
+        commit=plan.provenance.commit if plan.provenance else None,
     )
 
     runner_with_tooling = _MeasureRunnerAdapter(runner, tooling_context_dir)

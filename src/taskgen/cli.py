@@ -1,6 +1,7 @@
 """Command line entry point.
 
-    python -m taskgen.cli generate --repo <repo> --out <dir> \
+    python -m taskgen.cli generate (--repo <checkout> | --repo-url <src> \
+        [--commit <sha> | --allow-floating]) --out <dir> \
         [--file src/pkg/mod.py] [--func name] [--class Cls] \
         [--package-base src/] [--budget 100000] [--seed 0] \
         [--contexts all|bm25,mix,...]
@@ -22,11 +23,17 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import verify
+from . import clone, verify
+from . import emit as emit_mod
 from .contexts import CONTEXT_TYPES
 from .emit import DEFAULT_BUDGET, DEFAULT_SEED, emit_all
 from .langs import base
 from .scope import CarveScope
+
+#: Where `--repo-url` clones land by default: the same directory `verify`
+#: already searches when `--repo` is omitted (verify.REPOS_SRC_RELPATH), so a
+#: cloned task verifies with no extra flags.
+DEFAULT_REPOS_CACHE = Path('../../harbor-tasks/repos-src')
 
 
 def _parse_contexts(raw: str) -> tuple[str, ...]:
@@ -44,9 +51,43 @@ def _parse_contexts(raw: str) -> tuple[str, ...]:
     return tuple(c for c in CONTEXT_TYPES if c in set(wanted))
 
 
+def resolve_source(args, echo=print) -> tuple[Path, str | None, str | None, str | None]:
+    """`(local checkout, repo_url, commit, clone_kind)` for one generate run.
+
+    `--repo` is used DIRECTLY and records no provenance, so its emitted bytes are
+    exactly what they were before cloning existed. `--repo-url` goes through
+    `clone.ensure_repo`, which itself falls back to direct use for a plain
+    directory snapshot that has no `.git` to clone.
+    """
+    if args.repo is not None:
+        return args.repo, None, None, None
+
+    source = args.repo_url
+    name = args.repo_name or clone.derive_name(source)
+    repo = clone.ensure_repo(
+        source=source,
+        commit=args.commit,
+        cache_dir=Path(args.repos_cache),
+        name=name,
+        allow_floating=args.allow_floating,
+    )
+    head = clone.head_commit(repo)
+    pinned = head is not None and args.commit is not None and not args.allow_floating
+    if pinned:
+        echo(f'source      {source} @ {head}')
+        return repo, source, head, 'pinned'
+    echo(f'source      {source} (FLOATING: not reproducible)')
+    echo(
+        'warning     this task records no commit, so upstream can move under it '
+        'and verify will start failing. Pass --commit <sha> to pin it.'
+    )
+    return repo, source, '', 'floating'
+
+
 def cmd_generate(args) -> int:
+    repo, repo_url, commit, clone_kind = resolve_source(args)
     entries = emit_all(
-        repo=args.repo,
+        repo=repo,
         out=args.out,
         package_base=args.package_base,
         file=args.file,
@@ -62,6 +103,12 @@ def cmd_generate(args) -> int:
         include=args.include,
         exclude=args.exclude,
         delete_whole_file=args.delete_whole_file,
+        repo_url=repo_url,
+        commit=commit,
+        clone_kind=clone_kind,
+        verifier=args.verifier,
+        llm_config=args.llm_config,
+        verifier_min_criteria=args.verifier_min_criteria,
     )
     first = entries[0]
     print(f'language    {first.lang}')
@@ -97,7 +144,29 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest='command', required=True)
 
     gen = sub.add_parser('generate', help='emit one harbor entry per context type')
-    gen.add_argument('--repo', required=True, type=Path, help='repository checkout to carve')
+    source = gen.add_mutually_exclusive_group(required=True)
+    source.add_argument('--repo', type=Path, default=None,
+                        help='repository checkout to carve, already on disk')
+    source.add_argument('--repo-url', default=None, metavar='SRC',
+                        help='clone source instead of a ready checkout: a public '
+                             'https/ssh/git/file:// URL, or a local git repository. A '
+                             'plain directory with no .git is used directly, since '
+                             'there is nothing to clone')
+    gen.add_argument('--commit', default=None, metavar='SHA',
+                     help='--repo-url: the commit to check out. Required unless '
+                          '--allow-floating: verify pins the task to exact upstream '
+                          'bytes, so an unpinned clone stops verifying when upstream '
+                          'moves')
+    gen.add_argument('--allow-floating', action='store_true',
+                     help='--repo-url: accept the default-branch HEAD instead of a '
+                          'pinned commit. The emitted task is NOT reproducible')
+    gen.add_argument('--repo-name', default=None, metavar='NAME',
+                     help='--repo-url: override the checkout basename derived from the '
+                          'source. It is the identity: it seeds the entry ids, the slug '
+                          'and the image tag')
+    gen.add_argument('--repos-cache', type=Path, default=DEFAULT_REPOS_CACHE,
+                     metavar='DIR',
+                     help=f'--repo-url: where clones land (default: {DEFAULT_REPOS_CACHE})')
     gen.add_argument('--out', required=True, type=Path, help='output directory')
     gen.add_argument('--package-base', default='src/',
                      help="import root inside the repo (default: 'src/')")
@@ -132,6 +201,23 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument('--seed', type=int, default=DEFAULT_SEED)
     gen.add_argument('--contexts', default='all',
                      help=f"'all' or a comma list of: {', '.join(CONTEXT_TYPES)}")
+    gen.add_argument('--verifier', action='store_true',
+                     help='additionally generate ONE per-task verifier bundle and copy '
+                          "it into every entry's solution/verifier/. OFF by default: the "
+                          'bundle is LLM-authored, so a --verifier run is NOT '
+                          'diff -r-reproducible and needs an LLM proxy. Everything else '
+                          'the run emits is unchanged')
+    gen.add_argument('--llm-config', default=None, metavar='PATH',
+                     help='--verifier: the JSON config naming the LLM proxy '
+                          '(model, base_url, api_key). Default: the git-ignored '
+                          '.llm_config at the repo root. Missing or unreachable is a '
+                          'LOUD failure, never a silently empty bundle')
+    gen.add_argument('--verifier-min-criteria', type=int,
+                     default=emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA, metavar='INT',
+                     help='--verifier: how many rubric criteria must survive '
+                          'golden-pass AND stub-fail before a bundle ships (default: '
+                          f'{emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA}). Below the floor '
+                          'the task ships WITHOUT a bundle -- additive and non-blocking')
     gen.set_defaults(func_impl=cmd_generate)
 
     ver = sub.add_parser(

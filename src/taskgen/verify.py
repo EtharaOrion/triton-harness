@@ -53,10 +53,10 @@ that reads as RED would let a broken task pass the first half of the gate.
     python -m taskgen.cli verify --entry <entry-dir> [--keep-image]
     python -m taskgen.cli verify --all  <out-dir>    [--keep-image]
 
-`--all` exploits the fact that the nine context conditions of one target share
+`--all` exploits the fact that the context conditions of one target share
 ONE image, ONE carve and ONE oracle: the condition only ever changes
 instruction.md's pre-loaded context block. So it builds and grades once, then
-proves the claim by comparing every image-bound asset across the nine
+proves the claim by comparing every image-bound asset across all of them
 byte-for-byte. If any of them drifted, the single proof would not cover the
 rest and verification fails instead of quietly over-claiming.
 
@@ -584,10 +584,18 @@ class EntrySpec:
     lang: str = 'python'
     carve_scope: str = 'function'
     floor_mode: str | None = None
+    repo_url: str | None = None
+    commit: str = ''
+    clone_kind: str = ''
 
     @property
     def repo_dirname(self) -> str:
         return self.slug.split('__')[0]
+
+    @property
+    def pinned_source(self) -> bool:
+        """True when the entry names a clone source AND the commit to take."""
+        return bool(self.repo_url) and bool(self.commit) and self.clone_kind == 'pinned'
 
 
 def load_entry(entry_dir: Path) -> EntrySpec:
@@ -600,6 +608,7 @@ def load_entry(entry_dir: Path) -> EntrySpec:
 
     meta = doc.get('metadata', {})
     env = doc.get('environment', {})
+    prov = doc.get('provenance', {})
     image = env.get('docker_image')
     if not image:
         raise VerifyError(f'{toml_path}: [environment].docker_image is missing')
@@ -657,6 +666,9 @@ def load_entry(entry_dir: Path) -> EntrySpec:
         lang=meta.get('language', 'python'),
         carve_scope=meta.get('carve_scope', 'function'),
         floor_mode=meta.get('floor_mode'),
+        repo_url=prov.get('repo_url') or None,
+        commit=str(prov.get('commit') or ''),
+        clone_kind=str(prov.get('clone_kind') or ''),
     )
 
 
@@ -818,7 +830,7 @@ def check_oracle_integrity(entry_dir, repo, runner=None) -> CheckResult:
     return CheckResult('INTEGRITY', reasons)
 
 
-# -------------------------------------------- one image covers nine entries --
+# ------------------------------------------- one image covers every entry --
 
 
 @dataclass(frozen=True)
@@ -1207,6 +1219,62 @@ def _default_repo(spec: EntrySpec) -> Path:
     )
 
 
+def _repos_cache_dir() -> Path | None:
+    """The `repos-src/` a self-clone would land in, whether or not it holds this repo."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent.joinpath(*REPOS_SRC_RELPATH)
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _self_clone(spec: EntrySpec, echo=print) -> Path:
+    """Re-materialise the pinned upstream checkout the entry was carved from.
+
+    Only reachable when the entry records a PINNED source: oracle-integrity
+    re-hashes every carved file against this tree, so cloning a moving branch
+    here would turn an upstream commit into a verify failure that looks like a
+    tampered oracle.
+    """
+    from . import clone
+
+    source = spec.repo_url
+    if not source or not spec.commit:
+        raise VerifyError(
+            f'{spec.entry_id} has no pinned source to clone from; its task.toml '
+            'records no [provenance].repo_url and commit pair'
+        )
+    cache = _repos_cache_dir()
+    if cache is None:
+        raise VerifyError(
+            f'{spec.entry_id} records a pinned source ({spec.repo_url} @ '
+            f'{spec.commit}) but no harbor-tasks/repos-src/ directory exists to '
+            'clone it into. Pass --repo explicitly.'
+        )
+    echo(f'self-clone {source} @ {spec.commit} -> {cache / spec.repo_dirname}')
+    try:
+        return clone.ensure_repo(
+            source=source,
+            commit=spec.commit,
+            cache_dir=cache,
+            name=spec.repo_dirname,
+            allow_floating=False,
+        )
+    except SystemExit as exc:
+        raise VerifyError(f'self-clone failed: {exc}') from exc
+
+
+def _resolve_repo(spec: EntrySpec, repo, echo=print) -> Path:
+    if repo:
+        return Path(repo).resolve()
+    try:
+        return _default_repo(spec)
+    except VerifyError:
+        if not spec.pinned_source:
+            raise
+    return _self_clone(spec, echo=echo)
+
+
 def verify_entry(
     entry_dir: Path,
     repo: Path | None = None,
@@ -1221,7 +1289,7 @@ def verify_entry(
     lang = lang or spec.lang
     carve_scope = carve_scope or spec.carve_scope
     floor_mode = resolve_floor_mode(lang, spec.floor_mode)
-    repo_path = Path(repo).resolve() if repo else _default_repo(spec)
+    repo_path = _resolve_repo(spec, repo, echo=echo)
     if not repo_path.is_dir():
         raise VerifyError(f'repo checkout does not exist: {repo_path}')
     runner = runner or DockerRunner(echo=echo)

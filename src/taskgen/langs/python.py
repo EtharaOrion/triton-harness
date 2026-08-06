@@ -174,7 +174,13 @@ PY'''
             'REPORT=${VERIFIER_DIR}/pytest.log',
             'SELECTED=${VERIFIER_DIR}/selected_count.txt',
             'JUNIT=${VERIFIER_DIR}/junit.xml',
-            'rm -f "${SELECTED}" "${JUNIT}"',
+            '# PLAN 8b: the JUnit report is ALSO persisted as results.xml under a',
+            '# run-time results dir. Created here, inside the container, at run time --',
+            '# never baked into the image and never an emitted asset.',
+            'RESULTS_DIR=${VERIFIER_DIR}/results',
+            'RESULTS_XML=${RESULTS_DIR}/results.xml',
+            'mkdir -p "${RESULTS_DIR}"',
+            'rm -f "${SELECTED}" "${JUNIT}" "${RESULTS_XML}"',
             '',
             B.fail_closed_preamble(expected, compiled='1.0'),
             '',
@@ -202,6 +208,7 @@ PY'''
             '',
             _SELECTED_BLOCK,
             _JUNIT_PASSED_BLOCK,
+            _RESULTS_XML_BLOCK,
             '',
             '# Python always "compiles": there is no build step that can fail, and',
             '# folding that into the test result would erase a distinction the',
@@ -326,6 +333,42 @@ _JUNIT_PASSED_BLOCK = '\n'.join([
     'PY',
     ')',
     'PASSED=${PASSED:-0}',
+])
+
+#: PLAN 8b (D8) -- persist the JUnit report as `results.xml`.
+#:
+#: PURELY ADDITIVE REPORTING. It is a copy, taken AFTER ${PASSED} has already
+#: been read off ${JUNIT}: nothing below it reads results.xml, so RED is still
+#: 0.0 and GREEN is still 1.0 on exactly the arithmetic that was proven in a
+#: container. It is written at RUN TIME under ${VERIFIER_DIR}/results (i.e.
+#: /logs/verifier/results), which is a mounted log dir, not an image layer, so
+#: image hygiene and the N-way byte-identity of the emitted test.sh are both
+#: untouched. A missing ${JUNIT} (pytest died before writing one) is not fatal:
+#: `cp` is guarded and the reward path already handled that case above.
+#:
+#: THE OTHER FIVE LANGUAGES ARE NOT IMPLEMENTED -- documented follow-up only
+#: (PLAN 8b matrix). Nothing below is faked or half-wired anywhere in this tree:
+#:
+#:   go    `go test -json` is structured but not JUnit; convert with
+#:         `gotestsum --junitfile results.xml`. Effort: small (adds a tool to
+#:         the image).
+#:   java  Maven Surefire already writes JUnit XML to
+#:         target/surefire-reports/TEST-*.xml; collect/merge them into
+#:         results.xml. Effort: trivial.
+#:   rust  `cargo test`'s output is human-oriented; `cargo nextest run
+#:         --profile ci` emits JUnit. Effort: small (adds nextest).
+#:   c     ctest `--output-junit results.xml` (CMake >= 3.21), or wrap the
+#:         custom .xs corpus runner. Effort: medium.
+#:   cpp   doctest `--reporters=junit --out=results.xml`, or the same ctest
+#:         flag. Effort: medium.
+_RESULTS_XML_BLOCK = '\n'.join([
+    '',
+    '# PLAN 8b: persist the JUnit report as results.xml. Read-only side effect --',
+    '# PASSED was already computed above, and nothing below consumes this file, so',
+    '# the reward/binary contract is byte-for-byte the one that was proven.',
+    'if [ -f "${JUNIT}" ]; then',
+    '    cp "${JUNIT}" "${RESULTS_XML}" || echo "warn: could not write ${RESULTS_XML}" >&2',
+    'fi',
 ])
 
 
