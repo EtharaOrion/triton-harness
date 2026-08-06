@@ -332,3 +332,179 @@ def test_the_lock_json_is_sorted_so_two_hosts_agree(tmp_path):
     text = M.render_lock(_lock(tmp_path))
     keys = list(json.loads(text))
     assert keys == sorted(keys)
+
+
+# ------------------------------------------- the success path is UNCHANGED ---
+
+#: Captured by running the pre-stderr-capture measure.py at f046b4f. If surfacing
+#: a diagnostic on FAILURE ever moves a byte of the SUCCESS path, this literal is
+#: what catches it: `generate` consumes the lock offline and regeneration is a
+#: `diff -r` proof.
+GOLDEN_MEASURE_JSON = '{"tests_total": 3, "graded": ["t.py::c", "t.py::a", "t.py::b"]}'
+GOLDEN_LOCK_TEXT = (
+    '{\n  "carve_set_sha256": "",\n  "expected": 3,\n  "fingerprint_sha256": {\n'
+    '    "tests/test_x.py": "' + 'ab' * 32 + '"\n  },\n  "floor_mode": "equality",\n'
+    '  "graded": [\n    "t.py::a",\n    "t.py::b",\n    "t.py::c"\n  ],\n'
+    '  "lang": "fake",\n  "provenance": {\n'
+    '    "intact_image": "harbor-x-intact:local",\n'
+    '    "intact_image_digest": "sha256:' + 'ef' * 32 + '",\n'
+    '    "repo_sha256": "' + 'cd' * 32 + '"\n  },\n  "schema": 1,\n'
+    '  "scope": "function",\n  "tool_version": "taskgen/1"\n}\n'
+)
+
+
+def test_the_lock_for_a_fixed_measure_json_is_byte_identical_to_the_golden():
+    total, graded = M.parse_measure_json(GOLDEN_MEASURE_JSON)
+    lock = M.build_lock(
+        lang='fake', scope='function', expected=total, graded=graded,
+        floor_mode='equality', fingerprint_sha256={'tests/test_x.py': 'ab' * 32},
+        repo_sha256='cd' * 32, intact_image='harbor-x-intact:local',
+        intact_image_digest='sha256:' + 'ef' * 32,
+    )
+    assert M.render_lock(lock) == GOLDEN_LOCK_TEXT
+
+
+def test_capturing_stderr_does_not_change_what_the_parser_reads():
+    """The marker splits the run output; the json half parses as it always did."""
+    run_output = (
+        f'{GOLDEN_MEASURE_JSON}\n{M.MEASURE_STDERR_MARKER}\n'
+        'cc1: error: no such file or directory\n'
+    )
+    payload, stderr = M.split_measure_output(run_output)
+    assert payload == GOLDEN_MEASURE_JSON
+    assert M.parse_measure_json(payload) == M.parse_measure_json(GOLDEN_MEASURE_JSON)
+    assert stderr.strip() == 'cc1: error: no such file or directory'
+
+
+def test_a_stderr_tail_that_looks_like_measure_json_cannot_move_the_floor():
+    """Reading the raw output would take the LAST json line -- the stderr one."""
+    run_output = (
+        f'{GOLDEN_MEASURE_JSON}\n{M.MEASURE_STDERR_MARKER}\n'
+        '{"tests_total": 1, "graded": []}\n'
+    )
+    payload, _ = M.split_measure_output(run_output)
+    assert M.parse_measure_json(payload)[0] == 3
+
+
+def test_output_without_the_marker_is_all_measure_json():
+    assert M.split_measure_output(MEASURE_OUT) == (MEASURE_OUT, '')
+
+
+def test_the_measure_run_script_captures_stderr_but_still_cats_the_json():
+    script = M.MEASURE_RUN_SCRIPT
+    assert f'cat {M.MEASURE_JSON_PATH}' in script, 'the json must come from cat, as before'
+    assert '2>&1' not in script, 'stderr must not be merged into the parsed output'
+    assert f'2>{M.MEASURE_STDERR_PATH}' in script
+    assert M.MEASURE_STDERR_MARKER in script
+    assert 'EXPECTED' not in script, 'phase 1 stays floor-FREE'
+
+
+# ------------------------------------------------------- scrubbed stderr -----
+
+
+def test_scrub_stderr_keeps_only_the_last_cap_bytes():
+    text = '\n'.join(f'line {i}' for i in range(500))
+    out = M.scrub_stderr(text, cap_bytes=64)
+    assert len(out.encode('utf-8')) <= 64
+    assert 'line 499' in out
+    assert 'line 0\n' not in out
+
+
+def test_scrub_stderr_drops_lines_naming_the_intact_tree():
+    """A compiler error quoting a carved path is a leak, not a diagnostic."""
+    text = (
+        'gcc: warning: something bland\n'
+        '/opt/harbor/repo/src/secret.c:41: error: expected declaration\n'
+        'ld: fatal: link step aborted\n'
+    )
+    out = M.scrub_stderr(text)
+    assert '/opt/harbor/repo' not in out
+    assert 'secret.c' not in out
+    assert 'ld: fatal: link step aborted' in out
+
+
+def test_scrub_stderr_drops_lines_naming_an_extra_relpath():
+    text = 'error: in src/carved/target.py\nerror: unrelated failure\n'
+    out = M.scrub_stderr(text, extra_relpaths=('src/carved/target.py',))
+    assert 'src/carved/target.py' not in out
+    assert 'error: unrelated failure' in out
+
+
+def test_scrub_stderr_prefers_signal_lines_and_dedupes_them():
+    text = (
+        'building 1/9\n'
+        'undefined reference to `mg_start\'\n'
+        'building 2/9\n'
+        'undefined reference to `mg_start\'\n'
+        'building 3/9\n'
+        'FATAL: collect2 returned 1\n'
+    )
+    out = M.scrub_stderr(text).splitlines()
+    assert out == ['undefined reference to `mg_start\'', 'FATAL: collect2 returned 1']
+
+
+def test_scrub_stderr_falls_back_to_the_capped_tail_when_nothing_signals():
+    text = 'compiling a\ncompiling b\ncompiling c\n'
+    assert M.scrub_stderr(text).splitlines() == ['compiling a', 'compiling b', 'compiling c']
+
+
+def test_scrub_stderr_is_deterministic_and_introduces_no_host_path(tmp_path):
+    text = f'error: build failed under {tmp_path}\nerror: build failed\n'
+    first = M.scrub_stderr(text, extra_relpaths=(str(tmp_path),))
+    assert first == M.scrub_stderr(text, extra_relpaths=(str(tmp_path),))
+    assert str(tmp_path) not in first
+
+
+def test_scrub_stderr_never_emits_a_half_line_from_a_truncating_cut():
+    """The cut can land mid-path; half of `/opt/harbor/repo/...` evades redaction."""
+    text = 'padding\n/opt/harbor/repo/src/secret.c:1: error: boom\n'
+    out = M.scrub_stderr(text, cap_bytes=30)
+    assert 'secret.c' not in out
+
+
+# ---------------------------------------- the failure path carries a reason --
+
+
+class FailingRunner(FakeRunner):
+    def run(self, image, script, quiet=False, mounts=()):
+        self.runs.append((image, script))
+        return (
+            f'{M.MEASURE_STDERR_MARKER}\n'
+            'building...\n'
+            '/opt/harbor/repo/src/secret.c:9: error: leaked path\n'
+            'cc1: fatal error: stdio.h: No such file or directory\n'
+        )
+
+
+def test_a_failed_measure_surfaces_the_scrubbed_stderr(tmp_path):
+    runner = FailingRunner()
+    with pytest.raises(M.MeasureError) as caught:
+        M.measure(_request(tmp_path), FakePlugin(), runner, echo=lambda *_: None)
+    assert 'stdio.h: No such file or directory' in caught.value.stderr
+    assert 'secret.c' not in caught.value.stderr
+    assert 'stdio.h' in str(caught.value), 'the message must carry it too'
+    assert runner.removed, 'the NEVER-SHIP image still goes'
+
+
+def test_a_build_failure_surfaces_its_reason_even_with_no_captured_stderr(tmp_path):
+    class BrokenBuild(FakeRunner):
+        def build_with_contexts(self, image, dockerfile, context, contexts, target=None):
+            raise RuntimeError('docker build failed (exit 1): cannot find base image')
+
+    runner = BrokenBuild()
+    with pytest.raises(M.MeasureError) as caught:
+        M.measure(_request(tmp_path), FakePlugin(), runner, echo=lambda *_: None)
+    assert 'cannot find base image' in caught.value.stderr
+    assert runner.removed
+
+
+def test_a_successful_measure_carries_no_stderr_and_the_same_lock(tmp_path):
+    """SUCCESS is untouched: same lock bytes whether or not stderr was captured."""
+    plain = FakeRunner([MEASURE_OUT])
+    with_tail = FakeRunner([
+        f'{MEASURE_OUT}\n{M.MEASURE_STDERR_MARKER}\nwarning: noisy but harmless\n'
+    ])
+    first = M.measure(_request(tmp_path), FakePlugin(), plain, echo=lambda *_: None)
+    second = M.measure(_request(tmp_path), FakePlugin(), with_tail, echo=lambda *_: None)
+    assert M.render_lock(first) == M.render_lock(second)
+    assert first['expected'] == 5

@@ -53,6 +53,8 @@ __all__ = [
     'parse_measure_json',
     'render_lock',
     'repo_tree_sha256',
+    'scrub_stderr',
+    'split_measure_output',
     'write_lock',
 ]
 
@@ -65,10 +67,33 @@ MEASURE_IMAGE_SUFFIX = '-measure:local'
 
 #: Where the floor-FREE script lands in the measure image, and what it writes.
 MEASURE_SCRIPT_PATH = '/opt/harbor/tests/measure.sh'
-MEASURE_JSON_PATH = '/logs/verifier/measure.json'
+MEASURE_LOG_DIR = '/logs/verifier'
+MEASURE_JSON_PATH = f'{MEASURE_LOG_DIR}/measure.json'
+
+#: stderr is CAPTURED, not discarded: a build or collect error is the only
+#: evidence of WHY the floor could not be measured. It is replayed AFTER a marker
+#: rather than interleaved, so the bytes the parser reads are produced exactly as
+#: before -- stdout still to /dev/null, `cat` still the sole source of the json.
+MEASURE_STDERR_PATH = f'{MEASURE_LOG_DIR}/measure.stderr'
+MEASURE_STDERR_MARKER = '---STDERR---'
+MEASURE_STDERR_TAIL_BYTES = 4096
 MEASURE_RUN_SCRIPT = (
-    f'bash {MEASURE_SCRIPT_PATH} >/dev/null 2>&1; cat {MEASURE_JSON_PATH}'
+    f'mkdir -p {MEASURE_LOG_DIR}; '
+    f'bash {MEASURE_SCRIPT_PATH} >/dev/null 2>{MEASURE_STDERR_PATH}; '
+    f'cat {MEASURE_JSON_PATH} 2>/dev/null; '
+    f"echo '{MEASURE_STDERR_MARKER}'; "
+    f'tail -c {MEASURE_STDERR_TAIL_BYTES} {MEASURE_STDERR_PATH} 2>/dev/null'
 )
+
+#: A build log is mostly progress noise; these substrings carry the reason.
+STDERR_SIGNAL_MARKERS = (
+    'error', 'fatal', 'cannot find', 'undefined reference', 'no such file',
+    'not found', 'could not', 'unresolved', 'missing',
+)
+
+#: The INTACT tree's mount point: a compiler quoting `/opt/harbor/repo/thing.c:41`
+#: names a carved path, so the whole line is dropped rather than surfaced.
+STDERR_REDACT_PATHS = ('/opt/harbor/repo',)
 
 #: Mirrors harbor `stage_context.PRUNE_DIRS` / `stage_carved.PRUNE`. `.git` is the
 #: load-bearing one: it carries the carved files' full history, so letting it
@@ -81,7 +106,16 @@ PRUNE_DIRS = frozenset({
 
 
 class MeasureError(RuntimeError):
-    """Measurement could not be carried out, or its result cannot be pinned."""
+    """Measurement could not be carried out, or its result cannot be pinned.
+
+    `stderr` carries the scrubbed, bounded tail of the failed run so a caller can
+    react to the reason. It is empty for every failure raised before a container
+    ever ran, and for every error raised by the pure helpers.
+    """
+
+    def __init__(self, *args: object, stderr: str = '') -> None:
+        super().__init__(*args)
+        self.stderr = stderr
 
 
 # --------------------------------------------------------------------------
@@ -162,6 +196,54 @@ def check_provenance(lock: Mapping, repo_sha256: str, intact_image_digest: str) 
 # --------------------------------------------------------------------------
 # the measured output
 # --------------------------------------------------------------------------
+
+
+def split_measure_output(payload: str) -> tuple[str, str]:
+    """Cut the run's output into the measure.json part and the stderr part.
+
+    Output with no marker -- an older script, a stubbed runner, a container that
+    died before the `echo` -- is ALL measure.json part, byte-identical to what
+    `parse_measure_json` was handed before capture existed.
+    """
+    lines = payload.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == MEASURE_STDERR_MARKER:
+            return '\n'.join(lines[:index]), '\n'.join(lines[index + 1:])
+    return payload, ''
+
+
+def scrub_stderr(
+    text: str,
+    *,
+    redact_paths: tuple[str, ...] = STDERR_REDACT_PATHS,
+    extra_relpaths: tuple[str, ...] = (),
+    cap_bytes: int = 2048,
+) -> str:
+    """A bounded, leak-scrubbed, deterministic view of a failed run's stderr.
+
+    Pure: no I/O, no clock, no host path introduced. The tail is taken in BYTES
+    because the cap is about what a caller can be handed, not about lines; the
+    first line of a truncated tail is dropped because a half-path would slip past
+    the redaction below.
+    """
+    encoded = text.encode('utf-8', errors='replace')
+    truncated = len(encoded) > cap_bytes
+    lines = encoded[-cap_bytes:].decode('utf-8', errors='replace').splitlines()
+    if truncated and lines:
+        lines = lines[1:]
+
+    needles = tuple(n for n in (*redact_paths, *extra_relpaths) if n)
+    kept = [ln for ln in lines
+            if ln.strip() and not any(needle in ln for needle in needles)]
+
+    signal: list[str] = []
+    seen: set[str] = set()
+    for line in kept:
+        lowered = line.lower()
+        if any(marker in lowered for marker in STDERR_SIGNAL_MARKERS) and line not in seen:
+            seen.add(line)
+            signal.append(line)
+    return '\n'.join(signal or kept)
 
 
 def parse_measure_json(payload: str) -> tuple[int, tuple[str, ...]]:
@@ -310,6 +392,23 @@ class MeasureRequest:
         return measure_image_tag(self.repo_name)
 
 
+def _measure_failed(
+    exc: BaseException, stderr_tail: str, request: MeasureRequest
+) -> MeasureError:
+    """Re-raise a failed measurement with a diagnostic a refine loop can read.
+
+    A build that never reached the run has no captured stderr, so the runner's
+    own message is scrubbed instead: it is the only evidence there is.
+    """
+    scrubbed = scrub_stderr(
+        stderr_tail or str(exc), extra_relpaths=(str(request.repo),),
+    )
+    reason = f'{type(exc).__name__}: {exc}' if not isinstance(exc, MeasureError) else str(exc)
+    if scrubbed:
+        reason = f'{reason}\nmeasure stderr (scrubbed tail):\n{scrubbed}'
+    return MeasureError(reason, stderr=scrubbed)
+
+
 def measure(request: MeasureRequest, plugin, runner, echo=print) -> dict:
     """Build the measure image, count the intact suite, emit the lock, delete the image.
 
@@ -334,6 +433,7 @@ def measure(request: MeasureRequest, plugin, runner, echo=print) -> dict:
     echo(f'repo       {request.repo} ({repo_sha[:12]})')
     echo(f'intact     {request.intact_image}')
 
+    stderr_tail = ''
     try:
         intact_digest = runner.image_digest(request.intact_image)
         runner.build_with_contexts(
@@ -342,8 +442,10 @@ def measure(request: MeasureRequest, plugin, runner, echo=print) -> dict:
             context=request.context,
             contexts={langs_base.REPO_CONTEXT: str(request.repo)},
         )
-        payload = runner.run(image, MEASURE_RUN_SCRIPT)
+        payload, stderr_tail = split_measure_output(runner.run(image, MEASURE_RUN_SCRIPT))
         expected, graded = parse_measure_json(payload)
+    except Exception as exc:
+        raise _measure_failed(exc, stderr_tail, request) from exc
     finally:
         echo(f'deleting the NEVER-SHIP measure image {image}')
         runner.remove_image(image)
