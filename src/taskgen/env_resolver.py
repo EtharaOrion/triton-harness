@@ -16,9 +16,12 @@ test PATHS. That is not a convention, it is the benchmark's integrity: a test
 body is the answer the task hides, so a body must not be expressible in this
 function's arguments at all. The signature is the enforcement.
 
-ONE SHOT. `resolve_dep_plan` asks once and raises on an invalid answer. A
-build/collect repair loop needs docker, which this module does not have; the
-`repair` slot on `build_user_prompt` is the seam that loop will use later.
+ONE SHOT. `resolve_dep_plan` asks once and raises on an invalid answer. The
+build/collect repair loop lives in `refine`, not here: repairing means building
+and building means docker, which this module deliberately cannot reach. What
+this module owns is the SHAPE of a repaired ask -- the `repair` slot threaded
+from `resolve_dep_plan` into `build_user_prompt` -- so the loop supplies the
+diagnostic and never has to compose a prompt itself.
 """
 
 from __future__ import annotations
@@ -109,15 +112,21 @@ class ResolverClient(Protocol):
 class EnvResolver(Protocol):
     """What `emit` injects when `--resolve-env` is on: repo facts in, plan out.
 
-    Deliberately NOT a `ResolverClient`. `emit` must be able to run this without
+    Deliberately NOT a `ResolverClient`.     `emit` must be able to run this without
     importing a model SDK or reading a config, so the seam it depends on is the
     ANSWER, not the thing that answers. Binding this to an actual client -- and
     with it the manifest gathering `build_user_prompt` needs -- is a later
     slice; a test binds it to a canned plan.
+
+    `repair` is the refine loop's whole channel back to the model: `None` on the
+    first ask, and on a retry the SCRUBBED diagnostic of why the previous plan
+    did not build or collect. It is passed on every call, `None` included, so an
+    implementation that cannot accept one fails on attempt 1 rather than
+    surviving to fail mid-loop with the budget already half spent.
     """
 
     def __call__(
-        self, *, lang: str, repo: Path, base_image: str,
+        self, *, lang: str, repo: Path, base_image: str, repair: str | None = None,
     ) -> DepPlan | Refuse: ...
 
 
@@ -357,12 +366,20 @@ def resolve_dep_plan(
     manifest_files: dict[str, str],
     test_paths: list[str],
     framework: str,
+    repair: str | None = None,
 ) -> DepPlan | Refuse:
     """One resolution round trip: ask the injected client, parse, validate.
 
-    No repair loop: repairing means building, building means docker, and this
-    module is offline by construction. An inadmissible answer raises here rather
-    than being silently softened into a plausible plan.
+    Still ONE round trip. `repair` does not make this a loop -- it makes this the
+    step a loop repeats: the caller that owns the build owns the retry, the cap
+    and the budget (`refine.refine_dep_plan`), because repairing means building
+    and building means docker, which this module deliberately cannot reach. What
+    arrives here is already a scrubbed diagnostic; it is forwarded verbatim into
+    the prompt's Repair section and nothing else about the ask changes, so a
+    repaired resolution differs from the first by exactly that one block.
+
+    An inadmissible answer raises here rather than being silently softened into a
+    plausible plan.
     """
     user = build_user_prompt(
         lang=lang,
@@ -370,6 +387,7 @@ def resolve_dep_plan(
         manifest_files=manifest_files,
         test_paths=test_paths,
         framework=framework,
+        repair=repair,
     )
     response = client.complete(SYSTEM_PROMPT, user, max_tokens=MAX_RESPONSE_TOKENS)
     return parse_resolution(response.text, lang)

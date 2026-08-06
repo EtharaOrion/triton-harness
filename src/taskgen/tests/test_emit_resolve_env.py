@@ -138,9 +138,12 @@ class StubResolver:
         self._answer = answer
         self.calls = 0
 
-    def __call__(self, *, lang: str, repo: Path, base_image: str):
+    def __call__(self, *, lang: str, repo: Path, base_image: str,
+                 repair: str | None = None):
         self.calls += 1
-        self.seen = {'lang': lang, 'repo': repo, 'base_image': base_image}
+        self.seen = {
+            'lang': lang, 'repo': repo, 'base_image': base_image, 'repair': repair,
+        }
         return self._answer
 
 
@@ -261,8 +264,10 @@ def test_flag_renders_the_same_dockerfile_the_default_does(plan, tmp_path):
     pin(plan, tmp_path / 'out', resolve_env=True, resolver=resolver)
 
     assert resolver.calls == 1
+    # repair=None: attempt 1 asks exactly what the pre-loop single resolve asked.
     assert resolver.seen == {
         'lang': 'c', 'repo': plan.repo, 'base_image': B.get('c').toolchain_spec().base_image,
+        'repair': None,
     }
     written = dockerfile_path(tmp_path / 'out', plan).read_text()
     assert hashlib.sha256(written.encode()).hexdigest() == DEFAULT_MEASURE_SHA256

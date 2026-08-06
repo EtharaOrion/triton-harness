@@ -50,6 +50,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import tomllib
 import uuid
 from dataclasses import dataclass
@@ -59,7 +60,7 @@ from . import _tooling_path
 
 from gen_context import FRAMING_BLOCK, assert_no_leakage  # noqa: E402
 
-from . import depplan  # noqa: E402
+from . import refine  # noqa: E402
 from . import scope as scope_mod  # noqa: E402
 from . import templates  # noqa: E402
 from .carve import CarveSet, build_carve_set  # noqa: E402
@@ -72,7 +73,7 @@ from .contexts import (  # noqa: E402
     stub_phrase,
 )
 from .depplan import DepPlan  # noqa: E402
-from .env_resolver import EnvResolver, Refuse, ResolveRefused  # noqa: E402
+from .env_resolver import EnvResolver  # noqa: E402
 from .gradedset import (  # noqa: E402
     GradedSelection,
     derive_graded_set,
@@ -1020,12 +1021,19 @@ def emit_verifier_bundle(plan: CarvePlan, entries, *, llm_config=None,
 
 
 def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
-                      base_image: str, *, echo) -> DepPlan:
-    """The injected resolver's answer, canonicalised and validated, or a raise.
+                      base_image: str, *, build_and_measure: refine.MeasureAttempt,
+                      echo, clock=time.monotonic) -> refine.RefinedEnv:
+    """The refine loop, wired to this repo. A validated, MEASURED plan, or a raise.
 
     A `Refuse` becomes a raise rather than a fallback to the hardcoded gap: the
     fallback would emit a task whose environment nobody vouched for, which is
     the silent degradation the whole disposition rule exists to forbid.
+
+    The loop itself is `refine.refine_dep_plan` and knows nothing about docker;
+    everything container-shaped arrives as `build_and_measure`, so the bound and
+    the budget stay testable offline. What this wrapper adds is the one thing
+    only emit can answer -- that a flag with no resolver behind it is a caller
+    error, not a refusal to be retried.
     """
     if resolver is None:
         raise langs_base.LangError(
@@ -1036,22 +1044,21 @@ def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
             'caller passes one in; binding the flag to a real model client is a '
             'later slice'
         )
-    resolution = resolver(lang=plan.lang, repo=plan.repo, base_image=base_image)
-    if isinstance(resolution, Refuse):
-        raise ResolveRefused(resolution.reason)
-
-    resolved = depplan.canonicalize(resolution)
-    depplan.validate(resolved)
-    echo(
-        f'resolved env: {resolved.package_manager} toolchain '
-        f'{resolved.toolchain_version} ({depplan.dep_plan_digest(resolved)[:12]})'
+    return refine.refine_dep_plan(
+        resolver=resolver,
+        lang=plan.lang,
+        repo=plan.repo,
+        base_image=base_image,
+        build_and_measure=build_and_measure,
+        echo=echo,
+        clock=clock,
     )
-    return resolved
 
 
 def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
                      resolve_env: bool = False,
-                     resolver: EnvResolver | None = None) -> CarvePlan:
+                     resolver: EnvResolver | None = None,
+                     clock=time.monotonic) -> CarvePlan:
     """Phase 1 of the two-phase build for whole-suite languages.
 
     Builds a never-ship measure image against the INTACT tree, runs the
@@ -1062,9 +1069,12 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
     byte-identical.
 
     `resolve_env=False` is every byte of that, unchanged: no resolver is called,
-    no plan is rendered and the lock grows no key. With it on, the GAP of the
-    measure Dockerfile comes from the injected resolver's `DepPlan` instead of
-    the plugin's hardcoded lines, and that plan is pinned into the lock so the
+    no plan is rendered and the lock grows no key -- the measurement is the same
+    single call it always was, now reached through `_run_measure(None)`. With it
+    on, the GAP of the measure Dockerfile comes from the injected resolver's
+    `DepPlan` instead of the plugin's hardcoded lines, that measurement may
+    happen more than once (the refine loop rebuilds a repaired plan), and only
+    the plan that finally built and collected is pinned into the lock so the
     next run reuses the environment rather than re-resolving it.
     """
     import dataclasses
@@ -1108,37 +1118,50 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
         except measure_mod.MeasureError as exc:
             echo(f're-measuring: {lock_path} unreadable ({exc})')
 
-    dep_plan = (
-        _resolve_env_plan(resolver, plan, base_image, echo=echo)
-        if resolve_env
-        else None
-    )
-    if dep_plan is not None:
-        dockerfile_text = plugin.render_measure_dockerfile(env, dep_plan=dep_plan)
-
-    measure_ctx.mkdir(parents=True, exist_ok=True)
-    dockerfile = measure_ctx / 'Dockerfile'
-    dockerfile.write_text(dockerfile_text, encoding='utf-8')
-    (measure_ctx / 'measure.sh').write_text(measure_sh_text, encoding='utf-8')
-
     tooling_context_dir = staging_dir / 'tooling'
-    request = measure_mod.MeasureRequest(
-        repo=plan.repo,
-        repo_name=plan.repo_name,
-        lang=plan.lang,
-        intact_image=base_image,
-        dockerfile=dockerfile,
-        context=measure_ctx,
-        scope=plan.scope.value,
-        floor_mode=plugin.floor_mode,
-        fingerprint_sha256={},
-        repo_url=plan.provenance.repo_url if plan.provenance else None,
-        commit=plan.provenance.commit if plan.provenance else None,
-        dep_plan=dep_plan,
-    )
-
     runner_with_tooling = _MeasureRunnerAdapter(runner, tooling_context_dir)
-    lock = measure_mod.measure(request, plugin, runner_with_tooling, echo=echo)
+
+    def _run_measure(dep_plan: DepPlan | None) -> dict:
+        """One build-and-measure of ONE candidate environment.
+
+        A closure rather than a second copy of the request assembly: the refine
+        loop calls this once per attempt and the default path calls it exactly
+        once, so both paths write the same context out of the same lines and a
+        drift between them is not expressible.
+        """
+        text = (
+            dockerfile_text if dep_plan is None
+            else plugin.render_measure_dockerfile(env, dep_plan=dep_plan)
+        )
+        measure_ctx.mkdir(parents=True, exist_ok=True)
+        dockerfile = measure_ctx / 'Dockerfile'
+        dockerfile.write_text(text, encoding='utf-8')
+        (measure_ctx / 'measure.sh').write_text(measure_sh_text, encoding='utf-8')
+
+        request = measure_mod.MeasureRequest(
+            repo=plan.repo,
+            repo_name=plan.repo_name,
+            lang=plan.lang,
+            intact_image=base_image,
+            dockerfile=dockerfile,
+            context=measure_ctx,
+            scope=plan.scope.value,
+            floor_mode=plugin.floor_mode,
+            fingerprint_sha256={},
+            repo_url=plan.provenance.repo_url if plan.provenance else None,
+            commit=plan.provenance.commit if plan.provenance else None,
+            dep_plan=dep_plan,
+        )
+        return measure_mod.measure(request, plugin, runner_with_tooling, echo=echo)
+
+    if resolve_env:
+        refined = _resolve_env_plan(
+            resolver, plan, base_image,
+            build_and_measure=_run_measure, echo=echo, clock=clock,
+        )
+        lock = refined.lock
+    else:
+        lock = _run_measure(None)
     measure_mod.write_lock(lock_path, lock)
 
     expected = int(lock['expected'])

@@ -253,6 +253,7 @@ def test_the_prompt_cannot_contain_a_test_body_because_nothing_accepts_one() -> 
         'manifest_files',
         'test_paths',
         'framework',
+        'repair',
     }
 
 
