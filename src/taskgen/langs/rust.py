@@ -42,26 +42,46 @@ composed Dockerfile against `_assert_dockerfile_invariants` in the test file.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan
+from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
+    'BAKED_CAPABILITIES',
     'EXPECTED_HARNESSES',
     'HARNESSES',
+    'INTACT_VENDOR_BLOCK',
     'INTEGRITY_HARNESS_FILES',
+    'MEASURE_NO_WARM_COMMENT',
     'MIN_WAST',
     'BASE_IMAGE',
+    'REQUIRED_BUILD_FLAGS',
+    'REQUIRED_PLAN_SLOTS',
+    'REQUIRED_TEST_INVOCATION_KEYS',
+    'RUST_MEASURE_DEP_PLAN',
     'RUST_VERSION',
     'RustPlugin',
+    'SHIMS_PATH',
     'TEST_COMMAND',
+    'TOOLCHAIN_SOURCE',
     'WABT_VERSION',
 ]
 
 RUST_VERSION = '1.87.0'
+
+#: Where the base image's mise keeps the shims that resolve the selected
+#: toolchain. The zz- profile.d file prepends exactly this, so a base that moved
+#: its shims would leave the pin asserting a rustc nothing on PATH points at.
+SHIMS_PATH = '/opt/mise/shims'
+
+#: The CDN a `rustup toolchain install` would reach, named in the comment that
+#: explains why this image does not: the toolchain is baked, so no task build
+#: pays a download it cannot repeat under `--network=none`.
+TOOLCHAIN_SOURCE = 'static.rust-lang.org'
 
 #: Per-language base carrying rustc/cargo and wasm2wat already, so no task build
 #: reaches static.rust-lang.org for a compiler the image can simply hold.
@@ -108,6 +128,180 @@ TEST_COMMAND = (
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
 _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 
+#: The measure image's dep-warm slot. rust has no warm stage at all (see
+#: `dep_warm_spec`: `cargo vendor` needs a resolvable [lib] target, so vendoring
+#: happens inside the graded image), so this comment IS the slot's content.
+MEASURE_NO_WARM_COMMENT = '# no warmed dependencies (rust vendors in the graded image)'
+
+#: The measure image's vendor step, verbatim and FIXED. It is scaffolding, not
+#: provisioning a resolver may vary: it exists because the measure image holds
+#: the INTACT tree, where the shipped image's empty-lib-stub would half-carve
+#: src/ and break every compile. It also cannot live in `render_gap`'s string --
+#: it has to run AFTER the repo COPY, since `cargo vendor` reads Cargo.toml,
+#: and the gap slot sits above that COPY.
+INTACT_VENDOR_BLOCK = '\n'.join([
+    '# Vendor against the INTACT src/. No empty-lib-stub here: overwriting',
+    '# src/lib.rs while the other 30 .rs files remain would half-carve the',
+    '# tree and every test would fail to compile. The intact src/ is the',
+    '# real one, so cargo vendor resolves and downloads normally.',
+    'RUN set -eux; \\',
+    '    CARGO_NET_OFFLINE=false cargo vendor > /tmp/vendor-config.toml; \\',
+    '    mkdir -p .cargo; \\',
+    '    cp /tmp/vendor-config.toml .cargo/config.toml; \\',
+    '    rm -f /tmp/vendor-config.toml',
+])
+
+#: What the base image already provides, as `--resolve-env` states it to a
+#: model. Sorted and version-exact, so the same prompt is built on every run.
+#: Declared, never probed: the same facts the pin assert in `render_gap` checks
+#: at build time.
+BAKED_CAPABILITIES: tuple[str, ...] = (
+    'apt-get (build time only; the graded run has no network)',
+    f'cargo {RUST_VERSION}, with CARGO_NET_OFFLINE=true already exported',
+    'mise, whose shims resolve the selected toolchain under a login shell',
+    f'rustc {RUST_VERSION} (edition 2024 capable)',
+)
+
+#: Every `build_flags` key `render_gap` interpolates. Enumerated once, read by
+#: BOTH the renderer and `RustPlugin.validate_dep_plan`, so a flag added to the
+#: rendered text without being added here is the only way the two can disagree.
+REQUIRED_BUILD_FLAGS: tuple[str, ...] = ('shims_path', 'toolchain_source')
+
+#: Every `test_invocation` key the rust measure path needs. `render_gap` does
+#: not interpolate it -- the measure script runs the graded command itself --
+#: but a plan that does not state what it was resolved FOR is a plan nobody can
+#: check against the image it produced, so it is required at the same gate.
+REQUIRED_TEST_INVOCATION_KEYS: tuple[str, ...] = ('command',)
+
+#: The same requirements as the resolver is told them, before it answers. Kept
+#: adjacent to the checks above so the ask and the rejection cannot drift apart.
+#: Leak-safe: slot names, shapes and toolchain versions only -- never a repo
+#: path, a crate name or a source body.
+REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
+    'build_flags["shims_path"] must be a non-empty string: the directory the '
+    f'base image keeps its mise shims in, e.g. "{SHIMS_PATH}". The gap writes a '
+    'zz- profile.d file prepending it to PATH, which is the ONLY reason a login '
+    'shell resolves the pinned toolchain rather than the base default',
+    'build_flags["toolchain_source"] must be a non-empty string: the CDN a '
+    f'toolchain install would otherwise reach, e.g. "{TOOLCHAIN_SOURCE}". The '
+    'gap names it in the comment explaining why this image downloads nothing',
+    'install_commands must NOT build or test the graded sources -- '
+    'test_invocation runs the suite itself, and the image vendors its crates in '
+    'a later fixed step -- so for a cargo repo this list is USUALLY EMPTY. Add a '
+    'step only to PREPARE the environment; never a bare "cargo build". A build '
+    'step that cannot succeed makes the whole plan unbuildable, not merely '
+    'suboptimal',
+    'apt_packages lists ONLY system libraries the sources need that the base '
+    'image lacks; rustc, cargo and mise are already baked in, so naming them '
+    'here buys nothing and costs a network fetch',
+    'package_manager must be cargo: the gap pins the toolchain cargo drives and '
+    'the measure image vendors its dependencies with it',
+    'test_invocation["command"] must be a non-empty list of argv tokens: the '
+    'command that runs the whole graded suite, e.g. ["cargo", "test", '
+    '"--offline"]',
+    'toolchain_version must carry at least major.minor.patch, e.g. "1.87.0": it '
+    'is the rustc version, and the build-time login-shell pin matches it '
+    'verbatim against `rustc --version`',
+)
+
+#: The one package manager rust's gap has prose for. `depplan.PACKAGE_MANAGERS`
+#: already closes rust to exactly this, so the check is a belt on a brace -- but
+#: it is the check that would fire first if that enum ever widened.
+_SUPPORTED_MANAGERS: frozenset[str] = frozenset({'cargo'})
+
+
+def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
+    """A build flag the gap's rendered text needs, or a refusal to render at all."""
+    for name, value in build_flags:
+        if name == key:
+            if isinstance(value, str) and value:
+                return value
+            break
+    raise B.LangError(
+        f'the rust gap needs build_flags[{key!r}]: it must be a non-empty '
+        'string. A plan without it would render a Dockerfile pin with a hole in '
+        'it, and a hole in a toolchain pin is how a base swap goes unnoticed'
+    )
+
+
+def _test_tokens(
+    test_invocation: tuple[tuple[str, TestValue], ...], key: str,
+) -> tuple[str, ...]:
+    """A test_invocation entry the rust measure path needs, as argv tokens."""
+    for name, value in test_invocation:
+        if name == key:
+            tokens = (value,) if isinstance(value, str) else tuple(value)
+            if tokens and all(token.strip() for token in tokens):
+                return tokens
+            break
+    raise B.LangError(
+        f'the rust plan needs test_invocation[{key!r}]: it must be a non-empty '
+        'list of argv tokens naming the command that runs the graded suite. A '
+        'plan that does not state what it was resolved to RUN cannot be checked '
+        'against the image it produced'
+    )
+
+
+def _rustc_version(toolchain_version: str) -> str:
+    """The rustc version the login-shell pin matches verbatim, or a refusal.
+
+    The pin is `case "$v" in *"<version>"*)`, so a version that is not the exact
+    string `rustc --version` prints either matches nothing -- turning every
+    build into an exit 42 -- or, for something as short as a bare major, matches
+    far too much and passes on a toolchain nobody asked for.
+    """
+    parts = toolchain_version.split('.')
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:2]):
+        raise B.LangError(
+            f'toolchain_version {toolchain_version!r} must carry at least '
+            'major.minor.patch, e.g. "1.87.0"; the rust gap matches it verbatim '
+            'against what `rustc --version` prints under a login shell, and a '
+            'looser pin either never matches or matches a toolchain nobody asked '
+            'for'
+        )
+    return toolchain_version
+
+
+def _rust_measure_dep_plan() -> DepPlan:
+    """rust's own environment as the record a resolver would have to produce.
+
+    The fixed point of the exercise: fed to `RustPlugin.render_gap`, this plan
+    reproduces the gap bytes `render_measure_dockerfile` hardcodes today.
+
+    `apt_packages` and `install_commands` are EMPTY and must stay empty. rustc,
+    cargo and mise are all BAKED into the per-language base -- that is exactly
+    why the install block SELECTS a toolchain instead of reaching
+    `static.rust-lang.org` -- and these two fields mean "what the gap INSTALLS".
+    Listing a baked component would make the gap emit an `apt-get` line today's
+    bytes do not contain, and that line would want network in the measure build.
+
+    What is NOT described here: the wabt install, the workspace prune, the
+    vendor step and the strings leak-assert. Those are fixed scaffolding (and
+    for the shipped image, the leak proof), they run BELOW the repo COPY rather
+    than in the gap slot, and they stay hardcoded.
+    """
+    plan = DepPlan(
+        lang='rust',
+        toolchain_version=RUST_VERSION,
+        package_manager='cargo',
+        manifest_files=('Cargo.lock', 'Cargo.toml'),
+        apt_packages=(),
+        install_commands=(),
+        build_flags=(
+            ('shims_path', SHIMS_PATH),
+            ('toolchain_source', TOOLCHAIN_SOURCE),
+        ),
+        test_invocation=(('command', tuple(TEST_COMMAND.split())),),
+        needs_git_metadata=False,
+    )
+    validate(plan)
+    return canonicalize(plan)
+
+
+#: rust's canonical, validated environment plan. Module-level so a test can
+#: assert the rendered gap against it without re-deriving the facts it states.
+RUST_MEASURE_DEP_PLAN: DepPlan = _rust_measure_dep_plan()
+
 
 class RustPlugin(B.LangPlugin):
     """rustc 1.87 + wabt 1.0.41, whole-suite equality floor, measured denominator."""
@@ -117,6 +311,17 @@ class RustPlugin(B.LangPlugin):
     floor_mode: ClassVar[str] = 'equality'
     parser_backed: ClassVar[bool] = False
     synthesizes_git: ClassVar[bool] = False
+
+    #: The same facts `toolchain_spec().install_block` asserts at build time,
+    #: as the capability list `--resolve-env` shows the model. apt is listed
+    #: because principle 5 allows apt and ONLY apt, and a model not told so
+    #: reaches for curl.
+    baked_capabilities: ClassVar[tuple[str, ...]] = BAKED_CAPABILITIES
+
+    #: What `render_gap` reads and `depplan.validate` cannot know about. Stated
+    #: to the model in the prompt, enforced by `validate_dep_plan` before a
+    #: build; the two read the same tuple.
+    required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     rust_version: ClassVar[str] = RUST_VERSION
     wabt_version: ClassVar[str] = WABT_VERSION
@@ -141,12 +346,12 @@ class RustPlugin(B.LangPlugin):
         """
         install = (
             f'# rustc {self.rust_version} is baked into the base; select it rather\n'
-            '# than reaching static.rust-lang.org on every task build.\n'
+            f'# than reaching {TOOLCHAIN_SOURCE} on every task build.\n'
             '# profile.d is sourced in sorted order and the base re-exports its own\n'
             '# PATH ahead of the mise shims, so only a zz- file keeps the pin in front\n'
             "# for the login shells harbor's test.sh and solve.sh run as.\n"
             'RUN set -eux; \\\n'
-            '    printf \'export PATH="/opt/mise/shims:$PATH"\\n\' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\\n'
+            f'    printf \'export PATH="{SHIMS_PATH}:$PATH"\\n\' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \\\n'
             '    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh\n'
             'RUN set -eux; \\\n'
             '    v="$(bash -lc \'rustc --version\')"; \\\n'
@@ -494,6 +699,100 @@ class RustPlugin(B.LangPlugin):
 
         return (wabt_install, '', prune, '', vendor, '', strings_assert)
 
+    def validate_dep_plan(self, plan: DepPlan) -> None:
+        """Every precondition `render_gap` has, checked before a container exists.
+
+        The same set of checks `render_gap` makes, hoisted to where they cost
+        nothing and can still be repaired: same helpers, same messages, so a
+        plan accepted here cannot then fail to render. Enumerated from the
+        renderer below -- the rustc version the pin matches, the manager whose
+        toolchain it pins, the two rendered flags and the graded command --
+        because a slot the renderer reads and this gate does not is exactly the
+        crash this exists to prevent.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        self._reject_foreign(plan)
+        _rustc_version(plan.toolchain_version)
+        for key in REQUIRED_BUILD_FLAGS:
+            _flag_str(plan.build_flags, key)
+        for key in REQUIRED_TEST_INVOCATION_KEYS:
+            _test_tokens(plan.test_invocation, key)
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """rust's toolchain bytes, rendered from a plan instead of a literal.
+
+        The SCAFFOLDING stays fixed and stays hardcoded: the zz- profile.d file
+        that keeps the mise shims ahead of the base's own PATH, the login-shell
+        pin assert's shape, the ENV/WORKDIR placement tail -- and, below the
+        repo COPY where this string cannot reach, the wabt install, the
+        workspace prune, `INTACT_VENDOR_BLOCK` and the strings leak-assert.
+        Those are how harbor resolves a baked toolchain and proves no carved
+        byte survives, not facts about this repo. What comes from the PLAN is
+        the rustc version the pin matches, the shims directory it prepends, the
+        CDN the comment says it avoids, and the apt/install lines a repo needing
+        system libraries would add.
+
+        The apt and install blocks are unreachable for `RUST_MEASURE_DEP_PLAN`
+        (both fields are empty by construction, because the base BAKES the
+        toolchain) and are rendered from the plan for the case where a resolved
+        plan does declare them. They are the only lines here that are not in
+        today's image.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        self._reject_foreign(plan)
+
+        version = _rustc_version(plan.toolchain_version)
+        shims = _flag_str(plan.build_flags, 'shims_path')
+        lines = [
+            f'# rustc {version} is baked into the base; select it rather',
+            f'# than reaching {_flag_str(plan.build_flags, "toolchain_source")} '
+            'on every task build.',
+            '# profile.d is sourced in sorted order and the base re-exports its own',
+            '# PATH ahead of the mise shims, so only a zz- file keeps the pin in front',
+            "# for the login shells harbor's test.sh and solve.sh run as.",
+            'RUN set -eux; \\',
+            f'    printf \'export PATH="{shims}:$PATH"\\n\' > '
+            '/etc/profile.d/zz-harbor-toolchain-pin.sh; \\',
+            '    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh',
+            'RUN set -eux; \\',
+            '    v="$(bash -lc \'rustc --version\')"; \\',
+            '    case "$v" in \\',
+            f'        *"{version}"*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \\',
+            f'        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want '
+            f'{version}" >&2; exit 42 ;; \\',
+            '    esac',
+        ]
+        if plan.apt_packages:
+            lines.append(
+                'RUN apt-get update && apt-get install -y --no-install-recommends '
+                + ' '.join(plan.apt_packages)
+                + ' && rm -rf /var/lib/apt/lists/*'
+            )
+        lines += [
+            ' '.join((f'RUN {command.tool}', *command.args)).rstrip()
+            for command in plan.install_commands
+        ]
+
+        toolchain = replace(
+            self.toolchain_spec(), install_block='\n'.join(lines),
+        ).render()
+        return '\n'.join([toolchain, '', MEASURE_NO_WARM_COMMENT])
+
+    def _reject_foreign(self, plan: DepPlan) -> None:
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the rust gap cannot render a {plan.lang!r} plan; a gap is the '
+                'one part of a Dockerfile that is language-specific by definition'
+            )
+        if plan.package_manager not in _SUPPORTED_MANAGERS:
+            raise B.LangError(
+                f'the rust gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_SUPPORTED_MANAGERS))}'
+            )
+
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
     ) -> str:
@@ -509,29 +808,21 @@ class RustPlugin(B.LangPlugin):
         check. On the INTACT tree the strings-assert and tripwires WOULD fire
         (they exist to catch carved bytes); the measure image is built ONLY to
         count `tests_total` and is deleted in `measure.py`'s finally block.
+
+        `dep_plan` swaps the hardcoded gap for `render_gap(dep_plan)` in the
+        SAME slot and touches nothing else -- notably NOT the wabt install, the
+        prune or `INTACT_VENDOR_BLOCK` below, which are scaffolding and which
+        run after the repo COPY the gap slot sits above. `dep_plan=None` is what
+        emit.py passes and renders the bytes it always did.
         """
-        if dep_plan is not None:
-            raise B.LangError(
-                f'the {self.name!r} measure image does not render its gap from a '
-                'DepPlan yet; only c does. Passing one here would silently '
-                'ignore it, which is worse than refusing it'
-            )
         base_image = self.toolchain_spec().base_image
-        toolchain = self.toolchain()
+        gap = (
+            '\n'.join([self.toolchain(), '', MEASURE_NO_WARM_COMMENT])
+            if dep_plan is None
+            else self.render_gap(dep_plan)
+        )
         pre = self.pre_leakgate_blocks(env)
         wabt_install, _sep1, prune, _sep2, _shipped_vendor, _sep3, _strings = pre
-
-        intact_vendor = '\n'.join([
-            '# Vendor against the INTACT src/. No empty-lib-stub here: overwriting',
-            '# src/lib.rs while the other 30 .rs files remain would half-carve the',
-            '# tree and every test would fail to compile. The intact src/ is the',
-            '# real one, so cargo vendor resolves and downloads normally.',
-            'RUN set -eux; \\',
-            '    CARGO_NET_OFFLINE=false cargo vendor > /tmp/vendor-config.toml; \\',
-            '    mkdir -p .cargo; \\',
-            '    cp /tmp/vendor-config.toml .cargo/config.toml; \\',
-            '    rm -f /tmp/vendor-config.toml',
-        ])
 
         return '\n'.join([
             '# syntax=docker/dockerfile:1.7',
@@ -544,9 +835,7 @@ class RustPlugin(B.LangPlugin):
             '',
             f'FROM {base_image} AS measure',
             '',
-            toolchain,
-            '',
-            '# no warmed dependencies (rust vendors in the graded image)',
+            gap,
             '',
             f'# The measure phase points {env.repo_context} at the INTACT repo directly,',
             f'# not a staging tree, so there is no repo/ prefix to copy from. That is',
@@ -561,7 +850,7 @@ class RustPlugin(B.LangPlugin):
             prune,
             '',
             '# --- vendor deps against the intact tree ---',
-            intact_vendor,
+            INTACT_VENDOR_BLOCK,
             '',
             '# --- measure script (COPYed, not carved-tree, so it lives in a layer) ---',
             f'COPY measure.sh /opt/harbor/tests/measure.sh',

@@ -28,12 +28,13 @@ import inspect
 
 import pytest
 
-from taskgen import langs
+from taskgen import depplan, langs
 from taskgen.depplan import DepPlan, DepPlanError, InstallCommand, canonicalize, validate
 from taskgen.langs import base as B
 from taskgen.langs import c as C
 from taskgen.langs import cpp as CPP
 from taskgen.langs import java as JAVA
+from taskgen.langs import rust as RUST
 
 #: sha256 of `CPlugin.render_measure_dockerfile(EnvSpec('c-xs'))` as rendered by
 #: the commit BEFORE `render_gap` existed, measured by re-rendering from a clean
@@ -50,6 +51,9 @@ PRE_SEAM_CPP_MEASURE_SHA256 = (
 )
 PRE_SEAM_JAVA_MEASURE_SHA256 = (
     '093eb2e5ad93ac675a0e405c5470c23087ef3b907823df713e0a127c1c1c84b7'
+)
+PRE_SEAM_RUST_MEASURE_SHA256 = (
+    'e6ca8107cdc9c5da01489502d9817376541effffd1c0c3bcb54471717266f514'
 )
 
 #: c's gap, byte-for-byte, as it appears in the shipped measure Dockerfile:
@@ -139,8 +143,33 @@ WORKDIR /opt/harbor/repo
 
 # no separate warm stage (measure warms its own cache below)'''
 
+#: rust's gap, byte-for-byte: the baked-toolchain comment, the zz- profile.d
+#: PATH pin, the login-shell `rustc --version` assert, the ENV/WORKDIR tail and
+#: the "nothing was warmed" note. It stops at that note ON PURPOSE -- the vendor
+#: step is scaffolding that runs BELOW the repo COPY, and `INTACT_VENDOR_BLOCK`
+#: is asserted separately, unchanged on both paths.
+GOLDEN_RUST_GAP = r'''# rustc 1.87.0 is baked into the base; select it rather
+# than reaching static.rust-lang.org on every task build.
+# profile.d is sourced in sorted order and the base re-exports its own
+# PATH ahead of the mise shims, so only a zz- file keeps the pin in front
+# for the login shells harbor's test.sh and solve.sh run as.
+RUN set -eux; \
+    printf 'export PATH="/opt/mise/shims:$PATH"\n' > /etc/profile.d/zz-harbor-toolchain-pin.sh; \
+    chmod 0644 /etc/profile.d/zz-harbor-toolchain-pin.sh
+RUN set -eux; \
+    v="$(bash -lc 'rustc --version')"; \
+    case "$v" in \
+        *"1.87.0"*) echo "TOOLCHAIN PIN OK (login shell): $v" ;; \
+        *) echo "TOOLCHAIN PIN FAILED (login shell): got $v want 1.87.0" >&2; exit 42 ;; \
+    esac
+ENV CARGO_TERM_COLOR=never
+ENV RUST_BACKTRACE=1
+WORKDIR /opt/harbor/repo
+
+# no warmed dependencies (rust vendors in the graded image)'''
+
 #: One row per language whose gap is now plan-rendered, so every property below
-#: is asserted for all three from a single enumeration: a fourth language added
+#: is asserted for all four from a single enumeration: a fifth language added
 #: to `render_gap` without a row here is a missing row, not a silent gap.
 #: `repo_name` is part of each row because the pre-seam digest was measured
 #: against that exact `EnvSpec`.
@@ -150,9 +179,30 @@ GAP_LANGS = (
      PRE_SEAM_CPP_MEASURE_SHA256),
     ('java', 'java-tamboui', JAVA.JAVA_MEASURE_DEP_PLAN, GOLDEN_JAVA_GAP,
      PRE_SEAM_JAVA_MEASURE_SHA256),
+    ('rust', 'rust-spacewasm', RUST.RUST_MEASURE_DEP_PLAN, GOLDEN_RUST_GAP,
+     PRE_SEAM_RUST_MEASURE_SHA256),
 )
 
-GAPLESS_LANGS = ('rust',)
+#: The languages `render_gap` still refuses. python and go are parser-backed and
+#: build no measure image at all, so they have no gap to render and inherit the
+#: base's `NotImplementedError`. Every whole-suite language is now in GAP_LANGS.
+GAPLESS_LANGS = ('python', 'go')
+
+#: A plan each row's gap must refuse. Rust is foreign to the other three; c is
+#: foreign to rust. Reading it off the row keeps the assertion exactly as strong
+#: as it was when rust WAS the universal foreigner.
+FOREIGN_PLANS = {
+    'rust': DepPlan(lang='c', toolchain_version='13.3.0', package_manager='make'),
+}
+DEFAULT_FOREIGN_PLAN = DepPlan(
+    lang='rust', toolchain_version='1.83.0', package_manager='cargo',
+)
+
+#: An allowlisted `InstallCommand.tool` per gap, for the two tests that render a
+#: plan which DOES provision. Not the package_manager: java declares `gradle`
+#: and c declares `make`, but `depplan.TOOL_ALLOWLIST` is what a command is
+#: checked against.
+INSTALL_TOOLS = {'cpp': 'cmake', 'java': 'gradle', 'rust': 'cargo'}
 
 
 @pytest.fixture()
@@ -387,7 +437,8 @@ def test_the_planned_path_is_byte_for_byte_the_default_path(
 def test_the_gap_rejects_a_plan_for_another_language(
     name, repo, plan, golden, digest,
 ):
-    foreign = DepPlan(lang='rust', toolchain_version='1.83.0', package_manager='cargo')
+    foreign = FOREIGN_PLANS.get(name, DEFAULT_FOREIGN_PLAN)
+    assert foreign.lang != name
     with pytest.raises(B.LangError, match='cannot render'):
         langs.get(name).render_gap(foreign)
 
@@ -430,11 +481,69 @@ def test_the_java_gap_reads_the_plan_rather_than_a_literal():
     assert 'temurin' not in gap and '25.' not in gap
 
 
+def test_the_rust_gap_reads_the_plan_rather_than_a_literal():
+    """Move the rustc pin and the shims and the bytes move -- both, together.
+
+    Without this the golden test above would still pass if `render_gap` ignored
+    its argument and returned a constant.
+    """
+    gap = langs.get('rust').render_gap(
+        canonicalize(
+            dataclasses.replace(
+                RUST.RUST_MEASURE_DEP_PLAN,
+                toolchain_version='1.91.2',
+                build_flags=(
+                    ('shims_path', '/usr/local/rustup/shims'),
+                    ('toolchain_source', 'mirror.internal'),
+                ),
+            )
+        )
+    )
+
+    assert gap != GOLDEN_RUST_GAP
+    assert '# rustc 1.91.2 is baked into the base' in gap
+    assert '*"1.91.2"*)' in gap and 'want 1.91.2' in gap
+    assert 'than reaching mirror.internal on every task build.' in gap
+    assert 'export PATH="/usr/local/rustup/shims:$PATH"' in gap
+    assert '1.87.0' not in gap
+    assert '/opt/mise/shims' not in gap and 'static.rust-lang.org' not in gap
+
+
+def test_the_rust_vendor_scaffolding_is_untouched_by_a_plan():
+    """The vendor step is NOT the gap: it is fixed, and it is below the COPY.
+
+    `INTACT_VENDOR_BLOCK` cannot live in `render_gap`'s string -- `cargo vendor`
+    reads Cargo.toml, so it has to run after the repo COPY, while the gap slot
+    sits above it. This pins that split: the block appears verbatim in BOTH
+    renderings, in neither gap, and after the COPY in both.
+    """
+    plug = langs.get('rust')
+    env = B.EnvSpec(repo_name='rust-spacewasm')
+    provisioning = canonicalize(
+        dataclasses.replace(
+            RUST.RUST_MEASURE_DEP_PLAN, apt_packages=('libssl-dev',),
+        )
+    )
+
+    for text in (
+        plug.render_measure_dockerfile(env),
+        plug.render_measure_dockerfile(env, dep_plan=RUST.RUST_MEASURE_DEP_PLAN),
+        plug.render_measure_dockerfile(env, dep_plan=provisioning),
+    ):
+        assert text.count(RUST.INTACT_VENDOR_BLOCK) == 1
+        assert text.index('COPY --from=repoctx') < text.index(
+            RUST.INTACT_VENDOR_BLOCK
+        )
+
+    assert RUST.INTACT_VENDOR_BLOCK not in plug.render_gap(provisioning)
+
+
 @pytest.mark.parametrize(
     'name,plan',
     (
         ('cpp', CPP.CPP_MEASURE_DEP_PLAN),
         ('java', JAVA.JAVA_MEASURE_DEP_PLAN),
+        ('rust', RUST.RUST_MEASURE_DEP_PLAN),
     ),
 )
 def test_a_declared_apt_and_install_step_still_renders(name, plan):
@@ -442,9 +551,9 @@ def test_a_declared_apt_and_install_step_still_renders(name, plan):
 
     Unreachable for the canonical plans (both fields are empty by construction),
     which is exactly why it needs its own test: these are the only lines of
-    either gap that today's shipped bytes do not exercise.
+    each gap that today's shipped bytes do not exercise.
     """
-    tool = 'cmake' if name == 'cpp' else 'gradle'
+    tool = INSTALL_TOOLS[name]
     gap = langs.get(name).render_gap(
         canonicalize(
             dataclasses.replace(
@@ -468,11 +577,12 @@ def test_a_declared_apt_and_install_step_still_renders(name, plan):
     (
         ('cpp', CPP.CPP_MEASURE_DEP_PLAN),
         ('java', JAVA.JAVA_MEASURE_DEP_PLAN),
+        ('rust', RUST.RUST_MEASURE_DEP_PLAN),
     ),
 )
 def test_the_gap_inherits_the_metacharacter_gate(name, plan):
     """The allowlist still bites: a gap renders a plan, it does not sanitise one."""
-    tool = 'cmake' if name == 'cpp' else 'gradle'
+    tool = INSTALL_TOOLS[name]
     with pytest.raises(DepPlanError, match='metacharacter'):
         langs.get(name).render_gap(
             dataclasses.replace(
@@ -501,13 +611,22 @@ def test_plugins_without_a_gap_inherit_the_refusal(name):
         langs.get(name).render_gap(C.C_MEASURE_DEP_PLAN)
 
 
-@pytest.mark.parametrize('name', GAPLESS_LANGS)
-def test_plugins_without_a_gap_refuse_a_plan_instead_of_ignoring_it(name):
-    plug = langs.get(name)
-    env = B.EnvSpec(repo_name='demo-repo')
-    assert plug.render_measure_dockerfile(env)
-    with pytest.raises(B.LangError, match='does not render its gap'):
-        plug.render_measure_dockerfile(env, dep_plan=C.C_MEASURE_DEP_PLAN)
+def test_every_language_either_renders_a_gap_or_is_listed_as_gapless():
+    """No third state. A language that is in neither table has no proof at all.
+
+    This replaces the old "refuses a plan instead of ignoring it" test, which
+    covered exactly the plugins that built a measure image and had no
+    `render_gap`. That set is now EMPTY -- every whole-suite language renders
+    its gap from a plan -- so the invariant worth pinning became exhaustiveness:
+    a seventh plugin cannot be added without landing in one table or the other.
+    """
+    covered = {name for name, *_ in GAP_LANGS} | set(GAPLESS_LANGS)
+    assert covered == set(depplan.LANGS)
+
+    for name, *_ in GAP_LANGS:
+        assert langs.get(name).render_measure_dockerfile(
+            B.EnvSpec(repo_name='demo-repo'), dep_plan=None,
+        )
 
 
 @pytest.mark.parametrize('name', ('python', 'go'))

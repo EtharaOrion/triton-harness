@@ -35,6 +35,7 @@ from taskgen.langs import base as B
 from taskgen.langs import c as C
 from taskgen.langs import cpp as CPP
 from taskgen.langs import java as JAVA
+from taskgen.langs import rust as RUST
 
 GOOD_PLAN = C.C_MEASURE_DEP_PLAN
 
@@ -146,13 +147,13 @@ def test_a_rejection_names_the_slot_and_never_a_repo_body():
 
 
 def test_the_base_hook_is_a_no_op_so_gapless_languages_are_untouched():
-    """python, go and rust still have no gap, so they still have no gate."""
-    for lang in ('python', 'go', 'rust'):
+    """python and go are parser-backed: no measure image, no gap, no gate."""
+    for lang in ('python', 'go'):
         assert B.get(lang).validate_dep_plan(GOOD_PLAN) is None
         assert B.get(lang).required_plan_slots == ()
 
 
-@pytest.mark.parametrize('lang', ('c', 'cpp', 'java'))
+@pytest.mark.parametrize('lang', ('c', 'cpp', 'java', 'rust'))
 def test_a_language_with_a_gap_gates_every_plan_including_a_foreign_one(lang: str):
     """The overriding half: a gap and a no-op gate is the crash this slice fixed."""
     assert B.get(lang).required_plan_slots != ()
@@ -161,7 +162,7 @@ def test_a_language_with_a_gap_gates_every_plan_including_a_foreign_one(lang: st
             B.get(lang).validate_dep_plan(GOOD_PLAN)
 
 
-# ------------------------------------------------ the same gate, cpp + java --
+# ----------------------------------------- the same gate, cpp + java + rust --
 
 #: One row per plan-rendered language: its plugin's canonical plan and the two
 #: enumerations its gate reads. Driven off the plugin modules so a slot added to
@@ -173,6 +174,8 @@ GATED_LANGS = (
      CPP.REQUIRED_TEST_INVOCATION_KEYS, CPP.REQUIRED_PLAN_SLOTS),
     ('java', JAVA.JAVA_MEASURE_DEP_PLAN, JAVA.REQUIRED_BUILD_FLAGS,
      JAVA.REQUIRED_TEST_INVOCATION_KEYS, JAVA.REQUIRED_PLAN_SLOTS),
+    ('rust', RUST.RUST_MEASURE_DEP_PLAN, RUST.REQUIRED_BUILD_FLAGS,
+     RUST.REQUIRED_TEST_INVOCATION_KEYS, RUST.REQUIRED_PLAN_SLOTS),
 )
 
 
@@ -284,7 +287,9 @@ def test_every_gap_rejection_names_the_slot_and_never_a_repo_body(
 
     message = str(excinfo.value)
     assert key in message
-    for secret in ('#include', 'src/runtime', 'Compiler/', 'tamboui', 'Tests/'):
+    for secret in (
+        '#include', 'src/runtime', 'Compiler/', 'tamboui', 'Tests/', 'spacewasm',
+    ):
         assert secret not in message
 
 
