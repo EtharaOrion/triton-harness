@@ -741,8 +741,11 @@ class CppPlugin(B.LangPlugin):
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
 
-    def render_gap(self, plan: DepPlan) -> str:
+    def _gap_body(self, plan: DepPlan) -> str:
         """cpp's toolchain bytes, rendered from a plan instead of a literal.
+
+        The part BOTH the measure and the shipped render take; the measure-only
+        no-warm note is `render_gap`'s (see `LangPlugin._gap_body`).
 
         Same seam as c, one size up. What stays FIXED is the plugin's own
         SCAFFOLDING -- the update-alternatives group that makes the C++26
@@ -820,12 +823,19 @@ class CppPlugin(B.LangPlugin):
         ]
 
         spec = self.toolchain_spec()
-        toolchain = replace(
+        return replace(
             spec,
             install_block='\n'.join(lines),
             env={**spec.env, 'CC': cc, 'CXX': cxx},
         ).render()
-        return '\n'.join([toolchain, '', MEASURE_NO_WARM_COMMENT])
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """The measure image's gap: the shared body plus the no-warm note.
+
+        The note is the one line the shipped image must NOT carry, because it
+        COPYs its dependencies from a warm stage two blocks later.
+        """
+        return '\n'.join([self._gap_body(plan), '', MEASURE_NO_WARM_COMMENT])
 
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,

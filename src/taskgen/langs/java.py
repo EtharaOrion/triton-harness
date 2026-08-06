@@ -893,8 +893,11 @@ class JavaPlugin(B.LangPlugin):
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
 
-    def render_gap(self, plan: DepPlan) -> str:
+    def _gap_body(self, plan: DepPlan) -> str:
         """java's toolchain bytes, rendered from a plan instead of a literal.
+
+        The part BOTH the measure and the shipped render take; the measure-only
+        no-warm note is `render_gap`'s (see `LangPlugin._gap_body`).
 
         The SCAFFOLDING stays fixed and stays hardcoded: the zz- profile.d file
         that keeps the mise shims ahead of the base's own PATH, the login-shell
@@ -968,12 +971,19 @@ class JavaPlugin(B.LangPlugin):
         ]
 
         spec = self.toolchain_spec()
-        toolchain = replace(
+        return replace(
             spec,
             install_block='\n'.join(lines),
             env={**spec.env, 'JAVA_HOME': java_home},
         ).render()
-        return '\n'.join([toolchain, '', MEASURE_NO_WARM_COMMENT])
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """The measure image's gap: the shared body plus the no-warm note.
+
+        The note is the one line the shipped image must NOT carry: java's
+        shipped render warms the gradle cache in a separate stage and COPYs it.
+        """
+        return '\n'.join([self._gap_body(plan), '', MEASURE_NO_WARM_COMMENT])
 
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,

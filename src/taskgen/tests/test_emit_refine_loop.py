@@ -562,7 +562,7 @@ def test_the_lock_pins_the_repaired_plan_and_never_the_failed_one(plan, tmp_path
     out = tmp_path / 'out'
     resolver = ScriptedResolver(GOOD_PLAN, OTHER_PLAN)
 
-    pinned = emit._measure_and_pin(
+    pinned, _pinned_env = emit._measure_and_pin(
         plan, B.get('c'), out, echo=lambda *_: None,
         resolve_env=True, resolver=resolver,
     )
@@ -593,7 +593,7 @@ def test_an_unrenderable_plan_is_repaired_before_docker_is_ever_asked(
     out = tmp_path / 'out'
     resolver = ScriptedResolver(UNRENDERABLE_PLAN, GOOD_PLAN)
 
-    pinned = emit._measure_and_pin(
+    pinned, _pinned_env = emit._measure_and_pin(
         plan, B.get('c'), out, echo=lambda *_: None,
         resolve_env=True, resolver=resolver,
     )

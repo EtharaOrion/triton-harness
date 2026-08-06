@@ -219,6 +219,12 @@ def cplugin():
 
 
 def pin(plan_obj: CarvePlan, out: Path, **kwargs) -> CarvePlan:
+    """The measured CarvePlan alone, which is what every test below reads."""
+    return pin_full(plan_obj, out, **kwargs)[0]
+
+
+def pin_full(plan_obj: CarvePlan, out: Path, **kwargs) -> tuple[CarvePlan, DepPlan | None]:
+    """`_measure_and_pin` whole: the plan AND the environment it pinned."""
     return emit._measure_and_pin(plan_obj, B.get('c'), out, echo=lambda *_: None, **kwargs)
 
 
@@ -581,3 +587,149 @@ def test_a_moved_repo_invalidates_a_pinned_environment():
     assert M.check_env_lock_key(lock, same, digest) == []
     assert M.check_env_lock_key(lock, 'moved', digest) != []
     assert M.check_env_lock_key(lock, same, 'moved') != []
+
+
+# ----------------------- the pinned plan reaching the SHIPPED Dockerfile ---
+#
+# `_measure_and_pin` decides the environment; `emit.py` renders the shipped
+# image from it. These are the tests that the second half actually happens, and
+# that the WARM half of it happens without a resolver -- which is the whole
+# reason the plan is pinned into the lock rather than re-asked for.
+
+
+#: A plan that provisions something, so "the shipped bytes used it" is visible
+#: rather than inferred. `libpq-dev` is absent from every hardcoded gap.
+PINNED_APT = ('libpq-dev',)
+PINNED_PLAN = dataclasses.replace(C.C_MEASURE_DEP_PLAN, apt_packages=PINNED_APT)
+PINNED_APT_LINE = (
+    'RUN apt-get update && apt-get install -y --no-install-recommends '
+    'libpq-dev && rm -rf /var/lib/apt/lists/*'
+)
+
+
+def shipped_bytes(dep_plan: DepPlan | None) -> str:
+    return B.get('c').render_dockerfile(
+        B.EnvSpec(repo_name='c-xs'), dep_plan=dep_plan,
+    )
+
+
+def test_the_cold_path_surfaces_the_plan_it_just_pinned(plan, tmp_path):
+    """COLD: the plan comes back read out of the lock this call wrote.
+
+    Equality with the resolver's own answer is the json round trip proved on the
+    run that produces it, rather than first on some later run that reuses it.
+    """
+    out = tmp_path / 'out'
+    resolver = StubResolver(PINNED_PLAN)
+
+    _pinned, dep_plan = pin_full(plan, out, resolve_env=True, resolver=resolver)
+
+    assert resolver.calls == 1
+    assert dep_plan == depplan.canonicalize(PINNED_PLAN)
+
+
+def test_the_warm_path_surfaces_the_pinned_plan_and_never_resolves(plan, tmp_path):
+    """WARM: the environment comes off the lock, and the resolver is never called.
+
+    This is the determinism claim in one test -- a regeneration over a warm lock
+    ships the SAME environment while staying entirely offline.
+    """
+    out = tmp_path / 'out'
+    pin_full(plan, out, resolve_env=True, resolver=StubResolver(PINNED_PLAN))
+
+    warm_resolver = StubResolver(PINNED_PLAN)
+    _reused, dep_plan = pin_full(plan, out, resolve_env=True, resolver=warm_resolver)
+
+    assert warm_resolver.calls == 0
+    assert dep_plan == depplan.canonicalize(PINNED_PLAN)
+    assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
+
+
+def test_the_warm_pinned_plan_drives_the_shipped_dockerfile(plan, tmp_path):
+    """The seam, end to end: warm lock -> plan -> different SHIPPED bytes.
+
+    The apt line is in the shipped image and is NOT in the default rendering, so
+    the environment reached the file all eleven entries build rather than only
+    the throwaway measure image.
+    """
+    out = tmp_path / 'out'
+    pin_full(plan, out, resolve_env=True, resolver=StubResolver(PINNED_PLAN))
+
+    warm_resolver = StubResolver(PINNED_PLAN)
+    _reused, dep_plan = pin_full(plan, out, resolve_env=True, resolver=warm_resolver)
+    text = shipped_bytes(dep_plan)
+
+    assert warm_resolver.calls == 0
+    assert PINNED_APT_LINE in text
+    assert PINNED_APT_LINE not in shipped_bytes(None)
+    assert 'bash /usr/local/bin/leakscan.sh' in text
+
+
+def test_a_legacy_lock_surfaces_no_plan_and_ships_the_default_bytes(plan, tmp_path):
+    """Back-compat: a lock with no `env` block leaves the shipped image alone."""
+    out = tmp_path / 'out'
+    legacy = baseline_lock(
+        repo_sha256=M.repo_tree_sha256(plan.repo), intact_image_digest=FAKE_DIGEST,
+    )
+    assert M.LOCK_ENV_BLOCK not in legacy
+    M.write_lock(lock_path(out, plan), legacy)
+
+    resolver = StubResolver(C.C_MEASURE_DEP_PLAN)
+    _reused, dep_plan = pin_full(plan, out, resolve_env=True, resolver=resolver)
+
+    assert resolver.calls == 0
+    assert dep_plan is None
+    assert shipped_bytes(dep_plan) == shipped_bytes(None)
+
+
+def test_the_default_path_surfaces_no_plan_at_all(plan, tmp_path):
+    """No `--resolve-env` means no environment to pin and no shipped byte moved."""
+    out = tmp_path / 'out'
+
+    _pinned, dep_plan = pin_full(plan, out)
+
+    assert dep_plan is None
+    assert M.LOCK_ENV_BLOCK not in M.load_lock(lock_path(out, plan))
+
+
+def test_a_tampered_pinned_plan_is_re_measured_and_never_rendered(plan, tmp_path):
+    """A hand-edited lock cannot smuggle an environment into an image.
+
+    The env-lock KEY is what catches it, before the pinned bytes are ever parsed
+    back: the plan no longer hashes to the key it was stored under, so the run
+    re-measures and the environment that reaches the shipped render is the
+    freshly resolved one rather than the edited one.
+    """
+    out = tmp_path / 'out'
+    pin_full(plan, out, resolve_env=True, resolver=StubResolver(PINNED_PLAN))
+
+    tampered = M.load_lock(lock_path(out, plan))
+    tampered[M.LOCK_ENV_BLOCK]['dep_plan'] = depplan.to_canonical_json(
+        dataclasses.replace(PINNED_PLAN, apt_packages=('libpq-dev', 'evil-dev')),
+    )
+    M.write_lock(lock_path(out, plan), tampered)
+
+    resolver = StubResolver(PINNED_PLAN)
+    _reused, dep_plan = pin_full(plan, out, resolve_env=True, resolver=resolver)
+
+    assert resolver.calls == 1, 'a tampered lock must be re-resolved, not trusted'
+    assert dep_plan == depplan.canonicalize(PINNED_PLAN)
+    assert 'evil-dev' not in shipped_bytes(dep_plan)
+
+
+def test_a_lock_pinning_a_refusal_is_refused_rather_than_rendered():
+    """The unit guard: a REFUSAL is not an environment and cannot become bytes.
+
+    Unreachable through the lock-key check above, which is the point -- this is
+    the second bar, asserted directly on the reader so it cannot rot unnoticed.
+    """
+    lock = {M.LOCK_ENV_BLOCK: {'dep_plan': json.dumps(
+        {'disposition': 'REFUSE', 'reason': 'no toolchain for this repo'},
+    )}}
+
+    with pytest.raises(B.LangError, match='REFUSAL'):
+        emit._pinned_dep_plan(lock, 'c')
+
+
+def test_a_lock_with_no_env_block_reads_as_no_plan():
+    assert emit._pinned_dep_plan(baseline_lock(), 'c') is None

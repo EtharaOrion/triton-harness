@@ -53,6 +53,7 @@ import tempfile
 import time
 import tomllib
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,7 +74,7 @@ from .contexts import (  # noqa: E402
     stub_phrase,
 )
 from .depplan import DepPlan  # noqa: E402
-from .env_resolver import EnvResolver  # noqa: E402
+from .env_resolver import EnvResolver, Refuse, parse_resolution  # noqa: E402
 from .gradedset import (  # noqa: E402
     GradedSelection,
     derive_graded_set,
@@ -745,7 +746,8 @@ def _render_test_sh(plugin, plan: CarvePlan, graded_spec) -> str:
 
 
 def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
-                 plan: CarvePlan, plugin, graded_spec) -> Entry:
+                 plan: CarvePlan, plugin, graded_spec,
+                 dep_plan: DepPlan | None = None) -> Entry:
     repo_name = inp.repo_name
     carve = inp.carve
     relpath = carve.primary_relpath
@@ -801,7 +803,8 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
         _write(path / f'solution/carved/{rel}', text)
 
     env = langs_base.EnvSpec(repo_name=repo_name)
-    _write(path / 'environment/Dockerfile', plugin.render_dockerfile(env))
+    _write(path / 'environment/Dockerfile',
+           plugin.render_dockerfile(env, dep_plan=dep_plan))
     _write(path / 'environment/Dockerfile.dockerignore', templates.DOCKERIGNORE)
     _write(path / 'environment/contexts.json', json.dumps({
         'image': image,
@@ -860,8 +863,11 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
         provenance=make_provenance(repo_url, commit, clone_kind),
     )
 
+    # None for a parser-backed language by construction: it runs no measure
+    # phase, so there is no lock to pin an environment in and nothing to thread.
+    dep_plan: DepPlan | None = None
     if not plugin.parser_backed:
-        plan = _measure_and_pin(
+        plan, dep_plan = _measure_and_pin(
             plan, plugin, out, echo=echo,
             resolve_env=resolve_env, resolver=resolver,
         )
@@ -881,7 +887,7 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
     graded_spec = _graded_spec(plan, plugin)
     out.mkdir(parents=True, exist_ok=True)
     entries = [
-        _write_entry(inp, ct, out, meta, plan, plugin, graded_spec)
+        _write_entry(inp, ct, out, meta, plan, plugin, graded_spec, dep_plan)
         for ct in context_types
     ]
     if verifier:
@@ -1067,10 +1073,43 @@ def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
     )
 
 
+def _pinned_dep_plan(lock: Mapping[str, object], lang: str) -> DepPlan | None:
+    """The `DepPlan` a lock pins, or None for a lock that pins none.
+
+    The lock stores the plan as the exact canonical json its `env_lock_key` was
+    taken over, so this is where those bytes become a record again. It is read
+    back through `env_resolver.parse_resolution` rather than through a
+    purpose-built reader: that function already turns this exact field set into
+    a `DepPlan`, and `depplan.env_lock_key_from_canonical_json` warns in so many
+    words that a second deserializer is a second definition of what a plan is.
+    One definition means a lock cannot validate against a plan nobody rendered.
+    It also re-runs `validate` and `canonicalize`, so a hand-edited lock is
+    refused here rather than rendered into an image.
+
+    A lock with no `env` block returns None -- a lock written before this key
+    existed, or by any `--resolve-env`-free run, which is still every default
+    run. None is what keeps the shipped Dockerfile on its hardcoded bytes, so
+    back-compat is the same code path as the default rather than a special case.
+    """
+    from . import measure as measure_mod
+
+    canonical = measure_mod.dep_plan_from_lock(lock)
+    if not canonical:
+        return None
+    parsed = parse_resolution(canonical, lang)
+    if isinstance(parsed, Refuse):
+        raise langs_base.LangError(
+            f'the pinned environment in the measure lock reads as a REFUSAL '
+            f'({parsed.reason}); a refusal is not an environment and must never '
+            'have been pinned. Delete the lock and re-measure'
+        )
+    return parsed
+
+
 def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
                      resolve_env: bool = False,
                      resolver: EnvResolver | None = None,
-                     clock=time.monotonic) -> CarvePlan:
+                     clock=time.monotonic) -> tuple[CarvePlan, DepPlan | None]:
     """Phase 1 of the two-phase build for whole-suite languages.
 
     Builds a never-ship measure image against the INTACT tree, runs the
@@ -1079,6 +1118,20 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
     denominator. Reuses `graded.lock.json` from a prior run when the tree hash
     and base-image digest still match, so a second `generate` is fast and
     byte-identical.
+
+    Returns that plan AND the pinned `DepPlan`, because the environment is the
+    other half of what phase 1 decides and the SHIPPED Dockerfile has to be
+    rendered from it. Both paths read it from the LOCK, never from the resolver:
+
+      * COLD -- the plan that just built and collected, read back out of the
+        lock this call wrote, so the json round trip is exercised on the run
+        that produces it rather than first on some later run that reuses it.
+      * WARM -- the lock a previous run wrote, and nothing else. No resolver is
+        constructed, no model is contacted; regenerating over a warm lock stays
+        offline and byte-identical, which is the entire point of pinning.
+
+    None on both paths for a lock with no `env` block, which is every lock a
+    default (`--resolve-env`-free) run has ever written.
 
     `resolve_env=False` is every byte of that, unchanged: no resolver is called,
     no plan is rendered and the lock grows no key -- the measurement is the same
@@ -1124,7 +1177,12 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
                 new_graded = dataclasses.replace(
                     plan.graded, _expected=int(existing['expected']),
                 )
-                return dataclasses.replace(plan, graded=new_graded)
+                # Off the LOCK, never the resolver: this is what keeps a warm
+                # regeneration model-free even for a --resolve-env-written lock.
+                return (
+                    dataclasses.replace(plan, graded=new_graded),
+                    _pinned_dep_plan(existing, plan.lang),
+                )
             if reasons:
                 echo(f're-measuring: {"; ".join(reasons)}')
         except measure_mod.MeasureError as exc:
@@ -1186,7 +1244,10 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
     echo(f'measured intact denominator: expected={expected}')
 
     new_graded = dataclasses.replace(plan.graded, _expected=expected)
-    return dataclasses.replace(plan, graded=new_graded)
+    return (
+        dataclasses.replace(plan, graded=new_graded),
+        _pinned_dep_plan(lock, plan.lang),
+    )
 
 
 class _MeasureRunnerAdapter:

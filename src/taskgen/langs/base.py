@@ -643,6 +643,36 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
             'byte-identical to those bytes) before threading a plan through'
         )
 
+    def _gap_body(self, plan: DepPlan) -> str:
+        """The gap MINUS whatever only the measure image may say.
+
+        `render_gap` was written for the measure Dockerfile and its last line
+        proves it: every implementation ends with a "no warmed dependencies"
+        note, which is true of the measure image (it has no warm stage) and
+        FALSE of the shipped one (which COPYs from a warm stage two blocks
+        later). Substituting `render_gap` wholesale into the shipped render
+        would therefore have shipped a comment contradicting the very next
+        instruction.
+
+        So the two renders share this -- the toolchain scaffolding with the
+        plan's apt and install lines folded into its install block -- and each
+        adds its own tail. `render_gap` is then this plus the measure-only note,
+        which is what keeps `tests/test_render_gap.py`'s goldens byte-identical
+        while the shipped image gets the provisioning without the prose.
+
+        Same contract as `render_gap`: instructions out, no trailing newline.
+        The default raises for the same reason that one does -- a plugin with no
+        gap must say so, because rendering nothing here would put an image with
+        no toolchain in it on the ship path.
+        """
+        raise NotImplementedError(
+            f'the {self.name!r} plugin does not render its gap from a DepPlan, '
+            'so a resolved plan cannot drive its SHIPPED image; its toolchain '
+            'bytes come from toolchain() and a dep_plan must be None. Implement '
+            '_gap_body (and render_gap on top of it) before threading a plan '
+            'through render_dockerfile'
+        )
+
     def render_measure_dockerfile(
         self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
     ) -> str:
@@ -675,8 +705,35 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
             '(parser_backed languages derive the denominator without one)'
         )
 
-    def render_dockerfile(self, env: EnvSpec) -> str:
-        """The shipped image: the staged carved tree, and nothing that describes it."""
+    def render_dockerfile(self, env: EnvSpec, *, dep_plan: DepPlan | None = None) -> str:
+        """The shipped image: the staged carved tree, and nothing that describes it.
+
+        `dep_plan` is the resolved, PINNED environment reaching the image all
+        eleven entries actually build. It is keyword-only and defaults to None,
+        and None renders the exact bytes this method rendered before the
+        parameter existed -- pinned per language in
+        `tests/test_render_dockerfile_golden.py`, because the shipped Dockerfile
+        is what `verify` runs RED/GREEN and the layer archaeology against, and a
+        byte that moves here republishes every task image.
+
+        A plan substitutes ONE block: the toolchain slot below. Everything that
+        makes the image safe to ship is fixed scaffolding a resolver may not
+        reach -- the warm stage and the COPY (never `FROM`) that keeps its
+        layers out, the carved-tree COPY, `pre_leakgate_blocks`, the leak gate
+        itself, the carve-receipt and oracle-absence asserts, and the invariant
+        assert that re-reads the finished text. The plan is validated through
+        the plugin's own pre-render gate FIRST, so a plan missing a slot this
+        language interpolates fails as a message a resolver can repair instead
+        of as a Dockerfile that builds into a wrong image.
+
+        Parser-backed languages never get a plan: they have no `render_gap`, so
+        `_gap_body` refuses, and `emit.py` passes None for them by construction.
+        """
+        if dep_plan is None:
+            gap = self.toolchain()
+        else:
+            self.validate_dep_plan(dep_plan)
+            gap = self._gap_body(dep_plan)
         blocks = [
             '# syntax=docker/dockerfile:1.7',
             f'# Harbor task image -- {env.repo_name} ({self.name})',
@@ -690,7 +747,7 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
             ) or None,
             f'FROM {self.toolchain_spec().base_image} AS {env.stage}',
             '',
-            self.toolchain(),
+            gap,
             '',
             '# Dependencies arrive by COPY from a SEPARATE warm image. `FROM warm` would',
             '# inherit every layer that build happened to touch (invariant 7).',

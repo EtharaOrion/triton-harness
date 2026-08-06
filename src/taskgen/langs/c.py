@@ -630,14 +630,18 @@ class CPlugin(B.LangPlugin):
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
 
-    def render_gap(self, plan: DepPlan) -> str:
+    def _gap_body(self, plan: DepPlan) -> str:
         """c's toolchain + dependency bytes, rendered from a plan instead of a literal.
 
         c is the smallest possible gap and that is exactly why it is the one to
         prove the seam on: harbor-base already ships gcc and GNU Make, and the
         repo links only against libc, so NOTHING is installed and the whole gap
-        is a version echo, a pin assert and a "nothing was warmed" comment. If
-        the seam cannot reproduce those bytes it cannot reproduce anyone's.
+        is a version echo and a pin assert. If the seam cannot reproduce those
+        bytes it cannot reproduce anyone's.
+
+        This is the part BOTH renders take. The measure-only "nothing was
+        warmed" note is `render_gap`'s, because the shipped image does warm
+        dependencies -- see `LangPlugin._gap_body`.
 
         The apt and install blocks below are unreachable for
         `C_MEASURE_DEP_PLAN` (both fields are empty by construction) and are
@@ -690,11 +694,23 @@ class CPlugin(B.LangPlugin):
             for command in plan.install_commands
         ]
 
-        toolchain = replace(
+        return replace(
             self.toolchain_spec(), install_block='\n'.join(lines),
         ).render()
+
+    def render_gap(self, plan: DepPlan) -> str:
+        """The measure image's gap: the shared body plus the no-warm note.
+
+        The note is the one line the shipped image must NOT carry -- it COPYs
+        from a warm stage -- so it lives here rather than in `_gap_body`. The
+        manager is re-read off the canonical plan for the same reason the body
+        interpolates it: a plan that moved the manager and left this comment
+        naming the old one would describe an image it did not build.
+        """
+        body = self._gap_body(plan)
+        manager = canonicalize(plan).package_manager
         return '\n'.join([
-            toolchain,
+            body,
             '',
             f'# no warmed dependencies (harbor-base ships gcc + {manager} + libc6-dev)',
         ])
