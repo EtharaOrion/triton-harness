@@ -108,7 +108,7 @@ VERIFIER_SUBDIR = 'solution/verifier'
 #: whitelist rather than a `hasattr(plugin, 'render_gap')` probe because every
 #: plugin HAS the method -- `langs.base` defines it to raise -- so a probe would
 #: green-light a language whose only implementation is the refusal.
-RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c', 'cpp', 'java'})
+RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c', 'cpp', 'java', 'rust'})
 
 
 def assert_resolve_env_supported(lang: str) -> None:

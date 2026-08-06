@@ -103,7 +103,7 @@ def test_an_unsupported_language_refuses_before_any_client_is_built(repo, tmp_pa
             'generate', '--repo', str(repo), '--out', str(tmp_path / 'out'),
             '--lang', 'python', '--resolve-env', '--llm-config', str(llm_config),
         ])
-    assert 'only supported for c, cpp, java' in str(exc.value)
+    assert 'only supported for c, cpp, java, rust' in str(exc.value)
     assert spy_emit == {}
 
 

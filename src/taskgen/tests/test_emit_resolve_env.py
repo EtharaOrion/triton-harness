@@ -397,17 +397,26 @@ def test_a_refusal_raises_and_emits_neither_task_nor_lock(plan, tmp_path):
     assert FakeRunner.instances[-1].runs == []
 
 
-def test_the_flag_refuses_a_language_with_no_rendered_gap(plan, tmp_path):
-    rust_plan = dataclasses.replace(plan, lang='rust')
-    with pytest.raises(B.LangError, match='only supported for c, cpp, java'):
+def test_the_measure_phase_itself_refuses_a_language_with_no_rendered_gap(plan, tmp_path):
+    """The guard is in `_measure_and_pin` too, not only at the top of `emit_all`.
+
+    Every whole-suite language now renders its own gap, so the languages left
+    outside the whitelist are the parser-backed ones -- which is why this drives
+    `_measure_and_pin` DIRECTLY with go: reached through `emit_all`, go would be
+    refused a phase earlier and this in-phase guard would never be exercised.
+    `langs.base.render_gap` still raises for go, so the refusal is the honest
+    answer and not an artefact of the call site.
+    """
+    go_plan = dataclasses.replace(plan, lang='go')
+    with pytest.raises(B.LangError, match='only supported for c, cpp, java, rust'):
         emit._measure_and_pin(
-            rust_plan, B.get('rust'), tmp_path / 'out', echo=lambda *_: None,
+            go_plan, B.get('go'), tmp_path / 'out', echo=lambda *_: None,
             resolve_env=True, resolver=StubResolver(C.C_MEASURE_DEP_PLAN),
         )
 
 
 def test_the_flag_refuses_a_parser_backed_language_before_it_carves(repo, tmp_path):
-    with pytest.raises(B.LangError, match='only supported for c, cpp, java'):
+    with pytest.raises(B.LangError, match='only supported for c, cpp, java, rust'):
         emit.emit_all(repo=repo, out=tmp_path / 'out', lang='python', resolve_env=True)
 
 
