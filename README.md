@@ -4,41 +4,56 @@ This is the Official Repository for the repository level code generation benchma
 ## Structure
 ```
 .
-├── data
-│   ├── all_context_project_dict.json  # context information in project
-│   ├── context_info.json # context information in file, 
-│   ├── go_data_final.xlsx # data for Go
-│   ├── java_data_final.xlsx # data for Java
-│   └── py_data_final.xlsx # data for Python
-├── repo # repository data
-│   ├── go_data.7z
-│   ├── java_data.7z
-│   └── py_data.7z
-├── result 
-│   ├── cache_result # result of each model with different context in our experiment
-│   │   ├── callee
-│   │   ├── infile
-│   │   ├── llms
-│   │   ├── long_context
-│   │   └── rag
-│   ├── llms 
+├── data                                 # MRGBench dataset (518 entries: Python, Java, Go)
+│   ├── all_context_project_dict.json    # project-level context
+│   ├── context_info.json                # in-file context
+│   ├── go_data_final.xlsx               # data for Go
+│   ├── java_data_final.xlsx             # data for Java
+│   └── py_data_final.xlsx               # data for Python
+├── repo                                 # source repositories
+│   ├── go_data.7z                       # MRGBench Go repos (compressed)
+│   ├── java_data.7z                     # MRGBench Java repos (compressed)
+│   ├── py_data.7z                       # MRGBench Python repos (compressed)
+│   ├── python-a2a-python/               # trimmed sample repo (taskgen test fixture)
+│   ├── go-multigres/                    # trimmed sample repo (taskgen test fixture)
+│   └── vendor/                          # pinned toolchain assets (wabt tarball)
+├── result                               # MRGBench experiment results
+│   ├── cache_result                     # per-model results across contexts
+│   ├── llms
 │   └── rag
-└── src
-    ├── eval  # code for evaluation and test 
-    │   ├── AIClient.py
-    │   ├── config.json
-    │   ├── eval_llm.py
-    │   ├── eval_rag.py
-    │   ├── naive_rag.py
-    │   ├── parse_run_log.py
-    │   ├── repocoder.py
-    │   └── run_test.py
-    ├── parser  # code for parse repository into dataset
-    │   ├── base_parser.py
-    │   ├── csharp_parser.py
-    │   ├── go_parser.py
-    │   ├── java_parser.py
-    │   └── py_parser.py
+├── proxy                                # Anthropic-compatible LLM bridge (for --verifier)
+│   ├── claude_code_bridge/
+│   ├── claude_code_bridge.sh
+│   └── README.md
+├── .llm_config                          # verifier LLM client config
+│   └── example.json                     # committed template (real config git-ignored)
+├── fig                                  # README images
+├── src
+│   ├── eval                             # MRGBench evaluation / RAG harness
+│   ├── parser                           # repository -> dataset parsers (call graph)
+│   ├── taskgen                          # deterministic harbor task generator
+│   │   ├── cli.py                       # generate / verify entry point
+│   │   ├── clone.py                     # repo clone (URL + pinned commit)
+│   │   ├── select.py                    # target selection (eligibility)
+│   │   ├── carve.py                     # carve the target body -> stub + oracle
+│   │   ├── contexts.py                  # the eleven context conditions
+│   │   ├── emit.py                      # write the harbor task entries
+│   │   ├── measure.py                   # whole-suite graded-set measurement
+│   │   ├── verify.py                    # six-gate verify (docker)
+│   │   ├── langs/                       # per-language plugins (python/go/rust/c/cpp/java)
+│   │   └── tests/                       # self-contained pytest suite
+│   ├── verifier                         # per-task verifier bundle generator (opt-in --verifier)
+│   │   ├── bundle.py                    # drive generators + soundness loop
+│   │   ├── inputs.py                    # build TruthInputs from carve artifacts
+│   │   ├── exec_env.py                  # run generated tests vs golden / stub trees
+│   │   ├── llm_config.py                # .llm_config loader + client factory
+│   │   └── generators/                  # TRUTH / rubric / pytest / predicates / coverage
+│   └── harbor_tooling                   # vendored harbor retrieval + staging tooling
+├── LICENSE                              # MIT
+├── pyproject.toml                       # taskgen uv project (harbor pinned from PyPI)
+├── uv.lock
+├── requirement.txt                      # separate MRGBench GPU stack (untouched)
+└── README.md
 ```
 
 ## Usage
