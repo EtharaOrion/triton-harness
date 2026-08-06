@@ -125,6 +125,17 @@ cpus = 4
 memory_mb = 8192
 storage_mb = 16384
 gpus = 0
+{provenance}'''
+
+
+PROVENANCE_BLOCK = '''
+# Where the carved checkout came from. `.git` is deliberately absent from the
+# shipped tree and from the measure digest, so the pin has to live here or the
+# task cannot be regenerated from the artifact alone.
+[provenance]
+repo_url = "{repo_url}"
+commit = "{commit}"
+clone_kind = "{clone_kind}"
 '''
 
 
@@ -141,5 +152,35 @@ Dockerfile.dockerignore
 '''
 
 
-def render_task_toml(**kw) -> str:
-    return TASK_TOML.format(**kw)
+def _toml_basic_string(value: str) -> str:
+    """Escape a value for a TOML basic string, refusing what cannot be escaped.
+
+    A URL is user input landing in a machine-parsed artifact: an unescaped quote
+    would produce a task.toml that `verify` cannot read back.
+    """
+    text = str(value)
+    if any(ch in text for ch in '\n\r\t\x00'):
+        raise SystemExit(
+            f'refusing to record {text!r} in task.toml: it contains a control '
+            'character, so the emitted TOML would not parse back'
+        )
+    return text.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def render_provenance(provenance) -> str:
+    """The `[provenance]` block, or '' when the carve came from a plain checkout.
+
+    Empty is load-bearing: a task generated from `--repo` must stay byte-identical
+    to what taskgen emitted before clone support existed.
+    """
+    if provenance is None:
+        return ''
+    return PROVENANCE_BLOCK.format(
+        repo_url=_toml_basic_string(provenance.repo_url),
+        commit=_toml_basic_string(provenance.commit),
+        clone_kind=_toml_basic_string(provenance.clone_kind),
+    )
+
+
+def render_task_toml(provenance: str = '', **kw) -> str:
+    return TASK_TOML.format(provenance=provenance, **kw)

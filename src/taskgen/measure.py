@@ -223,9 +223,22 @@ def build_lock(
     intact_image_digest: str,
     carve_set_sha256: str = '',
     tool_version: str = TOOL_VERSION,
+    repo_url: str | None = None,
+    commit: str | None = None,
 ) -> dict:
     if floor_mode not in langs_base.FLOOR_MODES:
         raise MeasureError(f'unknown floor_mode {floor_mode!r}')
+    provenance = {
+        'intact_image': intact_image,
+        'intact_image_digest': intact_image_digest,
+        'repo_sha256': repo_sha256,
+    }
+    # A lock from a plain checkout carries these keys nowhere: the lock is a
+    # regeneration proof compared byte for byte, and `check_provenance` reads
+    # neither key, so their absence invalidates nothing.
+    if repo_url is not None:
+        provenance['repo_url'] = str(repo_url)
+        provenance['commit'] = str(commit or '')
     return {
         'carve_set_sha256': carve_set_sha256,
         'expected': int(expected),
@@ -233,11 +246,7 @@ def build_lock(
         'floor_mode': floor_mode,
         'graded': list(graded),
         'lang': lang,
-        'provenance': {
-            'intact_image': intact_image,
-            'intact_image_digest': intact_image_digest,
-            'repo_sha256': repo_sha256,
-        },
+        'provenance': provenance,
         'schema': LOCK_SCHEMA,
         'scope': scope,
         'tool_version': tool_version,
@@ -293,6 +302,8 @@ class MeasureRequest:
     fingerprint_sha256: Mapping[str, str] = field(default_factory=dict)
     carve_set_sha256: str = ''
     tool_version: str = TOOL_VERSION
+    repo_url: str | None = None
+    commit: str | None = None
 
     @property
     def image(self) -> str:
@@ -350,4 +361,6 @@ def measure(request: MeasureRequest, plugin, runner, echo=print) -> dict:
         intact_image_digest=intact_digest,
         carve_set_sha256=request.carve_set_sha256,
         tool_version=request.tool_version,
+        repo_url=request.repo_url,
+        commit=request.commit,
     )
