@@ -107,19 +107,21 @@ _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 
 
 def wabt_tarball_path() -> Path:
-    """Locate the vendored wabt tarball under `harbor-tasks/shared/vendor/`.
-
-    Mirrors `verify.harbor_tooling_dir()`: walks up from this file's location
-    to find the harbor-tasks tree rather than baking a host path.
+    """Locate the vendored wabt tarball: the in-repo `repo/vendor/` copy first,
+    then the external `harbor-tasks/shared/vendor/`. Walks up from this file's
+    location rather than baking a host path.
     """
     here = Path(__file__).resolve()
     for parent in here.parents:
-        candidate = parent / 'harbor-tasks' / 'shared' / 'vendor' / WABT_TARBALL
-        if candidate.is_file():
-            return candidate
+        for candidate in (
+            parent / 'repo' / 'vendor' / WABT_TARBALL,
+            parent / 'harbor-tasks' / 'shared' / 'vendor' / WABT_TARBALL,
+        ):
+            if candidate.is_file():
+                return candidate
     raise B.LangError(
         f'wabt tarball {WABT_TARBALL} not found under any ancestor of {here}; '
-        'expected under harbor-tasks/shared/vendor/'
+        'expected under repo/vendor/ or harbor-tasks/shared/vendor/'
     )
 
 
