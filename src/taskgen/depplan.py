@@ -40,6 +40,7 @@ __all__ = [
     'APT_TOOL',
     'DepPlan',
     'DepPlanError',
+    'HarnessValue',
     'InstallCommand',
     'LANGS',
     'PACKAGE_MANAGERS',
@@ -100,6 +101,11 @@ _APT_PIN = re.compile(r'=+')
 FlagValue = str | int | bool
 TestValue = tuple[str, ...] | str
 
+#: The SAME closed shapes as `build_flags` and `test_invocation`, so one
+#: metacharacter gate covers all three and a harness slot can never smuggle a
+#: shell fragment the other two could not.
+HarnessValue = str | int | bool | tuple[str, ...]
+
 
 class DepPlanError(RuntimeError):
     """A plan that must not be rendered, pinned or shipped."""
@@ -126,11 +132,18 @@ class InstallCommand:
 class DepPlan:
     """A resolved, per-language build/test environment, as data.
 
-    `build_flags` and `test_invocation` are mappings by nature, but a dict is
-    neither hashable nor ordered-by-content, and this record is both a cache key
-    and a frozen value. They are therefore carried as key-sorted tuples of
-    pairs, which `canonicalize` establishes and `to_canonical_json` renders back
-    out as JSON objects.
+    `build_flags`, `test_invocation` and `harness` are mappings by nature, but a
+    dict is neither hashable nor ordered-by-content, and this record is both a
+    cache key and a frozen value. They are therefore carried as key-sorted
+    tuples of pairs, which `canonicalize` establishes and `to_canonical_json`
+    renders back out as JSON objects.
+
+    `test_invocation` says what one command runs the whole suite; `harness` is
+    the sibling section that says how a language plugin BUILDS that suite,
+    DISCOVERS its individual graded units and DECIDES each one pass or fail. The
+    two are separate because only the second is what a verifier script has to be
+    rendered from, and a plugin that reads it must enforce its own slots in
+    `validate_dep_plan` -- this module closes the shapes, not the semantics.
     """
 
     lang: str
@@ -142,6 +155,7 @@ class DepPlan:
     install_commands: tuple[InstallCommand, ...] = ()
     build_flags: tuple[tuple[str, FlagValue], ...] = ()
     test_invocation: tuple[tuple[str, TestValue], ...] = ()
+    harness: tuple[tuple[str, HarnessValue], ...] = ()
     needs_git_metadata: bool = False
 
 
@@ -242,6 +256,22 @@ def validate(plan: DepPlan) -> None:
             _require_nonempty(token, f'a token of test_invocation {key!r}')
             _reject_metacharacters(token, f'a token of test_invocation {key!r}')
 
+    _require_unique_keys(plan.harness, 'harness')
+    for key, value in plan.harness:
+        _require_nonempty(key, 'a harness key')
+        _reject_metacharacters(key, 'a harness key')
+        if isinstance(value, (bool, int)):
+            continue
+        if isinstance(value, str):
+            # Asymmetry on purpose: an empty SCALAR is a real answer ("this
+            # repo has no such thing") for an optional slot, while an empty
+            # token in a LIST is a hole in a command line.
+            _reject_metacharacters(value, f'harness {key!r}')
+            continue
+        for token in value:
+            _require_nonempty(token, f'a token of harness {key!r}')
+            _reject_metacharacters(token, f'a token of harness {key!r}')
+
 
 # --------------------------------------------------------------------------
 # canonicalisation
@@ -258,6 +288,20 @@ def _canonical_flag_value(value: FlagValue) -> FlagValue:
 
 
 def _canonical_test_value(value: TestValue) -> TestValue:
+    if isinstance(value, str):
+        return value.strip()
+    return tuple(token.strip() for token in value)
+
+
+def _canonical_harness_value(value: HarnessValue) -> HarnessValue:
+    """Whitespace off every token; ORDER left alone -- it is semantic here.
+
+    A harness tuple is argv, an ordered corpus list or a unit-name list read
+    positionally against its siblings. Sorting one would silently re-pair the
+    parallel slots and grade a different suite under the same digest.
+    """
+    if isinstance(value, (bool, int)):
+        return value
     if isinstance(value, str):
         return value.strip()
     return tuple(token.strip() for token in value)
@@ -294,6 +338,12 @@ def canonicalize(plan: DepPlan) -> DepPlan:
                 key=lambda pair: pair[0],
             )
         ),
+        harness=tuple(
+            sorted(
+                ((k.strip(), _canonical_harness_value(v)) for k, v in plan.harness),
+                key=lambda pair: pair[0],
+            )
+        ),
     )
 
 
@@ -308,6 +358,10 @@ def to_canonical_json(plan: DepPlan) -> str:
     payload = {
         'apt_packages': list(canonical.apt_packages),
         'build_flags': {k: v for k, v in canonical.build_flags},
+        'harness': {
+            k: (v if isinstance(v, (bool, int, str)) else list(v))
+            for k, v in canonical.harness
+        },
         'install_commands': [
             {'args': list(command.args), 'tool': command.tool}
             for command in canonical.install_commands

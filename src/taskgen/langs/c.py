@@ -30,24 +30,37 @@ which mangled symbols could survive.
 
 from __future__ import annotations
 
-from dataclasses import replace
+import re
+from dataclasses import dataclass, replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
+from ..depplan import (
+    DepPlan,
+    FlagValue,
+    HarnessValue,
+    TestValue,
+    canonicalize,
+    validate,
+)
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
     'BAKED_CAPABILITIES',
+    'CORPUS_KINDS',
     'CPlugin',
     'C_MEASURE_DEP_PLAN',
+    'C_XS_HARNESS',
+    'CorpusSpec',
     'GRADER_FINGERPRINT_GLOBS',
+    'Harness',
     'MEASURE_NO_WARM_COMMENT',
     'REQUIRED_BUILD_FLAGS',
     'REQUIRED_PLAN_SLOTS',
     'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
     'UNIT_NAMES',
+    'read_harness',
 ]
 
 #: The 13 unit harness names from the Makefile / reference test.sh.
@@ -60,6 +73,36 @@ UNIT_NAMES: tuple[str, ...] = (
 #: tests/run-all.sh sweeps tests/*.xs, which includes test_http_client.xs --
 #: that opens real outbound HTTP connections and would break --network=none.
 TEST_COMMAND = 'make test-conformance test-regression test-unit'
+
+#: The two ways a graded unit can be decided, and the only two `read_harness`
+#: accepts. `runner`: one runner binary is applied to each file a corpus glob
+#: matches, and its exit status is the verdict. `binary`: each unit IS an
+#: executable the build produces, and running it is the verdict.
+CORPUS_KINDS: tuple[str, ...] = ('binary', 'runner')
+
+#: c-xs's own harness as a `DepPlan.harness` section -- the fixed point of the
+#: refactor: rendered, it reproduces the scripts this plugin used to hardcode
+#: byte for byte. Every value is a fact about the c-xs REPOSITORY, which is
+#: exactly why none of it belongs in the plugin.
+C_XS_HARNESS: tuple[tuple[str, HarnessValue], ...] = (
+    ('binary_env_var', 'XS'),
+    ('binary_names', UNIT_NAMES),
+    ('binary_suffix', '_test'),
+    ('build_artifacts', ('xs',)),
+    ('build_command', ('make',)),
+    ('build_parallel', True),
+    ('clean_command', ('make', 'clean')),
+    ('corpus_dirs', ('tests/conformance', 'tests/regression', 'tests/unit')),
+    ('corpus_kinds', ('runner', 'runner', 'binary')),
+    ('corpus_names', ('conformance', 'regression', 'unit')),
+    ('corpus_patterns', ('*.xs', '*.xs', '*_test.c')),
+    ('corpus_vars', ('CONF', 'REG', 'UNIT')),
+    ('exclude_names', ('test_http_client',)),
+    ('runner_argv', ('./xs',)),
+    ('stale_paths', ('build/obj',)),
+    ('vendored_dirs', ('src/tls',)),
+    ('vendored_labels', ('BearSSL',)),
+)
 
 #: What the plugin locks against tampering: every file under tests/ and the
 #: top-level Makefile. The Makefile is oracle because it enumerates the 58
@@ -109,6 +152,7 @@ def _c_measure_dep_plan() -> DepPlan:
             ('make_version', '4.3'),
         ),
         test_invocation=(('command', tuple(TEST_COMMAND.split())),),
+        harness=C_XS_HARNESS,
         needs_git_metadata=False,
     )
     validate(plan)
@@ -158,6 +202,53 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'command that runs the whole graded suite, e.g. ["make", "test"]',
     'toolchain_version must carry at least major.minor, e.g. "13.3.0": the gcc '
     'pin asserted at build time is derived from its first two components',
+    'harness is REQUIRED for c and describes THIS repository\'s own test '
+    'harness; it is what the graded verifier script is rendered from. State it '
+    'from the build manifests and the TEST FILE PATHS you were given, and from '
+    'nothing else. Build keys: harness["build_command"] is the argv that builds '
+    'the repo from clean (parallelism is added by the renderer, so never spell '
+    '-j yourself); harness["build_parallel"] is true when that build is safe '
+    'under -j; harness["clean_command"] is the argv that wipes previous output; '
+    'harness["build_artifacts"] lists the repo-relative files the build MUST '
+    'produce, and may be [] when it produces no single named binary; '
+    'harness["stale_paths"] lists build-output directories that must be gone '
+    'once the clean step has run',
+    'harness["corpus_names"], ["corpus_vars"], ["corpus_kinds"], '
+    '["corpus_dirs"] and ["corpus_patterns"] are five PARALLEL lists of the '
+    'SAME length, one entry each per graded corpus, read positionally. '
+    'corpus_names are lowercase identifiers (they become reward.json keys and '
+    'log filenames); corpus_vars are UPPERCASE shell prefixes; corpus_dirs are '
+    'repo-relative directories; corpus_patterns are basename globs; '
+    'corpus_kinds is "runner" (ONE runner binary is applied to each file the '
+    'glob matches and its exit status is the verdict) or "binary" (each unit '
+    'IS its own executable that the build produces from its own source file, '
+    'and running it is the verdict). At MOST ONE corpus may be "binary", and '
+    'all "runner" corpora must share a single corpus_pattern',
+    'ENUMERATE EVERY CORPUS. This is the single most consequential thing you '
+    'do here: the corpora you declare ARE the denominator the benchmark scores '
+    'against, so a corpus you leave out is not graded, is never missed, and '
+    'silently shrinks the task. Before answering, walk the TEST FILE PATHS list '
+    'you were given and account for EVERY entry -- each path must either be '
+    'matched by exactly one corpus\'s dir + pattern, or be a helper that is not '
+    'itself a runnable unit (a shared header, a stub, a fixture, a data file), '
+    'or be named in exclude_names. In particular: a directory of per-test C '
+    'SOURCE files, each with its own main(), which the build compiles into one '
+    'executable per file, IS a graded corpus of kind "binary" -- do not skip it '
+    'because its members are sources rather than data. Likewise, if the build '
+    'file exposes several test targets, they are usually several corpora, and '
+    'an aggregate target that chains them is still several corpora here',
+    'harness["runner_argv"] is required whenever a corpus is "runner": the '
+    'argv each matched file is passed to as a final argument. '
+    'harness["binary_suffix"], ["binary_names"] and ["binary_env_var"] are '
+    'required whenever a corpus is "binary": what the executable\'s name adds '
+    'to the unit name (a unit "parse" whose program is built as "parse_check" '
+    'has suffix "_check"), then EVERY unit name in that corpus in the order '
+    'the repository declares them, then the environment variable that must '
+    'point at the first build artifact while a unit runs, or "" if none does',
+    'harness["exclude_names"] lists basename stems that must NEVER be graded '
+    'because they need the network, an external service or a browser -- the '
+    'graded run has no network at all, so one of these caught by a corpus glob '
+    'turns a sound floor into a flaky one. Empty is fine and is the common case',
 )
 
 
@@ -210,6 +301,328 @@ def _major_minor(toolchain_version: str) -> str:
     return pin
 
 
+@dataclass(frozen=True)
+class CorpusSpec:
+    """One graded corpus: where its units live and how each one is decided."""
+
+    name: str
+    var: str
+    kind: str
+    directory: str
+    pattern: str
+
+    @property
+    def noun(self) -> str:
+        return 'harnesses' if self.kind == 'binary' else 'programs'
+
+
+@dataclass(frozen=True)
+class Harness:
+    """A c test harness as data: build it, discover its units, decide each one.
+
+    Everything the two rendered scripts used to hardcode about the c-xs REPO,
+    read off `DepPlan.harness`. `read_harness` is the only constructor, so a
+    slot that is missing, mistyped or inconsistent with its siblings becomes a
+    `LangError` before any container exists rather than a shell script that
+    greps an empty directory and reports a floor of zero.
+    """
+
+    build_command: tuple[str, ...]
+    build_parallel: bool
+    clean_command: tuple[str, ...]
+    build_artifacts: tuple[str, ...]
+    stale_paths: tuple[str, ...]
+    vendored: tuple[tuple[str, str], ...]
+    corpora: tuple[CorpusSpec, ...]
+    runner_argv: tuple[str, ...]
+    binary_suffix: str
+    binary_names: tuple[str, ...]
+    binary_env_var: str
+    exclude_names: tuple[str, ...]
+
+    @property
+    def runner_corpora(self) -> tuple[CorpusSpec, ...]:
+        return tuple(c for c in self.corpora if c.kind == 'runner')
+
+    @property
+    def binary_corpus(self) -> CorpusSpec | None:
+        for corpus in self.corpora:
+            if corpus.kind == 'binary':
+                return corpus
+        return None
+
+    @property
+    def runner(self) -> str:
+        return ' '.join(self.runner_argv)
+
+    @property
+    def artifact_paths(self) -> tuple[str, ...]:
+        return tuple(f'./{a}' for a in self.build_artifacts)
+
+    @property
+    def build_argv(self) -> str:
+        parallel = ' -j"$(nproc)"' if self.build_parallel else ''
+        return ' '.join(self.build_command) + parallel
+
+    @property
+    def unit_build_argv(self) -> str:
+        """The unit-harness build: `-k` so one link failure does not hide twelve."""
+        tool, *rest = self.build_command
+        parallel = [' -j"$(nproc)"'] if self.build_parallel else []
+        return ' '.join([tool, *rest, '-k']) + ''.join(parallel)
+
+    def counts(self, corpus_counts: Mapping[str, int]) -> tuple[tuple[CorpusSpec, int], ...]:
+        missing = [c.name for c in self.corpora if c.name not in corpus_counts]
+        if missing:
+            raise B.LangError(
+                f'no host-side count for corpus {", ".join(missing)}; emit '
+                '._c_grader_metadata must glob every corpus the plan declares'
+            )
+        return tuple((c, int(corpus_counts[c.name])) for c in self.corpora)
+
+
+_VAR_RE = re.compile(r'^[A-Z][A-Z0-9_]*$')
+_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+
+_ENGLISH: tuple[str, ...] = (
+    'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
+    'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen',
+    'sixteen', 'seventeen', 'eighteen', 'nineteen', 'twenty',
+)
+
+
+def _english(n: int) -> str:
+    return _ENGLISH[n] if 0 <= n < len(_ENGLISH) else str(n)
+
+
+def _slot_error(key: str, want: str) -> B.LangError:
+    return B.LangError(
+        f'the c harness needs harness[{key!r}]: {want}. Without it the rendered '
+        'verifier would either grade nothing or grade a suite nobody described, '
+        'and a denominator nobody described is not a floor'
+    )
+
+
+def _tuple_slot(values: Mapping[str, HarnessValue], key: str,
+                want: str, *, required: bool = False) -> tuple[str, ...]:
+    raw = values.get(key)
+    if raw is None:
+        if required:
+            raise _slot_error(key, want)
+        return ()
+    if isinstance(raw, (bool, int)):
+        raise _slot_error(key, f'{want} (a list of strings, not a scalar)')
+    tokens = (raw,) if isinstance(raw, str) else tuple(raw)
+    if required and not tokens:
+        raise _slot_error(key, want)
+    return tokens
+
+
+def _str_slot(values: Mapping[str, HarnessValue], key: str,
+              want: str, *, required: bool = False) -> str:
+    raw = values.get(key)
+    if raw is None or raw == '':
+        if required:
+            raise _slot_error(key, want)
+        return ''
+    if not isinstance(raw, str):
+        raise _slot_error(key, f'{want} (a single string)')
+    return raw
+
+
+def _bool_slot(values: Mapping[str, HarnessValue], key: str) -> bool:
+    raw = values.get(key)
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise _slot_error(key, 'it must be true or false')
+    return raw
+
+
+def _corpora(values: Mapping[str, HarnessValue]) -> tuple[CorpusSpec, ...]:
+    names = _tuple_slot(
+        values, 'corpus_names',
+        'the ordered list of graded corpora, one entry per test directory or '
+        'filename pattern the suite is split across',
+        required=True,
+    )
+    parallel = {
+        'corpus_vars': (
+            'one UPPERCASE shell-variable prefix per corpus, same order and '
+            'same length as corpus_names'
+        ),
+        'corpus_kinds': (
+            f'one of {", ".join(CORPUS_KINDS)} per corpus, same order as '
+            'corpus_names: "runner" if a runner binary is applied to each file '
+            'the corpus glob matches, "binary" if each unit is itself an '
+            'executable the build produces'
+        ),
+        'corpus_dirs': (
+            'the repo-relative directory holding each corpus, same order as '
+            'corpus_names'
+        ),
+        'corpus_patterns': (
+            'the filename glob that selects each corpus\'s units inside its '
+            'directory, same order as corpus_names'
+        ),
+    }
+    columns = {
+        key: _tuple_slot(values, key, want, required=True)
+        for key, want in parallel.items()
+    }
+    for key, column in columns.items():
+        if len(column) != len(names):
+            raise B.LangError(
+                f'harness[{key!r}] has {len(column)} entries but corpus_names '
+                f'has {len(names)}; the corpus slots are read POSITIONALLY, so '
+                'a short column silently re-pairs every corpus after it with '
+                "someone else's directory"
+            )
+    for name in names:
+        if not _NAME_RE.match(name):
+            raise B.LangError(
+                f'corpus name {name!r} must be lowercase letters, digits and '
+                'underscores: it is spelled into reward.json keys, into a log '
+                'filename and into a grep pattern'
+            )
+    for var in columns['corpus_vars']:
+        if not _VAR_RE.match(var):
+            raise B.LangError(
+                f'corpus var {var!r} must be an UPPERCASE shell identifier; it '
+                'becomes EXPECT_<var>, <var>_PASS and <var>_RAN in the verifier'
+            )
+    for kind in columns['corpus_kinds']:
+        if kind not in CORPUS_KINDS:
+            raise B.LangError(
+                f'corpus kind {kind!r} is not one of {", ".join(CORPUS_KINDS)}; '
+                'the verifier has exactly two ways to decide a unit and cannot '
+                'invent a third'
+            )
+    for label, column in (('name', names), ('var', columns['corpus_vars'])):
+        if len(set(column)) != len(column):
+            raise B.LangError(
+                f'two corpora share a {label}; each corpus owns its own '
+                'counters and its own log, so a duplicate would have one '
+                'corpus overwrite the other and shrink the denominator'
+            )
+    corpora = tuple(
+        CorpusSpec(
+            name=name,
+            var=columns['corpus_vars'][i],
+            kind=columns['corpus_kinds'][i],
+            directory=columns['corpus_dirs'][i],
+            pattern=columns['corpus_patterns'][i],
+        )
+        for i, name in enumerate(names)
+    )
+    if len([c for c in corpora if c.kind == 'binary']) > 1:
+        raise B.LangError(
+            'more than one corpus declares kind "binary", but the harness has a '
+            'single binary_suffix and a single binary_names list; split them or '
+            'describe them as one corpus'
+        )
+    patterns = {c.pattern for c in corpora if c.kind == 'runner'}
+    if len(patterns) > 1:
+        raise B.LangError(
+            f'the runner corpora declare {len(patterns)} different '
+            f'corpus_patterns ({", ".join(sorted(patterns))}), but they share '
+            'one sweep function in the rendered verifier; give them one common '
+            'glob or describe the odd one out as its own binary corpus'
+        )
+    return corpora
+
+
+def read_harness(plan: DepPlan) -> Harness:
+    """`plan.harness` as the record the two renderers read, or a `LangError`.
+
+    Every check here is reachable from the refine loop, so every message names
+    the slot and says what a correct value looks like: a resolver that gets one
+    wrong must be able to repair it without being shown the repository.
+    """
+    values = {key: value for key, value in canonicalize(plan).harness}
+    corpora = _corpora(values)
+
+    vendored_dirs = _tuple_slot(
+        values, 'vendored_dirs',
+        'the repo-relative directories holding vendored dependencies that are '
+        'NOT part of the carve and must stay intact',
+    )
+    vendored_labels = _tuple_slot(
+        values, 'vendored_labels',
+        'one human name per vendored_dirs entry, naming the dependency',
+    )
+    if len(vendored_labels) != len(vendored_dirs):
+        raise B.LangError(
+            f'harness["vendored_labels"] has {len(vendored_labels)} entries but '
+            f'vendored_dirs has {len(vendored_dirs)}; they are read as parallel '
+            'columns and the label names the dependency the guard protects'
+        )
+
+    harness = Harness(
+        build_command=_tuple_slot(
+            values, 'build_command',
+            'the argv that builds the repo from clean. Parallelism is added by '
+            'the renderer, so do not spell -j here',
+            required=True,
+        ),
+        build_parallel=_bool_slot(values, 'build_parallel'),
+        clean_command=_tuple_slot(
+            values, 'clean_command',
+            'the argv that wipes previous build output',
+        ),
+        build_artifacts=_tuple_slot(
+            values, 'build_artifacts',
+            'the repo-relative files the build must produce. Empty is allowed '
+            'for a repo whose build produces no single named binary',
+        ),
+        stale_paths=_tuple_slot(
+            values, 'stale_paths',
+            'the build-output directories that must be gone after the clean step',
+        ),
+        vendored=tuple(zip(vendored_dirs, vendored_labels)),
+        corpora=corpora,
+        runner_argv=_tuple_slot(
+            values, 'runner_argv',
+            'the argv of the binary each "runner" corpus unit is passed to',
+            required=any(c.kind == 'runner' for c in corpora),
+        ),
+        binary_suffix=_str_slot(
+            values, 'binary_suffix',
+            'what a "binary" corpus unit\'s executable name adds to its unit '
+            'name: a unit "parse" built as "parse_check" has suffix "_check"',
+            required=any(c.kind == 'binary' for c in corpora),
+        ),
+        binary_names=_tuple_slot(
+            values, 'binary_names',
+            'every unit name in the "binary" corpus, in the order the repo '
+            'declares them',
+            required=any(c.kind == 'binary' for c in corpora),
+        ),
+        binary_env_var=_str_slot(
+            values, 'binary_env_var',
+            'the environment variable a "binary" corpus unit needs pointing at '
+            'the first build artifact',
+        ),
+        exclude_names=_tuple_slot(
+            values, 'exclude_names',
+            'basename stems that must NEVER appear in a graded corpus: a test '
+            'needing the network, an external service or a browser',
+        ),
+    )
+    if harness.binary_env_var and not harness.build_artifacts:
+        raise B.LangError(
+            f'harness["binary_env_var"] is {harness.binary_env_var!r} but '
+            'build_artifacts is empty; the variable is set to the first build '
+            'artifact, and there is none to point it at'
+        )
+    if harness.binary_env_var and not _VAR_RE.match(harness.binary_env_var):
+        raise B.LangError(
+            f'harness["binary_env_var"] {harness.binary_env_var!r} must be an '
+            'UPPERCASE shell identifier; it is exported to each unit binary'
+        )
+    return harness
+
+
 class CPlugin(B.LangPlugin):
     """gcc + GNU Make from harbor-base, whole-suite equality floor, measured denominator."""
 
@@ -235,7 +648,6 @@ class CPlugin(B.LangPlugin):
     required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
-    unit_names: ClassVar[tuple[str, ...]] = UNIT_NAMES
 
     # --- axis 1 -----------------------------------------------------------
 
@@ -276,71 +688,136 @@ class CPlugin(B.LangPlugin):
 
     # --- axes 3-6 ---------------------------------------------------------
 
+    def _harness(self, dep_plan: DepPlan | None) -> tuple[DepPlan, Harness]:
+        """The plan the harness comes from, and the harness itself.
+
+        `dep_plan=None` is the pre-resolution path (`--no-resolve-env`, and
+        every caller written before the harness was plan-driven). It falls back
+        to c-xs's own canonical plan, which is exactly the environment those
+        callers were hardcoded against -- so the fallback is not a guess, it is
+        the same bytes under a name.
+        """
+        plan = canonicalize(C_MEASURE_DEP_PLAN if dep_plan is None else dep_plan)
+        return plan, read_harness(plan)
+
+    def _oracle_phrase(self) -> str:
+        """`tests/**`, `Makefile` as the fingerprint comment names them in prose."""
+        phrases = []
+        for glob in self.grader_fingerprint_globs:
+            trimmed = glob.removesuffix('/**').removesuffix('**')
+            phrases.append(f'{trimmed}/ tree' if trimmed != glob else glob)
+        return ' and the '.join(phrases)
+
     def render_test_sh(
         self,
         graded: GradedSet,
         *,
         expected: int | None = None,
         fingerprint: Mapping[str, str] | None = None,
-        tls_count: int | None = None,
         corpus_counts: Mapping[str, int] | None = None,
+        vendored_counts: Mapping[str, int] | None = None,
+        carve_root: str | None = None,
+        dep_plan: DepPlan | None = None,
     ) -> str:
         expected = graded.expected if expected is None else int(expected)
         fingerprint = graded.fingerprint_sha256 if fingerprint is None else fingerprint
 
-        if tls_count is None or corpus_counts is None:
+        if corpus_counts is None or vendored_counts is None:
             raise B.LangError(
-                'c plugin needs tls_count and corpus_counts threaded from the '
-                'intact tree at generate time; emit._render_test_sh supplies them '
-                '(no magic numbers in the plugin source)'
+                'c plugin needs corpus_counts and vendored_counts threaded from '
+                'the intact tree at generate time; emit._render_test_sh supplies '
+                'them (no magic numbers in the plugin source)'
             )
-        expect_conf = int(corpus_counts['conformance'])
-        expect_reg = int(corpus_counts['regression'])
-        expect_unit = int(corpus_counts['unit'])
-        if expect_conf + expect_reg + expect_unit != expected:
+        plan, harness = self._harness(dep_plan)
+        counted = harness.counts(corpus_counts)
+        total = sum(n for _, n in counted)
+        if total != expected:
             raise B.LangError(
-                f'c plugin sub-counts do not sum to expected: '
-                f'{expect_conf}+{expect_reg}+{expect_unit} != {expected}'
+                'c plugin sub-counts do not sum to expected: '
+                f'{"+".join(str(n) for _, n in counted)} != {expected}'
             )
-        if len(self.unit_names) != expect_unit:
+        if total < 1:
             raise B.LangError(
-                f'unit_names has {len(self.unit_names)} entries but the intact '
-                f'tests/unit/ has {expect_unit} *_test.c files -- the plugin\'s '
-                'harness list drifted from the repo'
+                'the resolved harness discovers 0 graded units against the '
+                'intact tree, so the denominator would be zero and every '
+                'solution would score 0.0. Widen corpus_dirs/corpus_patterns to '
+                "the repo's real test layout, or refuse the repo outright"
             )
-        tls = int(tls_count)
-        unit_names_str = ' '.join(self.unit_names)
+        corpora = harness.corpora
+        runners = harness.runner_corpora
+        binary = harness.binary_corpus
+        counts = {c.name: n for c, n in counted}
+        if binary is not None and len(harness.binary_names) != counts[binary.name]:
+            raise B.LangError(
+                f'harness["binary_names"] has {len(harness.binary_names)} entries '
+                f'but the intact {binary.directory}/ holds {counts[binary.name]} '
+                f'{binary.pattern} files -- the plan\'s harness list drifted from '
+                'the repo'
+            )
 
-        return '\n'.join([
-            '#!/usr/bin/env bash',
-            f'# Harbor verifier -- c ({expected} = {expect_conf} conformance + '
-            f'{expect_reg} regression + {expect_unit} unit, equality floor).',
-            '#',
-            '# EQUALITY floor. Each ./xs invocation and each unit _test binary is',
+        artifacts = harness.artifact_paths
+        artifact_str = ' '.join(artifacts) or 'the build'
+        clean_str = ' '.join(harness.clean_command)
+        tool = harness.build_command[0]
+        manager = plan.package_manager
+        suffix = harness.binary_suffix
+        carved = carve_root or 'the carved sources'
+
+        subjects = [
+            *([f'Each {harness.runner} invocation'] if runners else []),
+            *([f'each {binary.name} {suffix} binary'] if binary is not None else []),
+        ]
+        note = ' and '.join(subjects)
+        blocks: list[list[str]] = [[
+            f'# EQUALITY floor. {note[:1].upper()}{note[1:]} is',
             '# its own process, so a crash in one cannot abort the others (unlike',
             '# Go, spike G1). observed==EXPECTED is a real assertion.',
-            '#',
-            '# The Makefile\'s test-conformance/test-regression recipes are for-loops',
-            '# that `exit 1` on the FIRST failing program -- useless for a fraction.',
-            '# This script therefore runs each program with the recipe\'s own command',
-            '# and records per-program exit status. That is a faithful replication,',
-            '# not a re-definition: the Makefile is inside the fingerprint lock, so',
-            '# the recipes cannot drift out from under it.',
-            '#',
+        ]]
+        if runners:
+            command = _test_tokens(plan.test_invocation, 'command')
+            oracle = (plan.manifest_files or (tool,))[0]
+            recipes = '/'.join(
+                next((t for t in command[1:] if t.endswith(c.name)), c.name)
+                for c in runners
+            )
+            blocks.append([
+                f"# The {oracle}'s {recipes} recipes are for-loops",
+                '# that `exit 1` on the FIRST failing program -- useless for a fraction.',
+                "# This script therefore runs each program with the recipe's own command",
+                '# and records per-program exit status. That is a faithful replication,',
+                f'# not a re-definition: the {oracle} is inside the fingerprint lock, so',
+                '# the recipes cannot drift out from under it.',
+            ])
+        blocks.append([
             "# Harbor ignores this script's exit code; /logs/verifier/reward.json is",
             '# the single source of truth and is written on EVERY path.',
+        ])
+
+        lines: list[str] = [
+            '#!/usr/bin/env bash',
+            f'# Harbor verifier -- c ({expected} = '
+            + ' + '.join(f'{n} {c.name}' for c, n in counted)
+            + ', equality floor).',
+        ]
+        for block in blocks:
+            lines.append('#')
+            lines += block
+        lines += [
             '',
             'set -uo pipefail',
             '',
             f'REPO=${{REPO:-{B.WORKDIR}}}',
             B.reward_emitter_block(_LOGS_DEFAULT),
             'BUILD_LOG="${VERIFIER_DIR}/build.log"',
-            'UNIT_BUILD_LOG="${VERIFIER_DIR}/unit-build.log"',
-            'CONF_LOG="${VERIFIER_DIR}/conformance.log"',
-            'REG_LOG="${VERIFIER_DIR}/regression.log"',
-            'UNIT_LOG="${VERIFIER_DIR}/unit.log"',
+        ]
+        if binary is not None:
+            lines.append(
+                f'{binary.var}_BUILD_LOG="${{VERIFIER_DIR}}/{binary.name}-build.log"'
+            )
+        lines += [f'{c.var}_LOG="${{VERIFIER_DIR}}/{c.name}.log"' for c in corpora]
+        lines += [
             '',
-            '# COMPILED is set to 1.0 only after ./xs actually relinks in THIS run.',
+            f'# COMPILED is set to 1.0 only after {artifact_str} actually relinks in THIS run.',
             '# Kept as a shell variable so the fail-closed helper quotes the current',
             '# value on every early exit -- a build that failed halfway must not be',
             '# reported as compiled=1 by an earlier optimistic setting.',
@@ -350,143 +827,261 @@ class CPlugin(B.LangPlugin):
             '',
             'cd "${REPO}" || fail "no ${REPO}"',
             '',
-            f'EXPECT_CONF={expect_conf}',
-            f'EXPECT_REG={expect_reg}',
-            f'EXPECT_UNIT={expect_unit}',
+            *[f'EXPECT_{c.var}={n}' for c, n in counted],
             f'EXPECT_TOTAL={expected}',
-            f'UNIT_NAMES="{unit_names_str}"',
+        ]
+        if binary is not None:
+            lines.append(f'{binary.var}_NAMES="{" ".join(harness.binary_names)}"')
+        lines += [
             '',
-            'echo "VERIFIER: $(gcc --version | head -1) / $(make --version | head -1) / $(uname -m)"',
+            f'echo "VERIFIER: $(gcc --version | head -1) / '
+            f'$({manager} --version | head -1) / $(uname -m)"',
             '',
             '# --- integrity guards -----------------------------------------------',
-            '# The tests/ tree and the Makefile ARE the oracle. The 227-entry lock',
+            f'# The {self._oracle_phrase()} ARE the oracle. The {len(fingerprint)}-entry lock',
             '# below was captured host-side from the intact tree at generate time',
             '# and refuses to grade if any pinned file changed.',
             B.fingerprint_gate_block(fingerprint, repo_var='${REPO}'),
-            '',
-            '# Vendored BearSSL is not part of the carve; a solver that deleted or',
-            '# stubbed it could make the link succeed without regenerating anything.',
-            '# The pristine count is baked in from the host-side scan at generate time.',
-            'TLS_NOW=$(find src/tls -type f | wc -l | tr -d " ")',
-            f'[ "${{TLS_NOW}}" = "{tls}" ] \\',
-            f'    || fail "src/tls file count changed: found ${{TLS_NOW}}, expected {tls} '
-            '(vendored BearSSL must stay intact)"',
-            f'echo "VERIFIER: src/tls intact -- ${{TLS_NOW}} files (pinned at {tls})"',
-            '',
-            '# Corpus is asserted EXACTLY, not as a lower bound: this IS the denominator.',
-            'CONF_N=$(ls tests/conformance/*.xs 2>/dev/null | wc -l | tr -d " ")',
-            'REG_N=$(ls tests/regression/*.xs 2>/dev/null | wc -l | tr -d " ")',
-            '[ "${CONF_N}" = "${EXPECT_CONF}" ] \\',
-            '    || fail "conformance corpus truncated: ${CONF_N}, expected ${EXPECT_CONF}"',
-            '[ "${REG_N}" = "${EXPECT_REG}" ] \\',
-            '    || fail "regression corpus truncated: ${REG_N}, expected ${EXPECT_REG}"',
-            '',
-            '# The network-dependent harness must not have been dragged into either graded glob.',
-            'if ls tests/conformance/*.xs tests/regression/*.xs 2>/dev/null | grep -q "test_http_client"; then',
-            '    fail "network-dependent test_http_client.xs leaked into the graded globs"',
-            'fi',
-            'echo "VERIFIER: corpus = ${CONF_N} conformance + ${REG_N} regression, http_client excluded"',
+        ]
+
+        for directory, label in harness.vendored:
+            if directory not in vendored_counts:
+                raise B.LangError(
+                    f'no host-side file count for vendored dir {directory!r}; '
+                    'emit._c_grader_metadata must scan every vendored_dirs entry'
+                )
+            n = int(vendored_counts[directory])
+            var = directory.rsplit('/', 1)[-1].upper()
+            lines += [
+                '',
+                f'# Vendored {label} is not part of the carve; a solver that deleted or',
+                '# stubbed it could make the link succeed without regenerating anything.',
+                '# The pristine count is baked in from the host-side scan at generate time.',
+                f'{var}_NOW=$(find {directory} -type f | wc -l | tr -d " ")',
+                f'[ "${{{var}_NOW}}" = "{n}" ] \\',
+                f'    || fail "{directory} file count changed: found ${{{var}_NOW}}, '
+                f'expected {n} (vendored {label} must stay intact)"',
+                f'echo "VERIFIER: {directory} intact -- ${{{var}_NOW}} files (pinned at {n})"',
+            ]
+
+        if runners:
+            lines += [
+                '',
+                '# Corpus is asserted EXACTLY, not as a lower bound: this IS the denominator.',
+                *[
+                    f'{c.var}_N=$(ls {c.directory}/{c.pattern} 2>/dev/null '
+                    '| wc -l | tr -d " ")'
+                    for c in runners
+                ],
+            ]
+            for c in runners:
+                lines += [
+                    f'[ "${{{c.var}_N}}" = "${{EXPECT_{c.var}}}" ] \\',
+                    f'    || fail "{c.name} corpus truncated: ${{{c.var}_N}}, '
+                    f'expected ${{EXPECT_{c.var}}}"',
+                ]
+            globs = ' '.join(f'{c.directory}/{c.pattern}' for c in runners)
+            corpus_desc = ' + '.join(f'${{{c.var}_N}} {c.name}' for c in runners)
+            excluded = ''
+            lines.append('')
+            if harness.exclude_names:
+                needles = harness.exclude_names
+                grep = (
+                    f'grep -q "{needles[0]}"' if len(needles) == 1
+                    else f'grep -qE "{"|".join(needles)}"'
+                )
+                ext = runners[0].pattern[1:] if runners[0].pattern.startswith('*') else ''
+                lines += [
+                    '# The network-dependent harness must not have been dragged '
+                    'into either graded glob.',
+                    f'if ls {globs} 2>/dev/null | {grep}; then',
+                    '    fail "network-dependent '
+                    + ', '.join(f'{n}{ext}' for n in needles)
+                    + ' leaked into the graded globs"',
+                    'fi',
+                ]
+                excluded = ', ' + ', '.join(
+                    n.removeprefix('test_') for n in needles
+                ) + ' excluded'
+            lines.append(f'echo "VERIFIER: corpus = {corpus_desc}{excluded}"')
+
+        lines += [
             '',
             '# --- genuine rebuild -------------------------------------------------',
-            '# `make clean` wipes build/obj and ./xs; the unit-test binaries under',
-            '# tests/unit/ are removed by hand (clean does not touch them). Nothing',
-            '# stale from image build time or from the model\'s own iteration can',
-            '# masquerade as a pass.',
-            'make clean > "${VERIFIER_DIR}/clean.log" 2>&1 || true',
-            'rm -f ./xs',
-            'rm -f tests/unit/*_test',
-            '[ -e ./xs ] && fail "./xs survived make clean -- refusing to trust the build"',
-            '[ -d build/obj ] && fail "build/obj survived make clean -- refusing to trust the build"',
+        ]
+        if harness.clean_command:
+            wipes = ' and '.join([*harness.stale_paths, *artifacts]) or 'previous output'
+            head = f'# `{clean_str}` wipes {wipes}'
+            if binary is not None:
+                lines += [
+                    head + '; the unit-test binaries under',
+                    f'# {binary.directory}/ are removed by hand (clean does not '
+                    'touch them). Nothing',
+                ]
+            else:
+                lines.append(head + '. Nothing')
+            lines += [
+                "# stale from image build time or from the model's own iteration can",
+                '# masquerade as a pass.',
+                f'{clean_str} > "${{VERIFIER_DIR}}/clean.log" 2>&1 || true',
+                *[f'rm -f {a}' for a in artifacts],
+            ]
+            if binary is not None:
+                lines.append(f'rm -f {binary.directory}/*{suffix}')
+            lines += [
+                f'[ -e {a} ] && fail "{a} survived {clean_str} -- '
+                'refusing to trust the build"'
+                for a in artifacts
+            ]
+            lines += [
+                f'[ -d {s} ] && fail "{s} survived {clean_str} -- '
+                'refusing to trust the build"'
+                for s in harness.stale_paths
+            ]
+        lines += [
             '',
             'echo "VERIFIER: clean tree confirmed; starting full rebuild from source"',
-            'make -j"$(nproc)" > "${BUILD_LOG}" 2>&1',
+            f'{harness.build_argv} > "${{BUILD_LOG}}" 2>&1',
             'BUILD_STATUS=$?',
-            'echo "VERIFIER: make exit=${BUILD_STATUS}"',
+            f'echo "VERIFIER: {tool} exit=${{BUILD_STATUS}}"',
             'if [ "${BUILD_STATUS}" -ne 0 ]; then',
             '    echo "--- tail of build.log ---" >&2',
             '    tail -25 "${BUILD_LOG}" >&2',
-            '    echo "VERIFIER: build failed (expected while src/runtime is missing or incomplete)" >&2',
+            f'    echo "VERIFIER: build failed (expected while {carved} is '
+            'missing or incomplete)" >&2',
             '    emit 0.0 0 "${EXPECTED}" 0.0 0.0',
             '    exit 0',
             'fi',
-            '[ -x ./xs ] || fail "build reported success but ./xs was not produced"',
+            *[
+                f'[ -x {a} ] || fail "build reported success but {a} was not produced"'
+                for a in artifacts
+            ],
             '',
             'COMPILED=1.0',
-            'echo "VERIFIER: rebuilt ./xs ($(stat -c%s ./xs) bytes), compiled=1.0"',
-            '',
-            '# Build the 13 unit harnesses. -k so that one failing to link does not',
-            '# hide the results of the other twelve; each is scored on its own merits.',
-            'UNIT_TARGETS=""',
-            'for t in ${UNIT_NAMES}; do UNIT_TARGETS="${UNIT_TARGETS} tests/unit/${t}_test"; done',
-            '# shellcheck disable=SC2086',
-            'make -k -j"$(nproc)" ${UNIT_TARGETS} > "${UNIT_BUILD_LOG}" 2>&1',
-            'echo "VERIFIER: unit harness build exit=$? (per-harness results counted below)"',
+            *(
+                [
+                    f'echo "VERIFIER: rebuilt {a} ($(stat -c%s {a}) bytes), compiled=1.0"'
+                    for a in artifacts
+                ]
+                or ['echo "VERIFIER: build succeeded, compiled=1.0"']
+            ),
+        ]
+
+        if binary is not None:
+            n_units = len(harness.binary_names)
+            lines.append('')
+            if n_units == 1:
+                lines.append(
+                    f'# Build the one {binary.name} harness; it is scored on its own merits.'
+                )
+            else:
+                lines += [
+                    f'# Build the {n_units} {binary.name} harnesses. -k so that '
+                    'one failing to link does not',
+                    f'# hide the results of the other {_english(n_units - 1)}; '
+                    'each is scored on its own merits.',
+                ]
+            lines += [
+                f'{binary.var}_TARGETS=""',
+                f'for t in ${{{binary.var}_NAMES}}; do {binary.var}_TARGETS='
+                f'"${{{binary.var}_TARGETS}} {binary.directory}/${{t}}{suffix}"; done',
+                '# shellcheck disable=SC2086',
+                f'{harness.unit_build_argv} ${{{binary.var}_TARGETS}} > '
+                f'"${{{binary.var}_BUILD_LOG}}" 2>&1',
+                f'echo "VERIFIER: {binary.name} harness build exit=$? '
+                '(per-harness results counted below)"',
+            ]
+
+        lines += [
             '',
             '# --- graded run: per-program exit status ----------------------------',
-            'run_corpus() {',
-            '    local label=$1 dir=$2 log=$3',
-            '    local passed=0 ran=0 f',
-            '    : > "${log}"',
-            '    for f in "${dir}"/*.xs; do',
-            '        [ -f "${f}" ] || continue',
-            '        ran=$((ran + 1))',
-            '        if ./xs "${f}" >/dev/null 2>>"${log}"; then',
-            '            passed=$((passed + 1))',
-            '            echo "[${label}] PASS ${f}" >> "${log}"',
-            '        else',
-            '            echo "[${label}] FAIL ${f} (exit $?)" >> "${log}"',
-            '        fi',
-            '    done',
-            '    echo "${passed} ${ran}"',
-            '}',
+        ]
+        if runners:
+            lines += [
+                'run_corpus() {',
+                '    local label=$1 dir=$2 log=$3',
+                '    local passed=0 ran=0 f',
+                '    : > "${log}"',
+                f'    for f in "${{dir}}"/{runners[0].pattern}; do',
+                '        [ -f "${f}" ] || continue',
+                '        ran=$((ran + 1))',
+                f'        if {harness.runner} "${{f}}" >/dev/null 2>>"${{log}}"; then',
+                '            passed=$((passed + 1))',
+                '            echo "[${label}] PASS ${f}" >> "${log}"',
+                '        else',
+                '            echo "[${label}] FAIL ${f} (exit $?)" >> "${log}"',
+                '        fi',
+                '    done',
+                '    echo "${passed} ${ran}"',
+                '}',
+                '',
+            ]
+            for c in runners:
+                lines += [
+                    f'read -r {c.var}_PASS {c.var}_RAN <<EOF',
+                    f'$(run_corpus {c.name} {c.directory} "${{{c.var}_LOG}}")',
+                    'EOF',
+                ]
+
+        if binary is not None:
+            env = (
+                f'{harness.binary_env_var}="$(pwd)/{harness.build_artifacts[0]}" '
+                if harness.binary_env_var else ''
+            )
+            lines += [
+                '',
+                f'{binary.var}_PASS=0',
+                f'{binary.var}_RAN=0',
+                f': > "${{{binary.var}_LOG}}"',
+                f'for t in ${{{binary.var}_NAMES}}; do',
+                f'    bin="{binary.directory}/${{t}}{suffix}"',
+                f'    {binary.var}_RAN=$(({binary.var}_RAN + 1))',
+                '    if [ ! -x "${bin}" ]; then',
+                f'        echo "[{binary.name}:${{t}}] FAIL -- harness binary '
+                f'missing (did not link)" >> "${{{binary.var}_LOG}}"',
+                '        continue',
+                '    fi',
+                f'    one="${{VERIFIER_DIR}}/{binary.name}-${{t}}.log"',
+                f'    {env}"./${{bin}}" > "${{one}}" 2>&1',
+                '    rc=$?',
+                f'    cat "${{one}}" >> "${{{binary.var}_LOG}}"',
+                '    if [ "${rc}" -ne 0 ]; then',
+                f'        echo "[{binary.name}:${{t}}] FAIL (exit ${{rc}})" '
+                f'>> "${{{binary.var}_LOG}}"',
+                f'    elif grep -qiE "\\[{binary.name}:[a-z_]+\\] .*(fail|FAILED)" '
+                '"${one}"; then',
+                f'        echo "[{binary.name}:${{t}}] FAIL -- reported a failure '
+                f'despite exit 0" >> "${{{binary.var}_LOG}}"',
+                '    else',
+                f'        {binary.var}_PASS=$(({binary.var}_PASS + 1))',
+                f'        echo "[{binary.name}:${{t}}] PASS" >> "${{{binary.var}_LOG}}"',
+                '    fi',
+                'done',
+            ]
+
+        lines += [
             '',
-            'read -r CONF_PASS CONF_RAN <<EOF',
-            '$(run_corpus conformance tests/conformance "${CONF_LOG}")',
-            'EOF',
-            'read -r REG_PASS REG_RAN <<EOF',
-            '$(run_corpus regression tests/regression "${REG_LOG}")',
-            'EOF',
-            '',
-            'UNIT_PASS=0',
-            'UNIT_RAN=0',
-            ': > "${UNIT_LOG}"',
-            'for t in ${UNIT_NAMES}; do',
-            '    bin="tests/unit/${t}_test"',
-            '    UNIT_RAN=$((UNIT_RAN + 1))',
-            '    if [ ! -x "${bin}" ]; then',
-            '        echo "[unit:${t}] FAIL -- harness binary missing (did not link)" >> "${UNIT_LOG}"',
-            '        continue',
-            '    fi',
-            '    one="${VERIFIER_DIR}/unit-${t}.log"',
-            '    XS="$(pwd)/xs" "./${bin}" > "${one}" 2>&1',
-            '    rc=$?',
-            '    cat "${one}" >> "${UNIT_LOG}"',
-            '    if [ "${rc}" -ne 0 ]; then',
-            '        echo "[unit:${t}] FAIL (exit ${rc})" >> "${UNIT_LOG}"',
-            '    elif grep -qiE "\\[unit:[a-z_]+\\] .*(fail|FAILED)" "${one}"; then',
-            '        echo "[unit:${t}] FAIL -- reported a failure despite exit 0" >> "${UNIT_LOG}"',
-            '    else',
-            '        UNIT_PASS=$((UNIT_PASS + 1))',
-            '        echo "[unit:${t}] PASS" >> "${UNIT_LOG}"',
-            '    fi',
-            'done',
-            '',
-            'PASSED=$((CONF_PASS + REG_PASS + UNIT_PASS))',
-            'RAN=$((CONF_RAN + REG_RAN + UNIT_RAN))',
+            f'PASSED=$(({" + ".join(f"{c.var}_PASS" for c in corpora)}))',
+            f'RAN=$(({" + ".join(f"{c.var}_RAN" for c in corpora)}))',
             'TOTAL=${RAN}',
             '',
-            'echo "VERIFIER: conformance ${CONF_PASS}/${CONF_RAN}, regression ${REG_PASS}/${REG_RAN}, '
-            'unit ${UNIT_PASS}/${UNIT_RAN}"',
+            'echo "VERIFIER: '
+            + ', '.join(
+                f'{c.name} ${{{c.var}_PASS}}/${{{c.var}_RAN}}' for c in corpora
+            )
+            + '"',
             'echo "VERIFIER: graded total ${PASSED}/${RAN}"',
             '',
             '# Structural anti-gaming: exact sweep counts. A sweep that visited fewer',
             '# programs than the corpus scores 0 rather than a fraction of a shrunken total.',
-            '[ "${CONF_RAN}" -eq "${EXPECT_CONF}" ] \\',
-            '    || fail "ran ${CONF_RAN} conformance programs, expected ${EXPECT_CONF}"',
-            '[ "${REG_RAN}" -eq "${EXPECT_REG}" ] \\',
-            '    || fail "ran ${REG_RAN} regression programs, expected ${EXPECT_REG}"',
-            '[ "${UNIT_RAN}" -eq "${EXPECT_UNIT}" ] \\',
-            '    || fail "ran ${UNIT_RAN} unit harnesses, expected ${EXPECT_UNIT}"',
+        ]
+        for c in corpora:
+            lines += [
+                f'[ "${{{c.var}_RAN}}" -eq "${{EXPECT_{c.var}}}" ] \\',
+                f'    || fail "ran ${{{c.var}_RAN}} {c.name} {c.noun}, '
+                f'expected ${{EXPECT_{c.var}}}"',
+            ]
+        lines += [
             '',
             B.floor_gate_block(
                 self.floor_mode, expected,
@@ -495,29 +1090,48 @@ class CPlugin(B.LangPlugin):
             '',
             '# Extend reward.json with sub-counts so the shape matches the reference',
             '# grader (verify.py reads the 5 canonical keys and ignores extras).',
-            'printf \'{"reward": %s, "tests_passed": %s, "tests_total": %s, "binary": %s, '
-            '"compiled": %s, "conformance_passed": %s, "conformance_total": %s, '
-            '"regression_passed": %s, "regression_total": %s, "unit_passed": %s, '
-            '"unit_total": %s}\\n\' \\',
+            'printf \'{"reward": %s, "tests_passed": %s, "tests_total": %s, '
+            '"binary": %s, "compiled": %s'
+            + ''.join(
+                f', "{c.name}_passed": %s, "{c.name}_total": %s' for c in corpora
+            )
+            + '}\\n\' \\',
             '    "${REWARD}" "${PASSED}" "${EXPECTED}" "${BINARY}" "${COMPILED}" \\',
-            '    "${CONF_PASS}" "${EXPECT_CONF}" "${REG_PASS}" "${EXPECT_REG}" '
-            '"${UNIT_PASS}" "${EXPECT_UNIT}" \\',
+            '    '
+            + ' '.join(
+                f'"${{{c.var}_PASS}}" "${{EXPECT_{c.var}}}"' for c in corpora
+            )
+            + ' \\',
             '    > "${VERIFIER_DIR}/reward.json"',
             'echo "reward.json (extended) = $(cat "${VERIFIER_DIR}/reward.json")"',
             '',
             'exit 0',
             '',
-        ])
+        ]
+        return '\n'.join(lines)
 
-    def measure_test_sh(self, *, graded: GradedSet | None = None, **kwargs) -> str:
-        """Phase 1: build and run the three corpora against the INTACT tree, count runs.
+    def measure_test_sh(
+        self,
+        *,
+        graded: GradedSet | None = None,
+        dep_plan: DepPlan | None = None,
+        **kwargs,
+    ) -> str:
+        """Phase 1: build and sweep every corpus the plan declares, count runs.
 
         Floor-FREE by construction. `measure` writes tests_total = the count of
-        programs the sweep actually attempted, so a build that broke halfway
-        registers as fewer-than-expected and `parse_measure_json` rejects zero.
+        units the sweep actually attempted, so a build that broke halfway -- or
+        a harness whose globs match nothing -- registers as fewer-than-expected
+        and `parse_measure_json` rejects zero, which sends the refine loop back
+        to the resolver instead of shipping a task nobody can score.
         """
-        unit_names_str = ' '.join(self.unit_names)
-        return '\n'.join([
+        _plan, harness = self._harness(dep_plan)
+        corpora = harness.corpora
+        runners = harness.runner_corpora
+        binary = harness.binary_corpus
+        artifacts = harness.artifact_paths
+
+        lines: list[str] = [
             '#!/usr/bin/env bash',
             '# Harbor MEASURE (phase 1) -- c. Floor-FREE by construction; the pinned',
             '# denominator is what THIS run measures against the intact tree.',
@@ -527,12 +1141,17 @@ class CPlugin(B.LangPlugin):
             f'REPO=${{REPO:-{B.WORKDIR}}}',
             B.measure_emitter_block(_MEASURE_LOGS_DEFAULT),
             'BUILD_LOG="${MEASURE_DIR}/build.log"',
-            'UNIT_BUILD_LOG="${MEASURE_DIR}/unit-build.log"',
-            f'UNIT_NAMES="{unit_names_str}"',
+        ]
+        if binary is not None:
+            lines += [
+                f'{binary.var}_BUILD_LOG="${{MEASURE_DIR}}/{binary.name}-build.log"',
+                f'{binary.var}_NAMES="{" ".join(harness.binary_names)}"',
+            ]
+        lines += [
             '',
             'cd "${REPO}" || { echo "no ${REPO}" >&2; measure 0 \'\'; exit 0; }',
             '',
-            'make -j"$(nproc)" > "${BUILD_LOG}" 2>&1',
+            f'{harness.build_argv} > "${{BUILD_LOG}}" 2>&1',
             'BUILD_STATUS=$?',
             'if [ "${BUILD_STATUS}" -ne 0 ]; then',
             '    tail -20 "${BUILD_LOG}" >&2',
@@ -540,54 +1159,80 @@ class CPlugin(B.LangPlugin):
             '    measure 0 \'\'',
             '    exit 0',
             'fi',
-            'if [ ! -x ./xs ]; then',
-            '    echo "measure: no ./xs produced by intact build" >&2',
-            '    measure 0 \'\'',
-            '    exit 0',
-            'fi',
+        ]
+        for artifact in artifacts:
+            lines += [
+                f'if [ ! -x {artifact} ]; then',
+                f'    echo "measure: no {artifact} produced by intact build" >&2',
+                '    measure 0 \'\'',
+                '    exit 0',
+                'fi',
+            ]
+        if binary is not None:
+            lines += [
+                '',
+                f'{binary.var}_TARGETS=""',
+                f'for t in ${{{binary.var}_NAMES}}; do {binary.var}_TARGETS='
+                f'"${{{binary.var}_TARGETS}} {binary.directory}/${{t}}'
+                f'{harness.binary_suffix}"; done',
+                '# shellcheck disable=SC2086',
+                f'{harness.unit_build_argv} ${{{binary.var}_TARGETS}} > '
+                f'"${{{binary.var}_BUILD_LOG}}" 2>&1',
+            ]
+        if runners:
+            lines += [
+                '',
+                'run_dir() {',
+                '    local dir=$1 passed=0 ran=0 f',
+                f'    for f in "${{dir}}"/{runners[0].pattern}; do',
+                '        [ -f "${f}" ] || continue',
+                '        ran=$((ran + 1))',
+                f'        {harness.runner} "${{f}}" >/dev/null 2>&1 '
+                '&& passed=$((passed + 1))',
+                '    done',
+                '    echo "${passed} ${ran}"',
+                '}',
+                '',
+            ]
+            for c in runners:
+                lines += [
+                    f'read -r {c.var}_PASS {c.var}_RAN <<EOF',
+                    f'$(run_dir {c.directory})',
+                    'EOF',
+                ]
+        if binary is not None:
+            env = (
+                f'{harness.binary_env_var}="$(pwd)/{harness.build_artifacts[0]}" '
+                if harness.binary_env_var else ''
+            )
+            lines += [
+                '',
+                f'{binary.var}_PASS=0',
+                f'{binary.var}_RAN=0',
+                f'for t in ${{{binary.var}_NAMES}}; do',
+                f'    bin="{binary.directory}/${{t}}{harness.binary_suffix}"',
+                f'    {binary.var}_RAN=$(({binary.var}_RAN + 1))',
+                '    if [ -x "${bin}" ]; then',
+                f'        {env}"./${{bin}}" >/dev/null 2>&1 \\',
+                f'            && {binary.var}_PASS=$(({binary.var}_PASS + 1))',
+                '    fi',
+                'done',
+            ]
+        lines += [
             '',
-            'UNIT_TARGETS=""',
-            'for t in ${UNIT_NAMES}; do UNIT_TARGETS="${UNIT_TARGETS} tests/unit/${t}_test"; done',
-            '# shellcheck disable=SC2086',
-            'make -k -j"$(nproc)" ${UNIT_TARGETS} > "${UNIT_BUILD_LOG}" 2>&1',
-            '',
-            'run_dir() {',
-            '    local dir=$1 passed=0 ran=0 f',
-            '    for f in "${dir}"/*.xs; do',
-            '        [ -f "${f}" ] || continue',
-            '        ran=$((ran + 1))',
-            '        ./xs "${f}" >/dev/null 2>&1 && passed=$((passed + 1))',
-            '    done',
-            '    echo "${passed} ${ran}"',
-            '}',
-            '',
-            'read -r CONF_PASS CONF_RAN <<EOF',
-            '$(run_dir tests/conformance)',
-            'EOF',
-            'read -r REG_PASS REG_RAN <<EOF',
-            '$(run_dir tests/regression)',
-            'EOF',
-            '',
-            'UNIT_PASS=0',
-            'UNIT_RAN=0',
-            'for t in ${UNIT_NAMES}; do',
-            '    bin="tests/unit/${t}_test"',
-            '    UNIT_RAN=$((UNIT_RAN + 1))',
-            '    if [ -x "${bin}" ]; then',
-            '        XS="$(pwd)/xs" "./${bin}" >/dev/null 2>&1 \\',
-            '            && UNIT_PASS=$((UNIT_PASS + 1))',
-            '    fi',
-            'done',
-            '',
-            'RAN=$((CONF_RAN + REG_RAN + UNIT_RAN))',
-            'PASSED=$((CONF_PASS + REG_PASS + UNIT_PASS))',
-            'echo "MEASURE: conf ${CONF_PASS}/${CONF_RAN}, reg ${REG_PASS}/${REG_RAN}, '
-            'unit ${UNIT_PASS}/${UNIT_RAN} -- total ran ${RAN}"',
+            f'RAN=$(({" + ".join(f"{c.var}_RAN" for c in corpora)}))',
+            f'PASSED=$(({" + ".join(f"{c.var}_PASS" for c in corpora)}))',
+            'echo "MEASURE: '
+            + ', '.join(
+                f'{c.var.lower()} ${{{c.var}_PASS}}/${{{c.var}_RAN}}' for c in corpora
+            )
+            + ' -- total ran ${RAN}"',
             '',
             'measure "${RAN}" \'\'',
             'exit 0',
             '',
-        ])
+        ]
+        return '\n'.join(lines)
 
     # --- axis 7 -----------------------------------------------------------
 
@@ -629,6 +1274,7 @@ class CPlugin(B.LangPlugin):
             _flag_str(plan.build_flags, key)
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
+        read_harness(plan)
 
     def _gap_body(self, plan: DepPlan) -> str:
         """c's toolchain + dependency bytes, rendered from a plan instead of a literal.

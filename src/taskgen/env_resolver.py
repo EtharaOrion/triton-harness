@@ -35,6 +35,7 @@ from typing import Protocol
 from taskgen.depplan import (
     DepPlan,
     FlagValue,
+    HarnessValue,
     InstallCommand,
     TestValue,
     canonicalize,
@@ -54,9 +55,11 @@ __all__ = [
     'resolve_dep_plan',
 ]
 
-#: A DepPlan is a few hundred tokens; a cap keeps a rambling model from paying
-#: for prose the parser will throw away anyway.
-MAX_RESPONSE_TOKENS = 4096
+#: A cap, so a rambling model does not pay for prose the parser throws away.
+#: NOT reducible to 4096: a `harness` carries five corpus columns plus every
+#: unit name, and extended thinking needs a budget STRICTLY below max_tokens --
+#: at litellm's 4096 that is a request no provider accepts.
+MAX_RESPONSE_TOKENS = 16384
 
 
 class ResolverError(RuntimeError):
@@ -148,12 +151,14 @@ PRINCIPLES (grounded in prior art)
 3. VALIDATE-BY-RUNNING is the harness's job. Choose the MINIMAL install that makes the suite collect and pass (SWE-bench PASS_TO_PASS). Minimal extras; add one only if tests need it.
 4. OFFLINE AT GRADE TIME. Network exists only while building; the graded run has none. Every dependency must be fully installed at build time; anything fetching/serving at test time is disqualifying.
 5. STRUCTURED, NOT ARBITRARY. install_commands are {tool, args[]} with tool in the language allowlist. No pipes, no curl|bash, no sh -c, no shell metacharacters. System packages via apt only, sorted and pinned.
-6. INSTALL PREPARES, THE TEST COMMAND BUILDS (repo2docker; DockerizeMe). install_commands exist to PREPARE the environment -- fetch, vendor, or install dependencies -- and they run while the image is being built. They are NOT for compiling the repository's own sources: test_invocation is what builds and runs the suite, and it does so on a tree that may differ from the one present at image-build time. So for a compiled language driven by make/cmake, install_commands is USUALLY EMPTY. Do NOT add a bare `make` / `make all` / `cmake --build .` step unless a build file at the build root actually declares that default target AND the plan needs its output before the tests run. Every install_command must be able to SUCCEED in the image as built: a speculative build step that errors (no makefile, no such target, sources not present yet) does not degrade the plan, it makes the whole plan unbuildable. Likewise add apt_packages ONLY for system libraries the sources need and the base image lacks -- not for a toolchain the base already bakes in.
+6. THE HARNESS IS DISCOVERED FROM MANIFESTS AND TEST PATHS, NEVER FROM BODIES. Some languages also ask for a `harness` section: how the suite is BUILT, how its individual graded units are DISCOVERED, and how each unit is decided pass or fail. Fill it ONLY from the build manifests and the LIST OF TEST FILE PATHS you were given -- those two are sufficient, because a corpus is a directory plus a filename pattern and a unit's verdict is a process exit code. You are never shown a test body and must never ask for one; the behavior under test is the answer the benchmark hides. Enumerate EVERY distinct corpus the test paths reveal: a suite split across several directories or several filename patterns is several corpora, and one you leave out is silently ungraded. If the paths do not let you state the harness precisely, REFUSE -- a harness that discovers nothing produces a task with a denominator of zero, which is worse than no task.
+7. INSTALL PREPARES, THE TEST COMMAND BUILDS (repo2docker; DockerizeMe). install_commands exist to PREPARE the environment -- fetch, vendor, or install dependencies -- and they run while the image is being built. They are NOT for compiling the repository's own sources: test_invocation is what builds and runs the suite, and it does so on a tree that may differ from the one present at image-build time. So for a compiled language driven by make/cmake, install_commands is USUALLY EMPTY. Do NOT add a bare `make` / `make all` / `cmake --build .` step unless a build file at the build root actually declares that default target AND the plan needs its output before the tests run. Every install_command must be able to SUCCEED in the image as built: a speculative build step that errors (no makefile, no such target, sources not present yet) does not degrade the plan, it makes the whole plan unbuildable. Likewise add apt_packages ONLY for system libraries the sources need and the base image lacks -- not for a toolchain the base already bakes in.
 
 REFUSE (do not guess) -> {"disposition":"REFUSE","reason":"..."} when: no recognized manifest; required toolchain not provided by the base; tests need an external service (DB/network/browser/docker) impossible under --network=none; the only viable install needs a non-apt source / source build / PPA / curl; multiple test frameworks or an ambiguous package root. A precise REFUSE is a SUCCESS; a plausible-but-wrong plan corrupts the benchmark.
 
 OUTPUT — emit ONLY canonical JSON, keys sorted, lists sorted+deduped, versions normalized, package names lowercased:
-{ "schema":1, "lang":"...", "toolchain_version":"...", "package_manager":"<enum>", "manifest_files":[...], "apt_packages":[...], "install_commands":[{"tool":"<allowlisted>","args":["..."]}], "build_flags":{...}, "test_invocation":{"framework":"...","collect_args":[...],"run_args":[...]}, "needs_git_metadata":<bool> }
+{ "schema":1, "lang":"...", "toolchain_version":"...", "package_manager":"<enum>", "manifest_files":[...], "apt_packages":[...], "install_commands":[{"tool":"<allowlisted>","args":["..."]}], "build_flags":{...}, "test_invocation":{"framework":"...","collect_args":[...],"run_args":[...]}, "harness":{...}, "needs_git_metadata":<bool> }
+`harness` is omitted entirely unless the required plan slots below ask for it; when they do, they name every key, its type and its meaning. Its values are strings, booleans or lists of strings — never a shell fragment, and the same no-metacharacter rule as install_commands applies to every token.
 Be minimal and canonical: two runs on the same repo must produce the same plan; prefer the fewest packages, the lockfile path, one obvious install sequence; between equivalent options pick the lexicographically smallest. If given a repair message (build/collect stderr), change the SMALLEST set of slots that fixes the specific error -- and when the failing step is one YOU added that the plan does not need, DELETE that step rather than patching around it; removing a step is a smaller change than inventing a target for it."""
 
 
@@ -171,6 +176,26 @@ def _reject_multiline(value: str, where: str) -> str:
             'the benchmark hides and must never reach the model'
         )
     return value
+
+
+def _test_path_summary(paths: list[str]) -> str:
+    """`dir: N x .ext` per directory, sorted. Derived only from the paths.
+
+    Purely a re-presentation of the list the prompt already carries: it opens
+    no file, so it cannot widen the leak boundary, and it is sorted twice over
+    so two runs on one checkout send identical bytes.
+    """
+    groups: dict[tuple[str, str], int] = {}
+    for path in paths:
+        directory, _, name = path.rpartition('/')
+        _, dot, ext = name.rpartition('.')
+        groups[(directory or '.', f'.{ext}' if dot else '(no extension)')] = (
+            groups.get((directory or '.', f'.{ext}' if dot else '(no extension)'), 0) + 1
+        )
+    return '\n'.join(
+        f'- {directory}/ : {count} x {ext}'
+        for (directory, ext), count in sorted(groups.items())
+    )
 
 
 def build_user_prompt(
@@ -221,6 +246,14 @@ def build_user_prompt(
     sections.append(
         '# Test file paths (paths only -- bodies are never shown)\n'
         + ('\n'.join(f'- {p}' for p in paths) or '- (none found)')
+    )
+    sections.append(
+        '# Test paths grouped by directory and extension\n'
+        'A restatement of the list above and nothing more -- no new '
+        'information, no bodies. It is here because a harness is described '
+        'per DIRECTORY, and a directory holding a dozen files is a dozen '
+        'lines in a flat list but one line here:\n'
+        + (_test_path_summary(paths) or '- (none found)')
     )
     sections.append(f'# Detected test framework\n{framework}')
 
@@ -331,6 +364,27 @@ def _as_test_invocation(value: object) -> tuple[tuple[str, TestValue], ...]:
     return tuple(sorted(entries, key=lambda pair: pair[0]))
 
 
+def _as_harness(value: object) -> tuple[tuple[str, HarnessValue], ...]:
+    """The harness section: scalars stay scalars, lists become token tuples.
+
+    `bool` is tested before `int` for the same reason `_as_build_flags` does it:
+    `isinstance(True, int)` is true, and a `build_parallel` that canonicalised
+    into `1` would render the same image under a different digest.
+    """
+    if not isinstance(value, dict):
+        raise ResolverError(f'harness must be an object, got {type(value).__name__}')
+    entries: list[tuple[str, HarnessValue]] = []
+    for key, raw in value.items():
+        name = _as_str(key, 'a harness key')
+        parsed: HarnessValue
+        if isinstance(raw, bool) or isinstance(raw, (int, str)):
+            parsed = raw
+        else:
+            parsed = _as_str_tuple(raw, f'harness {name!r}')
+        entries.append((name, parsed))
+    return tuple(sorted(entries, key=lambda pair: pair[0]))
+
+
 def parse_resolution(text: str, lang: str) -> DepPlan | Refuse:
     """A model answer as either a validated, canonical `DepPlan` or a `Refuse`."""
     data = _extract_json_object(text)
@@ -369,6 +423,7 @@ def parse_resolution(text: str, lang: str) -> DepPlan | Refuse:
         install_commands=_as_install_commands(data.get('install_commands', [])),
         build_flags=_as_build_flags(data.get('build_flags', {})),
         test_invocation=_as_test_invocation(data.get('test_invocation', {})),
+        harness=_as_harness(data.get('harness', {})),
         needs_git_metadata=needs_git,
     )
     validate(plan)

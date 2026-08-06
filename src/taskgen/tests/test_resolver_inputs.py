@@ -306,3 +306,29 @@ def test_c_xs_leaks_no_line_of_any_source_or_test_file(c_xs):
         needles += 1
 
     assert needles > 100, f'only {needles} bodies were checked; the hunt was vacuous'
+
+
+def test_a_single_file_c_suite_is_seen_as_a_test_path_not_a_manifest(tmp_path):
+    """A root `test.c` is the whole suite of a single-file C project.
+
+    Two things at once: the resolver gets a path it can build a harness from
+    instead of an empty list it can only refuse on, and the file is guaranteed
+    never to be READ -- the test rule runs before the manifest rule, so its
+    body cannot reach the model.
+    """
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    (repo / 'Makefile').write_text('all:\n\tgcc test.c\n')
+    (repo / 'test.c').write_text('int main(void) { return SECRET_ANSWER; }\n')
+    (repo / 'aes.c').write_text('int aes;\n')
+
+    inputs = RI.gather_resolver_inputs(repo=repo, lang='c')
+    assert 'test.c' in inputs.test_paths
+    assert 'test.c' not in inputs.manifest_files
+    assert 'SECRET_ANSWER' not in '\n'.join(inputs.manifest_files.values())
+
+
+def test_the_new_c_test_names_do_not_leak_into_cpp(tmp_path):
+    """cpp was not in this slice; its pattern set must be unchanged."""
+    assert 'test.c' not in RI.TEST_NAME_PATTERNS['cpp']
+    assert 'tests.c' not in RI.TEST_NAME_PATTERNS['cpp']

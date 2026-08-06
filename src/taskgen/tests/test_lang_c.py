@@ -93,13 +93,22 @@ def test_test_command_is_the_three_hermetic_targets(plugin):
     assert 'http_client' not in plugin.test_command
 
 
-def test_unit_names_match_reference_grader(plugin):
-    """The 13 names must match the reference test.sh, in order."""
-    assert plugin.unit_names == (
+def test_unit_names_match_reference_grader():
+    """The 13 names must match the reference test.sh, in order.
+
+    They live on the c-xs PLAN now, not on the plugin: they are a fact about
+    one repository, and the plugin has to be able to render a harness for a
+    repository it has never seen.
+    """
+    harness = C.read_harness(C.C_MEASURE_DEP_PLAN)
+    assert harness.binary_names == (
         'lexer', 'parser', 'sema', 'value', 'gc', 'utf8', 'bigint',
         'regex', 'msgpack', 'strbuf', 'limits', 'bytecode_buf', 'self',
     )
-    assert len(plugin.unit_names) == 13
+    assert len(harness.binary_names) == 13
+    assert not hasattr(C.CPlugin, 'unit_names'), (
+        'the plugin must carry no per-repository unit list'
+    )
 
 
 # --------------------------------------------------------- gradedset wire --
@@ -172,7 +181,7 @@ def test_no_pre_leakgate_blocks(plugin):
 
 def test_render_test_sh_requires_metadata(plugin, graded):
     """No magic numbers in the plugin source: without threaded metadata it refuses."""
-    with pytest.raises(B.LangError, match='tls_count and corpus_counts'):
+    with pytest.raises(B.LangError, match='corpus_counts and vendored_counts'):
         plugin.render_test_sh(graded)
 
 
@@ -180,22 +189,22 @@ def test_render_test_sh_refuses_inconsistent_sub_counts(plugin, graded):
     with pytest.raises(B.LangError, match='do not sum to expected'):
         plugin.render_test_sh(
             graded,
-            tls_count=306,
+            vendored_counts={'src/tls': 306},
             corpus_counts={'conformance': 10, 'regression': 10, 'unit': 10},
         )
 
 
 def test_render_test_sh_refuses_wrong_unit_count():
-    """Plugin's unit_names has 13 entries; expected sub-count for unit must match."""
+    """The plan's binary_names has 13 entries; the unit sub-count must match."""
     plugin = C.CPlugin()
     graded_92 = B.GradedSet(
         expected=92, floor_mode='equality', kind='whole-suite',
         test_command=C.TEST_COMMAND,
     )
-    with pytest.raises(B.LangError, match='unit_names'):
+    with pytest.raises(B.LangError, match='binary_names'):
         plugin.render_test_sh(
             graded_92,
-            tls_count=306,
+            vendored_counts={'src/tls': 306},
             corpus_counts={'conformance': 18, 'regression': 60, 'unit': 14},
         )
 
@@ -203,8 +212,9 @@ def test_render_test_sh_refuses_wrong_unit_count():
 def _render_ok(plugin, graded):
     return plugin.render_test_sh(
         graded,
-        tls_count=306,
+        vendored_counts={'src/tls': 306},
         corpus_counts={'conformance': 18, 'regression': 60, 'unit': 13},
+        carve_root='src/runtime',
     )
 
 
@@ -358,7 +368,7 @@ def test_render_measure_dockerfile_uses_intact_tree(plugin):
 
 
 def test_emit_c_grader_metadata_computes_host_side(tmp_path):
-    """No magic numbers: sub-counts and tls_count come from the intact tree."""
+    """No magic numbers: every count comes from the intact tree, per the plan."""
     from taskgen.emit import _c_grader_metadata, CarvePlan
     from taskgen.scope import CarveScope
 
@@ -381,8 +391,8 @@ def test_emit_c_grader_metadata_computes_host_side(tmp_path):
         lang='c', scope=CarveScope.FOLDER, repo=repo, repo_name='fake',
         target=None, carve=None, graded=None, staged=None, staging_key='',
     )
-    meta = _c_grader_metadata(plan)
-    assert meta['tls_count'] == 7
+    meta = _c_grader_metadata(plan, None)
+    assert meta['vendored_counts'] == {'src/tls': 7}
     assert meta['corpus_counts'] == {'conformance': 3, 'regression': 5, 'unit': 2}
 
 

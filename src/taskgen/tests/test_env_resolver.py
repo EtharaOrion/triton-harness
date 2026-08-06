@@ -346,3 +346,47 @@ def test_the_module_imports_no_model_sdk_no_network_and_no_docker() -> None:
 
     assert not imported & {'litellm', 'openai', 'anthropic', 'httpx', 'requests',
                            'urllib', 'socket', 'docker', 'subprocess'}
+
+
+def test_the_test_path_summary_groups_by_directory_and_extension():
+    """A directory of many files is one line here and many lines above it."""
+    summary = R._test_path_summary([
+        'tests/conformance/a.xs', 'tests/conformance/b.xs',
+        'tests/unit/lexer_test.c', 'tests/unit/gc_test.c', 'tests/unit/test.h',
+        'runner',
+    ])
+    assert '- tests/conformance/ : 2 x .xs' in summary
+    assert '- tests/unit/ : 2 x .c' in summary
+    assert '- tests/unit/ : 1 x .h' in summary
+    assert '- ./ : 1 x (no extension)' in summary
+
+
+def test_the_test_path_summary_is_deterministic_and_sorted():
+    paths = ['b/y.c', 'a/z.c', 'a/x.h', 'b/w.c']
+    first = R._test_path_summary(paths)
+    assert first == R._test_path_summary(list(reversed(paths)))
+    assert first.splitlines() == sorted(first.splitlines())
+
+
+def test_the_test_path_summary_adds_no_information_beyond_the_paths():
+    """It restates; it never opens a file, so it cannot widen the leak boundary.
+
+    Every token it emits is a directory, an extension or a count -- all three
+    are already derivable from the list the prompt carries in full.
+    """
+    summary = R._test_path_summary(['tests/unit/lexer_test.c'])
+    assert summary == '- tests/unit/ : 1 x .c'
+    assert 'lexer_test' not in summary
+
+
+def test_the_prompt_carries_the_summary_and_still_no_bodies():
+    prompt = R.build_user_prompt(
+        lang='c',
+        toolchain_capabilities=['gcc 13.3.0'],
+        manifest_files={'Makefile': 'all:\n\tgcc aes.c\n'},
+        test_paths=['tests/unit/lexer_test.c', 'tests/unit/gc_test.c'],
+        framework='make',
+    )
+    assert 'Test paths grouped by directory and extension' in prompt
+    assert '- tests/unit/ : 2 x .c' in prompt
+    assert 'tests/unit/lexer_test.c' in prompt

@@ -743,43 +743,58 @@ def _test_file_counts(plan: CarvePlan) -> dict[str, int]:
     return counts
 
 
-def _c_grader_metadata(plan: CarvePlan) -> dict:
-    """Sub-counts and tls_count for c-xs, computed HOST-SIDE from the intact tree.
+def _c_grader_metadata(plan: CarvePlan, dep_plan: DepPlan | None) -> dict:
+    """Per-corpus and per-vendored-dir counts, HOST-SIDE, from the intact tree.
 
-    Threaded into the plugin's render_test_sh so no magic numbers appear in the
-    plugin source; the reference test.sh reads the tls count off an image file
-    (/opt/harbor/tls_file_count), we inline it as a bash literal at generate
-    time. Both paths refuse to grade if the runtime count drifts.
+    WHICH directories and WHICH globs is the resolved `DepPlan`'s answer, not
+    this function's: a count taken over a hardcoded `tests/conformance` is a
+    count of one repository, and the whole point of the harness section is that
+    an unseen repo states its own layout. What stays here is the SCAN, because
+    only the generator has the intact tree -- the verifier that runs later sees
+    a carved one and would count a shrunken denominator as if it were the floor.
     """
+    from .langs import c as c_lang
+
     repo = plan.repo
-    conformance = len(sorted((repo / 'tests' / 'conformance').glob('*.xs')))
-    regression = len(sorted((repo / 'tests' / 'regression').glob('*.xs')))
-    unit_dir = repo / 'tests' / 'unit'
-    unit = len(sorted(
-        p for p in unit_dir.iterdir()
-        if p.is_file() and p.name.endswith('_test.c')
-    )) if unit_dir.is_dir() else 0
-    tls_count = len([
-        p for p in (repo / 'src' / 'tls').rglob('*') if p.is_file()
-    ]) if (repo / 'src' / 'tls').is_dir() else 0
-    return {
-        'corpus_counts': {
-            'conformance': conformance,
-            'regression': regression,
-            'unit': unit,
-        },
-        'tls_count': tls_count,
+    harness = c_lang.read_harness(
+        dep_plan if dep_plan is not None else c_lang.C_MEASURE_DEP_PLAN
+    )
+    corpus_counts = {
+        corpus.name: len([
+            p for p in (repo / corpus.directory).glob(corpus.pattern) if p.is_file()
+        ])
+        for corpus in harness.corpora
     }
+    vendored_counts = {
+        directory: len([
+            p for p in (repo / directory).rglob('*') if p.is_file()
+        ])
+        for directory, _label in harness.vendored
+    }
+    return {'corpus_counts': corpus_counts, 'vendored_counts': vendored_counts}
 
 
-def _render_test_sh(plugin, plan: CarvePlan, graded_spec) -> str:
+def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
+                    dep_plan: DepPlan | None = None) -> str:
     if plan.lang == 'go':
         return plugin.render_test_sh(
             graded_spec, test_file_counts=_test_file_counts(plan),
         )
     if plan.lang == 'c':
-        return plugin.render_test_sh(graded_spec, **_c_grader_metadata(plan))
+        return plugin.render_test_sh(
+            graded_spec,
+            dep_plan=dep_plan,
+            carve_root=carve_root,
+            **_c_grader_metadata(plan, dep_plan),
+        )
     return plugin.render_test_sh(graded_spec)
+
+
+def _measure_test_sh(plugin, plan: CarvePlan, dep_plan: DepPlan | None) -> str:
+    """Phase 1's script. Only c reads the plan; the others keep their signature."""
+    if plan.lang == 'c':
+        return plugin.measure_test_sh(graded=plan.graded, dep_plan=dep_plan)
+    return plugin.measure_test_sh(graded=plan.graded)
 
 
 def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
@@ -788,9 +803,9 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
     repo_name = inp.repo_name
     carve = inp.carve
     relpath = carve.primary_relpath
+    carve_root = common_root(carve.carved_relpaths)
     func_key = (
-        inp.target.name if plan.scope is CarveScope.FUNCTION
-        else common_root(carve.carved_relpaths)
+        inp.target.name if plan.scope is CarveScope.FUNCTION else carve_root
     )
     cls_key = getattr(inp.target, 'class_name', '') or ''
     eid = entry_id(
@@ -831,7 +846,8 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
         _write(path / 'tests/allowlist.txt',
                ''.join(f'{n}\n' for n in plan.graded.selectors))
         _write(path / 'tests/harbor_filter.py', templates.HARBOR_FILTER_PY)
-    _write(path / 'tests/test.sh', _render_test_sh(plugin, plan, graded_spec),
+    _write(path / 'tests/test.sh',
+           _render_test_sh(plugin, plan, graded_spec, carve_root, dep_plan),
            executable=True)
 
     _write(path / 'solution/solve.sh',
@@ -1211,7 +1227,6 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
 
     env = langs_base.EnvSpec(repo_name=plan.repo_name)
     dockerfile_text = plugin.render_measure_dockerfile(env)
-    measure_sh_text = plugin.measure_test_sh(graded=plan.graded)
 
     runner = verify_mod.DockerRunner(echo=echo)
     base_image = plugin.toolchain_spec().base_image
@@ -1254,11 +1269,17 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
         loop calls this once per attempt and the default path calls it exactly
         once, so both paths write the same context out of the same lines and a
         drift between them is not expressible.
+
+        The measure SCRIPT is rendered per candidate, not once above, because
+        for a harness-driven language the plan says which corpora to sweep --
+        and a script rendered before the plan existed would measure the previous
+        candidate's suite and pin its denominator against this candidate's image.
         """
         text = (
             dockerfile_text if dep_plan is None
             else plugin.render_measure_dockerfile(env, dep_plan=dep_plan)
         )
+        measure_sh_text = _measure_test_sh(plugin, plan, dep_plan)
         measure_ctx.mkdir(parents=True, exist_ok=True)
         dockerfile = measure_ctx / 'Dockerfile'
         dockerfile.write_text(text, encoding='utf-8')

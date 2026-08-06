@@ -162,7 +162,11 @@ TEST_NAME_PATTERNS: Mapping[str, tuple[str, ...]] = {
     'python': ('conftest.py', 'test_*.py', '*_test.py'),
     'go': ('*_test.go',),
     'rust': ('*_test.rs', 'test_*.rs'),
-    'c': ('*_test.c', 'test_*.c', 'test_*.sh'),
+    # `test.c`/`tests.c` for c only: a single-file C project holds its whole
+    # suite in one root file, and empty test_paths leave a resolver nothing to
+    # describe a harness from. Also the leak-SAFER reading -- the test rule runs
+    # before the manifest rule, so a name listed here can never be opened.
+    'c': ('*_test.c', 'test.c', 'test_*.c', 'test_*.sh', 'tests.c'),
     'cpp': ('*_test.cc', '*_test.cpp', 'test_*.cc', 'test_*.cpp'),
     'java': ('*Test.java', '*TestCase.java', '*Tests.java'),
     'csharp': ('*Test.cs', '*Tests.cs'),
