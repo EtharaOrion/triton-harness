@@ -26,23 +26,25 @@ from taskgen.scope import CarveScopeError
 
 from .conftest import FROZEN_FILE, FROZEN_FUNC, FROZEN_NODEIDS, FROZEN_SHA256
 
-#: The ids the proven single-function entry has always had. They are the
-#: backward-compatibility contract: `--carve-scope`/`--lang` were added to the
-#: uuid5 key, and the key must collapse to its old form at the defaults. The
-#: nine originals are UNCHANGED by the caller_* conditions, which is the point:
-#: the key is per-context_type, so adding conditions cannot renumber the rest.
+#: The ids the proven single-function entry mints under the `triton.taskgen`
+#: uuid5 namespace. They are the backward-compatibility contract:
+#: `--carve-scope`/`--lang` were added to the uuid5 key, and the key must
+#: collapse to its old form at the defaults. The nine originals are UNCHANGED by
+#: the caller_* conditions, which is the point: the key is per-context_type, so
+#: adding conditions cannot renumber the rest. Only re-seeding the namespace may
+#: move this whole table at once, since a uuid5 is a pure function of seed+key.
 FROZEN_ENTRY_IDS = {
-    'no_context': '35424944-86c8-5f4d-98ba-75ec1f161c72',
-    'callee_func': '1968d8d9-be80-5244-8375-a52438198268',
-    'callee_sig': '15e2b5b1-95af-55e2-8cbd-7d48e9c76f66',
-    'caller_func': '98cfe292-5b96-5141-9476-0717b6262e02',
-    'caller_sig': '2dfa0757-f929-55c7-9c37-36f0a472deb3',
-    'in_file': 'dcbdfe3c-9b88-584b-927f-b7a7ad167834',
-    'project': 'd1005a35-ec29-5f77-b5ba-01ee90f3c86b',
-    'bm25': 'cb55ac19-23b0-5ef7-ba70-c01caf04340e',
-    'embedding': 'c6321169-82f8-5c88-b28f-05616610854d',
-    'mix': 'e659157d-017c-5b70-9098-f10e9fe450ca',
-    'repo_coder': '192fe59f-305f-51df-83f1-a7c647b5930a',
+    'no_context': '69e6a008-ea77-5237-8079-f2d8d8693c5a',
+    'callee_func': '9fdea6ea-4a99-521a-8d48-58543fc316a7',
+    'callee_sig': 'd07a6bcc-a761-5481-a630-1c0986cad095',
+    'caller_func': 'b706af8b-0fde-525b-9124-fe782efa3001',
+    'caller_sig': 'dd68fe30-53e0-5630-abdf-d96eef44060a',
+    'in_file': 'c0605da8-3ce0-5c6c-91ed-f37ac9ebf150',
+    'project': 'dbd1f5fe-c0c2-59f5-a1cd-973e0494adc5',
+    'bm25': '9a41fac2-ac19-5e81-880c-f0cb45963d29',
+    'embedding': 'ad3307cf-93c6-58ee-8ca3-b80ca830482e',
+    'mix': 'ded73010-93b8-567f-b96e-07b0046e6dbb',
+    'repo_coder': '87fc4553-36ac-5030-87a7-7393535ed67c',
 }
 
 UTILS_GLOB = 'src/a2a/utils/**'

@@ -108,7 +108,7 @@ VERIFIER_FAKE_CLIENT_ENV = 'TASKGEN_VERIFIER_FAKE_CLIENT'
 
 #: uuid5 namespace for the shared staging directory name. Keyed on the carve,
 #: so two scopes over one repo stage side by side instead of overwriting.
-_STAGING_NS = uuid.uuid5(uuid.NAMESPACE_URL, 'mrgctx.taskgen.staging')
+_STAGING_NS = uuid.uuid5(uuid.NAMESPACE_URL, 'triton.taskgen.staging')
 
 
 @dataclass(frozen=True)

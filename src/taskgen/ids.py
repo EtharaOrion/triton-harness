@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 
 #: Fixed namespace for every id this package mints.
-NS = uuid.uuid5(uuid.NAMESPACE_URL, 'mrgctx.taskgen')
+NS = uuid.uuid5(uuid.NAMESPACE_URL, 'triton.taskgen')
 
 #: The eleven harness context-provisioning conditions, in canonical order.
 #: Five are `eval_llm.py`'s context_type enum and four `eval_rag.py`'s rag_type

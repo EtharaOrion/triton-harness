@@ -56,7 +56,7 @@ def _write_entry(root: Path, entry_id: str = 'aaaaaaaa-1111-5111-8111-1111111111
     (d / 'task.toml').write_text(textwrap.dedent(f"""
         schema_version = "1.4"
         [task]
-        name = "mrgctx/python-a2a-python__apply_history_length__no_context"
+        name = "triton/python-a2a-python__apply_history_length__no_context"
         [metadata]
         id = "{entry_id}"
         name = "python-a2a-python__apply_history_length__no_context"
@@ -249,7 +249,7 @@ def _write_go_entry(root: Path, entry_id: str, condition: str = 'no_context') ->
     (d / 'task.toml').write_text(textwrap.dedent(f"""
         schema_version = "1.4"
         [task]
-        name = "mrgctx/go-multigres__assignConnectionID__{condition}"
+        name = "triton/go-multigres__assignConnectionID__{condition}"
         [metadata]
         id = "{entry_id}"
         name = "go-multigres__assignConnectionID__{condition}"

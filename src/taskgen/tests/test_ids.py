@@ -12,7 +12,7 @@ ARGS = ('python-a2a-python', 'src/a2a/utils/task.py', '', 'apply_history_length'
 
 
 def test_namespace_is_the_documented_uuid5():
-    assert NS == uuid.uuid5(uuid.NAMESPACE_URL, 'mrgctx.taskgen')
+    assert NS == uuid.uuid5(uuid.NAMESPACE_URL, 'triton.taskgen')
 
 
 def test_entry_id_is_deterministic():

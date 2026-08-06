@@ -80,7 +80,7 @@ def test_task_toml_parses_with_the_family_a_schema(emitted):
         assert data['metadata']['context_budget_tokens'] == 100000
         assert data['metadata']['tokenizer'] == 'chars4'
         assert data['metadata']['seed'] == 0
-        assert data['task']['name'] == f'mrgctx/{e.slug}'
+        assert data['task']['name'] == f'triton/{e.slug}'
         assert data['verifier']['network_mode'] == 'allowlist'
         assert data['agent']['allowed_hosts'] == ['172.17.0.1']
         assert data['environment']['network_mode'] == 'public'

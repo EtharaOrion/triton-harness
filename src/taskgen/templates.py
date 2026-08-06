@@ -84,7 +84,7 @@ TASK_TOML = '''# Harbor task -- {slug}
 schema_version = "1.4"
 
 [task]
-name = "mrgctx/{slug}"
+name = "triton/{slug}"
 version = "1.0.0"
 description = "Regenerate the carved-out {carve_scope} {func} of {upstream} under the {condition} context-provisioning condition."
 authors = []

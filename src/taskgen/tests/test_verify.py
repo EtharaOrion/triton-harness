@@ -61,7 +61,7 @@ def _write_entry(root: Path, entry_id: str, condition: str, *, carve_body: str =
         textwrap.dedent(f"""
         schema_version = "1.4"
         [task]
-        name = "mrgctx/python-a2a-python__apply_history_length__{condition}"
+        name = "triton/python-a2a-python__apply_history_length__{condition}"
         [metadata]
         id = "{entry_id}"
         name = "python-a2a-python__apply_history_length__{condition}"
