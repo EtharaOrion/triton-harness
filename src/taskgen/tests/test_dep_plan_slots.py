@@ -284,6 +284,85 @@ def test_the_c_prompt_states_the_slots_the_gate_will_enforce():
     assert '4.3' in prompt
 
 
+def test_the_c_prompt_says_install_commands_do_not_compile_the_graded_sources():
+    """The live quality failure, as an assertion on the ASK.
+
+    A model resolved c with `install_commands=[{"tool":"make","args":[]}]`; the
+    measure image ran `RUN make`, the build root has no default target, and all
+    three refine attempts kept the step. Nothing in the prompt had ever said
+    what install_commands are FOR, so the model had no reason to drop it. This
+    is guidance, not the answer: the convention is stated, the plan is not.
+    """
+    prompt = R.build_user_prompt(
+        lang='c',
+        toolchain_capabilities=list(C.BAKED_CAPABILITIES),
+        manifest_files={'Makefile': 'all:\n\t$(CC) -o xs\n'},
+        test_paths=['tests/unit/gc_test.c'],
+        framework='make',
+        required_slots=list(resolver_inputs.required_plan_slots(B.get('c'))),
+    )
+
+    assert 'install_commands must NOT compile the graded sources' in prompt
+    assert 'USUALLY EMPTY' in prompt
+    assert 'never a bare "make" or "make all"' in prompt
+    assert 'makes the whole plan unbuildable' in prompt
+    assert 'apt_packages lists ONLY system libraries' in prompt
+
+
+def test_the_system_prompt_states_the_install_versus_build_principle():
+    """The general convention lives once, in the language-agnostic prompt."""
+    system = R.SYSTEM_PROMPT
+
+    assert 'INSTALL PREPARES, THE TEST COMMAND BUILDS' in system
+    assert 'NOT for compiling the repository' in system
+    assert 'USUALLY EMPTY' in system
+    assert '`make` / `make all` / `cmake --build .`' in system
+    assert 'makes the whole plan unbuildable' in system
+    assert 'DELETE that step rather than patching around it' in system
+
+
+def test_the_install_guidance_names_no_repo_and_no_carved_path():
+    """Leak-safe: build CONVENTIONS, never this repo's answer."""
+    blob = R.SYSTEM_PROMPT + '\n'.join(C.REQUIRED_PLAN_SLOTS)
+
+    for secret in (
+        'c-xs', 'src/runtime', 'xs_', '#include', 'test-conformance',
+        'test-regression', 'test-unit', 'BearSSL', 'msgpack',
+    ):
+        assert secret not in blob
+
+
+def test_the_guidance_does_not_dictate_the_canonical_plan():
+    """Convergence must be EARNED. The prompt never spells c's own answer."""
+    assert GOOD_PLAN.install_commands == ()
+    for verbatim in ('-lm -lpthread -ldl', C.TEST_COMMAND):
+        assert verbatim not in R.SYSTEM_PROMPT
+
+
+def test_the_canonical_c_plan_still_satisfies_the_guidance_it_now_states():
+    """The plan the guidance points at is the one the gap already renders."""
+    plugin = B.get('c')
+    assert GOOD_PLAN.install_commands == ()
+    assert GOOD_PLAN.apt_packages == ()
+    plugin.validate_dep_plan(GOOD_PLAN)
+    assert 'RUN make\n' not in plugin.render_gap(GOOD_PLAN) + '\n'
+
+
+def test_a_bare_make_install_step_is_what_the_guidance_warns_about():
+    """The rejected shape stays SCHEMA-valid -- only guidance can prevent it.
+
+    Proving this keeps the fix honest: no validator was quietly tightened to
+    ban a `make` step, because a repo whose plan genuinely needs one must still
+    be expressible. The prompt is the only thing that changed.
+    """
+    bare_make = dataclasses.replace(
+        GOOD_PLAN, install_commands=(depplan.InstallCommand(tool='make', args=()),),
+    )
+    depplan.validate(bare_make)
+    B.get('c').validate_dep_plan(bare_make)
+    assert 'RUN make' in B.get('c').render_gap(bare_make)
+
+
 def test_the_stated_slots_carry_no_repo_source():
     """The slot list comes off the PLUGIN, so no repo byte can ride along."""
     slots = resolver_inputs.required_plan_slots(B.get('c'))

@@ -143,6 +143,16 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'the repo builds with, e.g. "-lm -lpthread -ldl"',
     'build_flags["make_version"] must be a non-empty string: the GNU make '
     'version the base image ships, e.g. "4.3"',
+    'install_commands must NOT compile the graded sources -- test_invocation '
+    'builds and runs the suite itself -- so for a make-driven repo this list '
+    'is USUALLY EMPTY. Add a step only to PREPARE the environment (fetch or '
+    'vendor a dependency); never a bare "make" or "make all" unless a build '
+    'file at the build root declares that default target and the plan needs '
+    'its output first. A build step that cannot succeed makes the whole plan '
+    'unbuildable, not merely suboptimal',
+    'apt_packages lists ONLY system libraries the sources need that the base '
+    'image lacks; the toolchain above is already baked in, so naming it here '
+    'buys nothing and costs a network fetch',
     'package_manager must be one of: cmake, make',
     'test_invocation["command"] must be a non-empty list of argv tokens: the '
     'command that runs the whole graded suite, e.g. ["make", "test"]',
