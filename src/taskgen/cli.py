@@ -27,7 +27,10 @@ from . import clone, verify
 from . import emit as emit_mod
 from .contexts import CONTEXT_TYPES
 from .emit import DEFAULT_BUDGET, DEFAULT_SEED, emit_all
+from .env_resolver import EnvResolver, ResolveRefused
 from .langs import base
+from .llm_resolver import LlmEnvResolver, ResolverTransportError
+from .resolver_inputs import base_capabilities
 from .scope import CarveScope
 
 #: Where `--repo-url` clones land by default: the same directory `verify`
@@ -84,9 +87,76 @@ def resolve_source(args, echo=print) -> tuple[Path, str | None, str | None, str 
     return repo, source, '', 'floating'
 
 
+def build_env_resolver(args, *, echo=print) -> EnvResolver:
+    """The real resolver for a `--resolve-env` run: config in, client out.
+
+    The ONLY place a generate run learns how to reach a model, at the cli
+    boundary so `emit`'s import graph stays free of anything that opens a socket.
+
+    `--llm-config` is REQUIRED, unlike `--verifier`'s: a wrong proxy costs that
+    feature a bundle, but costs this one the task's floor, and a run that
+    resolved against whatever `.llm_config` was lying in the repo root would pin
+    a lock nobody chose.
+    """
+    if not args.llm_config:
+        raise SystemExit(
+            '--resolve-env requires --llm-config PATH: the environment is '
+            'resolved by a model, and there is no default proxy to fall back '
+            'to. Point it at the JSON naming your bridge, e.g. '
+            '--llm-config .llm_config/claude-code-oauth.json'
+        )
+    try:
+        emit_mod.assert_resolve_env_supported(args.lang)
+    except base.LangError as exc:
+        raise SystemExit(f'--resolve-env: {exc}') from exc
+
+    from verifier.llm_config import LLMConfigError, client_from_config, load_llm_config
+
+    try:
+        cfg = load_llm_config(args.llm_config)
+    except LLMConfigError as exc:
+        raise SystemExit(f'--resolve-env: {exc}') from exc
+
+    endpoint = str(cfg['base_url'])
+    echo(f'resolve-env  asking {cfg["model"]} via {endpoint}')
+    return LlmEnvResolver(
+        client=client_from_config(cfg),
+        capabilities=base_capabilities(base.get(args.lang)),
+        endpoint=endpoint,
+        echo=echo,
+    )
+
+
 def cmd_generate(args) -> int:
     repo, repo_url, commit, clone_kind = resolve_source(args)
-    entries = emit_all(
+    resolver = build_env_resolver(args) if args.resolve_env else None
+    try:
+        entries = _emit(args, repo, repo_url, commit, clone_kind, resolver)
+    except ResolveRefused as exc:
+        # SHIP or REFUSE: the measure phase raises before any entry or lock is
+        # written, so this path leaves the output directory empty on purpose.
+        print(f'REFUSE({exc.reason})', file=sys.stderr)
+        return 3
+    except ResolverTransportError as exc:
+        raise SystemExit(f'--resolve-env: {exc}') from exc
+
+    first = entries[0]
+    print(f'language    {first.lang}')
+    print(f'carve scope {first.carve_scope}')
+    print(f'target      {first.target_relpath}::{first.slug.split("__")[1]}')
+    print(f'carved      {len(first.carved_relpaths)} file(s)')
+    for rel in first.carved_relpaths:
+        print(f'  - {rel}')
+    print(f'graded ids  {len(first.nodeids)}')
+    print(f'out         {Path(args.out).resolve()}')
+    for e in entries:
+        print(f'  {e.entry_id}  {e.context_type}')
+    print(f'{len(entries)} entries written')
+    return 0
+
+
+def _emit(args, repo, repo_url, commit, clone_kind, resolver):
+    return emit_all(
         repo=repo,
         out=args.out,
         package_base=args.package_base,
@@ -110,20 +180,8 @@ def cmd_generate(args) -> int:
         llm_config=args.llm_config,
         verifier_min_criteria=args.verifier_min_criteria,
         resolve_env=args.resolve_env,
+        resolver=resolver,
     )
-    first = entries[0]
-    print(f'language    {first.lang}')
-    print(f'carve scope {first.carve_scope}')
-    print(f'target      {first.target_relpath}::{first.slug.split("__")[1]}')
-    print(f'carved      {len(first.carved_relpaths)} file(s)')
-    for rel in first.carved_relpaths:
-        print(f'  - {rel}')
-    print(f'graded ids  {len(first.nodeids)}')
-    print(f'out         {Path(args.out).resolve()}')
-    for e in entries:
-        print(f'  {e.entry_id}  {e.context_type}')
-    print(f'{len(entries)} entries written')
-    return 0
 
 
 def cmd_verify(args) -> int:
@@ -209,10 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
                           'diff -r-reproducible and needs an LLM proxy. Everything else '
                           'the run emits is unchanged')
     gen.add_argument('--llm-config', default=None, metavar='PATH',
-                     help='--verifier: the JSON config naming the LLM proxy '
-                          '(model, base_url, api_key). Default: the git-ignored '
-                          '.llm_config at the repo root. Missing or unreachable is a '
-                          'LOUD failure, never a silently empty bundle')
+                     help='the JSON config naming the LLM proxy (model, base_url, '
+                          'api_key). --verifier defaults it to the git-ignored '
+                          '.llm_config at the repo root; --resolve-env REQUIRES it '
+                          'explicitly, because the environment it resolves is the '
+                          "task's floor. Missing or unreachable is a LOUD failure, "
+                          'never a silently empty bundle or an unvouched-for lock')
     gen.add_argument('--verifier-min-criteria', type=int,
                      default=emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA, metavar='INT',
                      help='--verifier: how many rubric criteria must survive '

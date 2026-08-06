@@ -38,6 +38,7 @@ from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
+    'BAKED_CAPABILITIES',
     'CPlugin',
     'C_MEASURE_DEP_PLAN',
     'GRADER_FINGERPRINT_GLOBS',
@@ -62,6 +63,15 @@ TEST_COMMAND = 'make test-conformance test-regression test-unit'
 #: carved files in RUNTIME_SRCS/ASYNC_SRCS and defines the three graded
 #: targets; letting a solver rewrite it would let them redefine the task.
 GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('tests/**', 'Makefile')
+
+#: What harbor-base already provides, as `--resolve-env` states it to a model.
+#: Sorted and version-exact, so the same prompt is built on every run.
+BAKED_CAPABILITIES: tuple[str, ...] = (
+    'GNU Make 4.3',
+    'apt-get (build time only; the graded run has no network)',
+    'gcc 13.3.0 (aarch64)',
+    'libc6-dev, providing -lm -lpthread -ldl',
+)
 
 #: The measure image's dep-warm slot. c has no warm stage at all (its whole
 #: dependency set is libc), so this comment IS the slot's content -- it is not
@@ -139,6 +149,12 @@ class CPlugin(B.LangPlugin):
     #: See `emit.plan_carve`: whole-suite plugins can declare a set of intact-
     #: tree globs to fingerprint. Empty for rust; non-empty here.
     grader_fingerprint_globs: ClassVar[tuple[str, ...]] = GRADER_FINGERPRINT_GLOBS
+
+    #: The same facts `toolchain_spec().install_block` asserts at build time,
+    #: as the capability list `--resolve-env` shows the model. apt is listed
+    #: because principle 5 allows apt and ONLY apt, and a model not told so
+    #: reaches for curl.
+    baked_capabilities: ClassVar[tuple[str, ...]] = BAKED_CAPABILITIES
 
     test_command: ClassVar[str] = TEST_COMMAND
     unit_names: ClassVar[tuple[str, ...]] = UNIT_NAMES

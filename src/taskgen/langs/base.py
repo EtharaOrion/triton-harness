@@ -434,6 +434,12 @@ class LangPlugin(abc.ABC):
     #: is not provably carved is leak route C.
     synthesizes_git: ClassVar[bool] = False
 
+    #: What the BASE IMAGE already ships, phrased for `--resolve-env`'s prompt.
+    #: Declared, not probed from a container: the plugin already had to know it
+    #: to write `toolchain_spec().install_block`, and a second derivation is how
+    #: the prompt and the image start disagreeing about what is installed.
+    baked_capabilities: ClassVar[tuple[str, ...]] = ()
+
     def __init__(self) -> None:
         if not self.name:
             raise LangError(f'{type(self).__name__}: name is required')
