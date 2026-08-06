@@ -399,7 +399,7 @@ def test_a_refusal_raises_and_emits_neither_task_nor_lock(plan, tmp_path):
 
 def test_the_flag_refuses_a_language_with_no_rendered_gap(plan, tmp_path):
     rust_plan = dataclasses.replace(plan, lang='rust')
-    with pytest.raises(B.LangError, match='only supported for c in this slice'):
+    with pytest.raises(B.LangError, match='only supported for c, cpp, java'):
         emit._measure_and_pin(
             rust_plan, B.get('rust'), tmp_path / 'out', echo=lambda *_: None,
             resolve_env=True, resolver=StubResolver(C.C_MEASURE_DEP_PLAN),
@@ -407,7 +407,7 @@ def test_the_flag_refuses_a_language_with_no_rendered_gap(plan, tmp_path):
 
 
 def test_the_flag_refuses_a_parser_backed_language_before_it_carves(repo, tmp_path):
-    with pytest.raises(B.LangError, match='only supported for c in this slice'):
+    with pytest.raises(B.LangError, match='only supported for c, cpp, java'):
         emit.emit_all(repo=repo, out=tmp_path / 'out', lang='python', resolve_env=True)
 
 

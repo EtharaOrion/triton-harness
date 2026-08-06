@@ -108,7 +108,7 @@ VERIFIER_SUBDIR = 'solution/verifier'
 #: whitelist rather than a `hasattr(plugin, 'render_gap')` probe because every
 #: plugin HAS the method -- `langs.base` defines it to raise -- so a probe would
 #: green-light a language whose only implementation is the refusal.
-RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c'})
+RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c', 'cpp', 'java'})
 
 
 def assert_resolve_env_supported(lang: str) -> None:
@@ -125,8 +125,8 @@ def assert_resolve_env_supported(lang: str) -> None:
         f'--resolve-env is only supported for '
         f'{", ".join(sorted(RESOLVE_ENV_LANGS))} in this slice, not {lang!r}: '
         "rendering a measure image from a DepPlan needs the plugin's "
-        'render_gap, and only c has one proven byte-identical to the gap it '
-        'hardcodes today'
+        'render_gap, and only those langs have one proven byte-identical to '
+        'the gap they hardcode today'
     )
 
 #: Test/dev hook: `module:callable` returning a ModelClient, used INSTEAD of the
