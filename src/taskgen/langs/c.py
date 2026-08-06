@@ -30,14 +30,18 @@ which mangled symbols could survive.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar, Mapping
 
+from ..depplan import DepPlan, FlagValue, canonicalize, validate
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
     'CPlugin',
+    'C_MEASURE_DEP_PLAN',
     'GRADER_FINGERPRINT_GLOBS',
+    'MEASURE_NO_WARM_COMMENT',
     'TEST_COMMAND',
     'UNIT_NAMES',
 ]
@@ -59,8 +63,68 @@ TEST_COMMAND = 'make test-conformance test-regression test-unit'
 #: targets; letting a solver rewrite it would let them redefine the task.
 GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('tests/**', 'Makefile')
 
+#: The measure image's dep-warm slot. c has no warm stage at all (its whole
+#: dependency set is libc), so this comment IS the slot's content -- it is not
+#: `DepWarmSpec.render()`, which speaks about a COPY that never happens here.
+MEASURE_NO_WARM_COMMENT = '# no warmed dependencies (harbor-base ships gcc + make + libc6-dev)'
+
+
+def _c_measure_dep_plan() -> DepPlan:
+    """c's own environment as the record a resolver would have to produce.
+
+    The fixed point of the exercise: fed to `CPlugin.render_gap`, this plan
+    reproduces the gap bytes `render_measure_dockerfile` hardcodes today.
+
+    `apt_packages` is EMPTY and must stay empty. libc6-dev is baked into
+    harbor-base, and this field means "packages the gap INSTALLS" -- listing a
+    baked package would make the gap emit an `apt-get` line today's bytes do not
+    contain, and that line would need network in the measure build.
+
+    `toolchain_version` is the full gcc triple, but the image's pin asserts
+    major.minor only: harbor-base may move the patch level, and a pin that
+    failed the build on gcc 13.3.1 would be a false alarm, not a caught drift.
+    """
+    plan = DepPlan(
+        lang='c',
+        toolchain_version='13.3.0',
+        package_manager='make',
+        manifest_files=('Makefile',),
+        apt_packages=(),
+        install_commands=(),
+        build_flags=(
+            ('link_libraries', '-lm -lpthread -ldl'),
+            ('make_version', '4.3'),
+        ),
+        test_invocation=(('command', tuple(TEST_COMMAND.split())),),
+        needs_git_metadata=False,
+    )
+    validate(plan)
+    return canonicalize(plan)
+
+
+#: c's canonical, validated environment plan. Module-level so a test can assert
+#: the rendered gap against it without re-deriving the facts it states.
+C_MEASURE_DEP_PLAN: DepPlan = _c_measure_dep_plan()
+
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
 _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
+
+#: How the gap's prose names each package manager `depplan` allows for c.
+_MANAGER_LABELS: Mapping[str, str] = {'make': 'GNU Make', 'cmake': 'CMake'}
+
+
+def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
+    """A build flag the gap's rendered text needs, or a refusal to render at all."""
+    for name, value in build_flags:
+        if name == key:
+            if isinstance(value, str) and value:
+                return value
+            break
+    raise B.LangError(
+        f'the c gap needs build_flags[{key!r}] as a non-empty string; a plan '
+        'without it would render a Dockerfile comment with a hole in it, and a '
+        'hole in the toolchain description is how a base swap goes unnoticed'
+    )
 
 
 class CPlugin(B.LangPlugin):
@@ -439,7 +503,84 @@ class CPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
-    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+    def render_gap(self, plan: DepPlan) -> str:
+        """c's toolchain + dependency bytes, rendered from a plan instead of a literal.
+
+        c is the smallest possible gap and that is exactly why it is the one to
+        prove the seam on: harbor-base already ships gcc and GNU Make, and the
+        repo links only against libc, so NOTHING is installed and the whole gap
+        is a version echo, a pin assert and a "nothing was warmed" comment. If
+        the seam cannot reproduce those bytes it cannot reproduce anyone's.
+
+        The apt and install blocks below are unreachable for
+        `C_MEASURE_DEP_PLAN` (both fields are empty by construction) and are
+        rendered from the plan for the case where a resolved plan does declare
+        them. They are the only lines here that are not in today's image.
+
+        The ENV/WORKDIR tail comes from `toolchain_spec()` rather than being
+        respelled: those are placement, not provisioning, and the plan has no
+        business moving them.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the c gap cannot render a {plan.lang!r} plan; a gap is the one '
+                'part of a Dockerfile that is language-specific by definition'
+            )
+
+        pin = '.'.join(plan.toolchain_version.split('.')[:2])
+        if pin.count('.') != 1:
+            raise B.LangError(
+                f'toolchain_version {plan.toolchain_version!r} has no major.minor '
+                'to pin gcc against; a one-component version would make the pin '
+                'assert match every 13.x the base image ever ships'
+            )
+        manager = plan.package_manager
+        lines = [
+            f'# harbor-base already ships gcc {plan.toolchain_version} and '
+            f'{_MANAGER_LABELS[manager]} {_flag_str(plan.build_flags, "make_version")} '
+            'on aarch64.',
+            f'# The c-xs repo compiles with '
+            f'{_flag_str(plan.build_flags, "link_libraries")} only (libc6-dev), so',
+            '# there is nothing to install here; the version echo makes the layer',
+            '# non-empty and prints the exact toolchain grades will use.',
+            f'RUN gcc --version | head -1 && {manager} --version | head -1',
+            '# gcc is baked into the base image, so there is no shim to reorder --',
+            '# but an UNASSERTED compiler is how a base swap moves the published',
+            '# numbers with nothing failing. Run as a login shell because that is',
+            "# how harbor's test.sh resolves the compiler at grade time.",
+            'RUN set -eux; \\',
+            '    g="$(bash -lc \'gcc --version | head -1\')"; \\',
+            '    case "$g" in \\',
+            f'      *{pin}*) echo "TOOLCHAIN PIN OK (login shell): $g" ;; \\',
+            f'      *) echo "TOOLCHAIN PIN FAILED (login shell): got $g want gcc {pin}"'
+            ' >&2; exit 42 ;; \\',
+            '    esac',
+        ]
+        if plan.apt_packages:
+            lines.append(
+                'RUN apt-get update && apt-get install -y --no-install-recommends '
+                + ' '.join(plan.apt_packages)
+                + ' && rm -rf /var/lib/apt/lists/*'
+            )
+        lines += [
+            ' '.join((f'RUN {command.tool}', *command.args)).rstrip()
+            for command in plan.install_commands
+        ]
+
+        toolchain = replace(
+            self.toolchain_spec(), install_block='\n'.join(lines),
+        ).render()
+        return '\n'.join([
+            toolchain,
+            '',
+            f'# no warmed dependencies (harbor-base ships gcc + {manager} + libc6-dev)',
+        ])
+
+    def render_measure_dockerfile(
+        self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
+    ) -> str:
         """The stripped Dockerfile for the never-ship measure image.
 
         Same toolchain as the shipped image; the intact tree lands directly
@@ -447,9 +588,17 @@ class CPlugin(B.LangPlugin):
         leak gate, NO tripwire scan, NO carve-receipt assert: on the intact
         tree all three would fire by construction (they exist to catch carved
         bytes, and the intact tree IS carved bytes).
+
+        `dep_plan` swaps the hardcoded gap for `render_gap(dep_plan)` in the
+        SAME slot and touches nothing else. `dep_plan=None` is what emit.py
+        passes and renders the bytes it always did.
         """
         base_image = self.toolchain_spec().base_image
-        toolchain = self.toolchain()
+        gap = (
+            '\n'.join([self.toolchain(), '', MEASURE_NO_WARM_COMMENT])
+            if dep_plan is None
+            else self.render_gap(dep_plan)
+        )
         return '\n'.join([
             '# syntax=docker/dockerfile:1.7',
             f'# Harbor MEASURE image -- {env.repo_name} ({self.name}). NEVER SHIP.',
@@ -461,9 +610,7 @@ class CPlugin(B.LangPlugin):
             '',
             f'FROM {base_image} AS measure',
             '',
-            toolchain,
-            '',
-            '# no warmed dependencies (harbor-base ships gcc + make + libc6-dev)',
+            gap,
             '',
             f'# The measure phase points {env.repo_context} at the INTACT repo directly,',
             f'# not a staging tree, so there is no repo/ prefix to copy from. That is',

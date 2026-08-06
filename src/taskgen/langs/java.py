@@ -78,6 +78,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Mapping
 
+from ..depplan import DepPlan
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
@@ -688,7 +689,9 @@ class JavaPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
-    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+    def render_measure_dockerfile(
+        self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
+    ) -> str:
         """The stripped Dockerfile for the never-ship measure image (phase 1).
 
         Same toolchain (JDK25 install byte-identical to the graded one for
@@ -704,6 +707,12 @@ class JavaPlugin(B.LangPlugin):
         `measure_image_tag` marks the image as never-ship and `measure.py`
         deletes it in a finally block.
         """
+        if dep_plan is not None:
+            raise B.LangError(
+                f'the {self.name!r} measure image does not render its gap from a '
+                'DepPlan yet; only c does. Passing one here would silently '
+                'ignore it, which is worse than refusing it'
+            )
         base_image = self.toolchain_spec().base_image
         toolchain = self.toolchain()
         return '\n'.join([

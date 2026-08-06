@@ -45,6 +45,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar, Mapping
 
+from ..depplan import DepPlan
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
@@ -493,7 +494,9 @@ class RustPlugin(B.LangPlugin):
 
         return (wabt_install, '', prune, '', vendor, '', strings_assert)
 
-    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+    def render_measure_dockerfile(
+        self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
+    ) -> str:
         """The stripped Dockerfile for the never-ship measure image.
 
         Same toolchain + wabt + prune as the shipped image, but the vendor
@@ -507,6 +510,12 @@ class RustPlugin(B.LangPlugin):
         (they exist to catch carved bytes); the measure image is built ONLY to
         count `tests_total` and is deleted in `measure.py`'s finally block.
         """
+        if dep_plan is not None:
+            raise B.LangError(
+                f'the {self.name!r} measure image does not render its gap from a '
+                'DepPlan yet; only c does. Passing one here would silently '
+                'ignore it, which is worse than refusing it'
+            )
         base_image = self.toolchain_spec().base_image
         toolchain = self.toolchain()
         pre = self.pre_leakgate_blocks(env)

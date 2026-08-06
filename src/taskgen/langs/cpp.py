@@ -67,6 +67,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Mapping
 
+from ..depplan import DepPlan
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
@@ -513,7 +514,9 @@ class CppPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
-    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+    def render_measure_dockerfile(
+        self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
+    ) -> str:
         """The stripped Dockerfile for the never-ship measure image.
 
         Same toolchain (apt+kitware) as the shipped image; the intact tree lands
@@ -522,6 +525,12 @@ class CppPlugin(B.LangPlugin):
         tree all three would fire by construction (they exist to catch carved
         bytes, and the intact tree IS carved bytes).
         """
+        if dep_plan is not None:
+            raise B.LangError(
+                f'the {self.name!r} measure image does not render its gap from a '
+                'DepPlan yet; only c does. Passing one here would silently '
+                'ignore it, which is worse than refusing it'
+            )
         base_image = self.toolchain_spec().base_image
         toolchain = self.toolchain()
         return '\n'.join([

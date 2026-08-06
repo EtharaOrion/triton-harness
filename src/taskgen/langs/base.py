@@ -52,6 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Literal, Mapping
 
+from ..depplan import DepPlan
+
 __all__ = [
     'DepWarmSpec',
     'EnvSpec',
@@ -575,7 +577,38 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
         """
         return ()
 
-    def render_measure_dockerfile(self, env: EnvSpec) -> str:
+    def render_gap(self, plan: DepPlan) -> str:
+        """The language GAP: the toolchain/dependency provisioning bytes, from a plan.
+
+        A rendered Dockerfile is two things welded together. Most of it is FIXED
+        SCAFFOLDING that every language shares and that no resolver may touch --
+        the COPY of the tree, the leak gate, the carve-receipt assert, the floor.
+        The rest is the GAP: how this language's compiler, its system packages
+        and its dependencies get into the image. Only the gap varies per repo,
+        and only the gap is a candidate for being RESOLVED rather than written by
+        hand -- which is why it is a method taking a `DepPlan` instead of a
+        free-form string a resolver could hand back.
+
+        The contract is deliberately narrow: `plan` in, Dockerfile INSTRUCTIONS
+        out, no trailing newline, and nothing else. The plan has already passed
+        `depplan.validate`, so no argument here can carry a shell metacharacter
+        and no tool outside the per-language allowlist can be named.
+
+        The default raises `NotImplementedError` rather than returning '': a
+        plugin whose gap is genuinely empty must say so by emitting the fixed
+        lines it emits today, because silently rendering nothing would turn a
+        missing implementation into an image with no toolchain in it.
+        """
+        raise NotImplementedError(
+            f'the {self.name!r} plugin does not render its gap from a DepPlan; '
+            'its toolchain and dependency bytes are still hardcoded in '
+            'render_measure_dockerfile. Implement render_gap (and prove it '
+            'byte-identical to those bytes) before threading a plan through'
+        )
+
+    def render_measure_dockerfile(
+        self, env: EnvSpec, *, dep_plan: DepPlan | None = None,
+    ) -> str:
         """The stripped Dockerfile for the never-ship measure image (phase 1).
 
         Only a plugin with `parser_backed = False` needs one: parser-backed
@@ -587,6 +620,16 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
         intact COPY, whatever is needed to compile the tests, and a COPY of
         measure.sh -- NO leak gate, NO strings-assert, NO tripwire scan (all
         three would fire on the intact tree by construction).
+
+        `dep_plan` is the seam for a RESOLVED gap, and it is opt-in for a
+        reason. `dep_plan is None` -- the only thing `emit.py` ever passes --
+        renders exactly the bytes it rendered before this parameter existed, so
+        the shipped path cannot move because a resolver was wired up somewhere
+        else. When a plan IS passed, the plugin substitutes `render_gap(plan)`
+        for its hardcoded gap and leaves every line of fixed scaffolding alone;
+        for a plan describing the environment the plugin already hardcodes, the
+        two must come out byte-identical (`tests/test_render_gap.py`), which is
+        what makes the substitution reviewable rather than a leap of faith.
         """
         raise LangError(
             f'{self.name!r} does not render a measure dockerfile; whole-suite '
