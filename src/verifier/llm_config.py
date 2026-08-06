@@ -1,6 +1,6 @@
 """`.llm_config` loading — the only place the verifier learns where its LLM lives.
 
-The dotfile is a JSON object (seeded from the proxy's `claude-code-oauth.json`)::
+The config is a JSON object (copy the committed `.llm_config/example.json`)::
 
     {"model": "anthropic/claude-opus-4-8", "base_url": "http://127.0.0.1:8765",
      "api_key": "...", "timeout": 600, "num_retries": 2}
@@ -69,14 +69,23 @@ def client_from_config(cfg: dict[str, Any]) -> LiteLLMClient:
     )
 
 
+DEFAULT_CONFIG_FILE = 'claude-code-oauth.json'
+
+
 def resolve_config(explicit_path: str | Path | None = None) -> dict[str, Any]:
-    """Explicit path > `.llm_config` in the repo root > a loud failure."""
+    """Explicit path > `.llm_config` (file, or `claude-code-oauth.json` inside a
+    `.llm_config/` directory) in the repo root > a loud failure."""
     if explicit_path is not None:
         return load_llm_config(explicit_path)
     root_cfg = _repo_root() / DEFAULT_CONFIG_NAME
     if root_cfg.is_file():
         return load_llm_config(root_cfg)
+    if root_cfg.is_dir():
+        inner = root_cfg / DEFAULT_CONFIG_FILE
+        if inner.is_file():
+            return load_llm_config(inner)
     raise LLMConfigError(
         f"the verifier requires an LLM config/proxy: no config given and no "
-        f"{DEFAULT_CONFIG_NAME} at {root_cfg}. Seed one from the proxy's "
-        f"claude-code-oauth.json (it is git-ignored).")
+        f"usable {DEFAULT_CONFIG_NAME} at {root_cfg}. Copy the committed "
+        f".llm_config/example.json to .llm_config/{DEFAULT_CONFIG_FILE} "
+        f"(git-ignored) or pass --llm-config PATH.")

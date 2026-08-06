@@ -11,7 +11,7 @@ instead of an API key, by:
 
 Start it with ``./claude_code_bridge.sh start`` (or ``python -m
 claude_code_bridge`` from the ``proxy/`` directory) and point trajectory
-generation at ``proxy/claude-code-oauth.json``.
+generation at ``.llm_config/claude-code-oauth.json``.
 """
 
 from .credentials import (

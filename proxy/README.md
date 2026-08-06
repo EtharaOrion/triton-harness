@@ -63,10 +63,14 @@ proxy/
 │   ├── credentials.py             #   OAuth load / refresh / cache + multi-account pool
 │   └── errors.py                  #   Anthropic error classification
 ├── claude_code_bridge.sh          # start | stop | status | check | monitor (background + watchdog)
-├── claude-code-oauth.json         # the LLM config you pass to the harness
 ├── .gitignore                     # ignores runtime artifacts (*.pid, logs/)
 └── README.md                      # this file
 ```
+
+The **LLM config no longer lives here.** It sits in `.llm_config/` at the repo
+root: [`.llm_config/example.json`](../.llm_config/example.json) is the committed
+template, and `.llm_config/claude-code-oauth.json` — the copy you actually pass
+to the harness — is git-ignored.
 
 No new dependencies: the proxy only needs `fastapi`, `uvicorn`, `httpx`, which
 are already in the harness `.venv`.
@@ -97,11 +101,12 @@ cd harness
 proxy/claude_code_bridge.sh start
 proxy/claude_code_bridge.sh status          # /healthz -> {"ok": true, ...}
 
-# 2. set base_url for macOS in proxy/claude-code-oauth.json:
+# 2. copy the template and set base_url for macOS in .llm_config/claude-code-oauth.json:
+cp .llm_config/example.json .llm_config/claude-code-oauth.json
 #      "base_url": "http://host.docker.internal:8765"
 
 # 3. generate trajectories
-LANGUAGE=python uv run multi-swebench-infer proxy/claude-code-oauth.json \
+LANGUAGE=python uv run multi-swebench-infer .llm_config/claude-code-oauth.json \
     --dataset bytedance-research/Multi-SWE-Bench --split python_verified \
     --workspace docker --max-iterations 100
 
@@ -164,8 +169,9 @@ ip -4 addr show docker0 | awk '/inet/ {print $2}'          # e.g. 172.17.0.1/16
 # or authoritatively, the gateway of the default bridge network:
 docker network inspect bridge -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
 ```
-Set that IP as `base_url` in [`proxy/claude-code-oauth.json`](claude-code-oauth.json)
-(the shipped default is already `172.17.0.1:8765`):
+Set that IP as `base_url` in `.llm_config/claude-code-oauth.json` (copied from the
+committed [`.llm_config/example.json`](../.llm_config/example.json), whose shipped
+default is the macOS `127.0.0.1:8765`):
 ```json
 {
   "model": "anthropic/claude-opus-4-8",
@@ -190,12 +196,12 @@ a watchdog restarts it if `/healthz` fails 3× in a row.
 
 ```bash
 cd harness
-LANGUAGE=python uv run multi-swebench-infer proxy/claude-code-oauth.json \
+LANGUAGE=python uv run multi-swebench-infer .llm_config/claude-code-oauth.json \
     --dataset bytedance-research/Multi-SWE-Bench --split python_verified \
     --workspace docker --num-workers 4 --max-iterations 100
 
 # ...or the full pipeline:
-./run_eval.sh --llm-config proxy/claude-code-oauth.json \
+./run_eval.sh --llm-config .llm_config/claude-code-oauth.json \
     --dataset <bundle>.jsonl --ecr-prefix <acct>.dkr.ecr.<region>.amazonaws.com/<repo>
 ```
 Every worker's agent container routes its LLM calls through the one host proxy.
@@ -264,7 +270,8 @@ All optional. Set in the environment before `start` (or in the systemd unit).
 | `AURORA_BRIDGE_READ_TIMEOUT` | `180` | Per-chunk read timeout (s). Raise for very long extended-thinking turns. |
 | `AURORA_BRIDGE_REQUEST_TIMEOUT` | `600` | Overall request timeout (s). |
 
-The **LLM config** ([`claude-code-oauth.json`](claude-code-oauth.json)) must use
+The **LLM config** (`.llm_config/claude-code-oauth.json`, copied from the
+committed [`.llm_config/example.json`](../.llm_config/example.json)) must use
 an `anthropic/` model (so litellm speaks the native Messages API the proxy
 proxies) and a non-empty stub `api_key` (litellm requires one; the proxy
 discards it).

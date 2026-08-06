@@ -4,7 +4,7 @@
 # The bridge exposes an Anthropic-compatible endpoint on the host that injects
 # your Claude Code OAuth subscription token, so trajectory generation runs on
 # the subscription instead of an ANTHROPIC_API_KEY. Point the harness at it
-# with an LLM config whose "base_url" is the bridge (proxy/claude-code-oauth.json).
+# with an LLM config whose "base_url" is the bridge (.llm_config/claude-code-oauth.json).
 #
 # Usage (run from anywhere; paths resolve relative to this script):
 #   proxy/claude_code_bridge.sh check     # validate credentials only
@@ -14,11 +14,11 @@
 #   proxy/claude_code_bridge.sh monitor   # start watchdog only (foreground)
 #
 # After `start`, generate trajectories with the bridge-backed config:
-#   LANGUAGE=python uv run multi-swebench-infer proxy/claude-code-oauth.json \
+#   LANGUAGE=python uv run multi-swebench-infer .llm_config/claude-code-oauth.json \
 #       --dataset bytedance-research/Multi-SWE-Bench --split python_verified \
 #       --workspace docker --max-iterations 100
 #   # ...or via run_eval.sh:
-#   ./run_eval.sh --llm-config proxy/claude-code-oauth.json --dataset <bundle>.jsonl ...
+#   ./run_eval.sh --llm-config .llm_config/claude-code-oauth.json --dataset <bundle>.jsonl ...
 #
 # Multi-account pool (optional):
 #   export AURORA_CC_ACCOUNT_POOL="keychain:Claude Code-credentials:$HOME/.cache/aurora-harness/acc2.json"
@@ -129,7 +129,7 @@ case "$action" in
       echo "[bridge] monitor up (PID $(cat "$MONITOR_PID_FILE"))" >&2
     fi
     echo "[bridge] up on http://${HOST}:${PORT} (PID $(cat "$PID_FILE"))" >&2
-    echo "[bridge] generate trajectories with:  --llm-config proxy/claude-code-oauth.json" >&2
+    echo "[bridge] generate trajectories with:  --llm-config .llm_config/claude-code-oauth.json" >&2
     echo "         (set that config's base_url to the host address your container can reach:" >&2
     echo "          172.17.0.1:${PORT} on Linux/EC2, host.docker.internal:${PORT} on macOS)" >&2
     ;;

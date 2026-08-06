@@ -12,10 +12,12 @@ and additive: `--verifier` (off by default) also authors a
 
 ## Setup
 
+Every command below runs **from the repo root** through `uv run`, which syncs
+the pinned environment before it executes:
+
 ```bash
-cd triton/harness
-uv venv --python 3.12 .venv-taskgen
-VIRTUAL_ENV=.venv-taskgen uv pip install -r src/taskgen/requirements-dev.txt
+uv sync
+uv run taskgen --help
 ```
 
 Python 3.12 is a floor, not a preference: `harbor-tasks/shared/tooling` uses
@@ -25,8 +27,7 @@ arm64 build.
 ## Generate
 
 ```bash
-cd triton/harness
-PYTHONPATH=src ./.venv-taskgen/bin/python -m taskgen.cli generate \
+uv run taskgen generate \
   --repo ../../harbor-tasks/repos-src/python-a2a-python \
   --package-base src/ \
   --file src/a2a/utils/task.py \
@@ -43,7 +44,7 @@ Three further flags are off by default and documented in
 * `--verifier` — also author one verifier bundle and copy it into every entry's
   `solution/verifier/`. Needs an LLM proxy; not `diff -r`-reproducible.
 * `--llm-config PATH` — the JSON naming that proxy (default: `.llm_config` at the
-  repo root).
+  repo root — a file, or a directory holding `claude-code-oauth.json`).
 * `--verifier-min-criteria INT` — how many rubric criteria must survive the
   soundness filter before a bundle ships (default `6`).
 
@@ -52,9 +53,26 @@ Three further flags are off by default and documented in
 `--repo-url` replaces `--repo` when the checkout does not exist yet (exactly one
 of the two is required):
 
+A complete pinned round trip — generate from a public repo, then verify it:
+
 ```bash
-... generate --repo-url https://github.com/a2aproject/a2a-python \
-  --commit <40-char sha> --out .taskgen_out
+# generate from a public repo at a pinned commit (deterministic)
+uv run taskgen generate \
+  --repo-url https://github.com/a2aproject/a2a-python --commit <40-char-sha> \
+  --package-base src/ --file src/a2a/utils/task.py --func apply_history_length \
+  --out .taskgen_out/py-fn
+
+# verify self-clones the pinned commit when no local checkout exists
+uv run taskgen verify --all .taskgen_out/py-fn --lang python --carve-scope function
+```
+
+The floating variant drops the pin and is **not** reproducible — the same
+command generates a different tree once upstream moves:
+
+```bash
+uv run taskgen generate \
+  --repo-url https://github.com/a2aproject/a2a-python --allow-floating \
+  --package-base src/ --out .taskgen_out/py-floating
 ```
 
 The clone lands in `--repos-cache` (default `../../harbor-tasks/repos-src`)
@@ -92,8 +110,7 @@ at all and is byte-identical to what taskgen emitted before cloning existed.
 ## Test
 
 ```bash
-cd triton/harness
-./.venv-taskgen/bin/python -m pytest src/taskgen/tests -q
+uv run pytest src/taskgen/tests -q
 ```
 
 ## The eleven conditions
@@ -136,13 +153,11 @@ Two are deliberate, documented approximations:
 Two runs produce byte-identical trees, directory names included:
 
 ```bash
-cd triton/harness
 for d in /tmp/tg-a /tmp/tg-b; do
-  PYTHONPATH=src ./.venv-taskgen/bin/python -m taskgen.cli generate \
-    --repo ../../harbor-tasks/repos-src/python-a2a-python \
-    --file src/a2a/utils/task.py --func apply_history_length --out "$d"
+  uv run taskgen generate --repo ../../harbor-tasks/repos-src/python-a2a-python \
+    --package-base src/ --file src/a2a/utils/task.py --func apply_history_length --out "$d"
 done
-diff -r /tmp/tg-a /tmp/tg-b   # empty
+diff -r /tmp/tg-a /tmp/tg-b   # empty == deterministic
 ```
 
 What makes that hold: entry ids are `uuid5` over
@@ -179,14 +194,53 @@ still succeeds. The bundle is additive and non-blocking.
 
 That is the only quiet path. A missing, malformed or unreachable `--llm-config`
 proxy — or a language with no soundness executor — fails **loud**; an empty or
-mocked bundle is never emitted in its place. `.llm_config` is a git-ignored JSON
-object, seeded from `proxy/claude-code-oauth.json`, whose `base_url` points at the
-local proxy bridge:
+mocked bundle is never emitted in its place. The config is a JSON object whose
+`base_url` points at the local proxy bridge:
 
 ```json
-{"model": "...", "base_url": "http://127.0.0.1:8765", "api_key": "...",
- "timeout": 600, "num_retries": 2}
+{"model": "anthropic/claude-opus-4-8", "base_url": "http://127.0.0.1:8765",
+ "api_key": "sk-ant-oauth-bridge-stub", "timeout": 600, "num_retries": 2}
 ```
+
+`.llm_config/example.json` is that object, committed as the template. Copy it to
+`.llm_config/claude-code-oauth.json` — git-ignored, the real config — and edit
+`base_url`. With no `--llm-config`, taskgen resolves `.llm_config` at the repo
+root: either a file, or this directory containing `claude-code-oauth.json`.
+
+### End-to-end: generate with a bundle
+
+The bundle needs the [LLM proxy bridge](../../proxy/README.md) running on the
+host, so start it first:
+
+```bash
+# 1. point the client at the bridge: copy the template and set base_url for your OS
+cp .llm_config/example.json .llm_config/claude-code-oauth.json
+#    macOS host: base_url = http://127.0.0.1:8765   (default in the template)
+#    Linux/EC2 container: base_url = http://172.17.0.1:8765
+
+# 2. start the Anthropic-compatible bridge and confirm it is healthy
+proxy/claude_code_bridge.sh start
+proxy/claude_code_bridge.sh status      # expect: {"ok": true, "token_prefix": "sk-ant-oat01-..."}
+proxy/claude_code_bridge.sh check       # validates credentials only
+
+# 3. generate WITH a per-task sound verifier bundle (authored through the proxy)
+uv run taskgen generate --repo ../../harbor-tasks/repos-src/python-a2a-python \
+  --package-base src/ --file src/a2a/client/card_resolver.py --func parse_agent_card \
+  --out .taskgen_out/py-verif \
+  --verifier --llm-config .llm_config/claude-code-oauth.json --verifier-min-criteria 6
+
+# 4. the additive bundle changes no gate
+uv run taskgen verify --all .taskgen_out/py-verif --lang python --carve-scope function
+
+proxy/claude_code_bridge.sh stop
+```
+
+Step 3 is the only step that differs from a default run: `--verifier` is off by
+default, so plain `generate` stays offline and `diff -r`-reproducible. The bundle
+lands in each entry's `solution/verifier/`; under the sound floor the task ships
+without one and the run still succeeds; a missing or unreachable proxy fails loud
+in step 3 rather than emitting a stub bundle. Step 4 clears the same six gates it
+would without the bundle.
 
 Two caveats, both structural:
 

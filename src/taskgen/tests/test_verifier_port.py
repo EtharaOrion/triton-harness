@@ -711,6 +711,23 @@ def test_resolve_config_prefers_the_explicit_path(tmp_path, monkeypatch):
     assert verifier.resolve_config(None)['api_key'] == 'root'
 
 
+def test_resolve_config_reads_the_config_inside_a_llm_config_directory(tmp_path, monkeypatch):
+    root = tmp_path / 'root'
+    (root / '.llm_config').mkdir(parents=True)
+    _write_config(root / '.llm_config' / 'claude-code-oauth.json', {**CONFIG, 'api_key': 'in-dir'})
+    monkeypatch.setattr(verifier.llm_config, '_repo_root', lambda: root)
+
+    assert verifier.resolve_config(None)['api_key'] == 'in-dir'
+
+
+def test_resolve_config_directory_without_the_config_file_is_a_clear_error(tmp_path, monkeypatch):
+    (tmp_path / '.llm_config').mkdir()
+    monkeypatch.setattr(verifier.llm_config, '_repo_root', lambda: tmp_path)
+
+    with pytest.raises(verifier.LLMConfigError, match='requires an LLM config/proxy'):
+        verifier.resolve_config(None)
+
+
 def test_resolve_config_without_any_config_is_a_clear_error(tmp_path, monkeypatch):
     monkeypatch.setattr(verifier.llm_config, '_repo_root', lambda: tmp_path)
 
