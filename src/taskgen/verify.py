@@ -90,6 +90,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -307,6 +308,167 @@ def resolve_floor_mode(lang: str, declared: str | None = None) -> str:
             )
         return declared
     return 'equality'
+
+
+# ------------------------------------------- pytest allowlist cross-check ---
+#
+# harbor_filter.py selects by EXACT node-id set membership (templates.py:55:
+# `item.nodeid in wanted`). An allowlist id that no collected node id equals is
+# therefore not an error anywhere -- it is silently deselected, `selected_count`
+# comes back short, and the equality floor fires with "the graded set is 0,
+# pinned at 2 -- the denominator moved" (langs/base.py:370). That message names
+# neither the id nor the reason, and the commonest reason is PARAMETRIZATION:
+# `def test_base64(...)` under `@pytest.mark.parametrize` collects only as
+# `...::test_base64[value0]`, never as the bare `...::test_base64` the graded
+# set records.
+#
+# So before the graded runs happen, ask the BUILT IMAGE what it actually
+# collects and compare. Cross-checking only -- nothing here changes the emitted
+# task, the image or the reward math.
+
+#: The graded.json `kind` whose selectors are real pytest node ids
+#: (gradedset.SELECTOR_KIND['python']). go ships `go-run` selectors and the
+#: whole-suite languages ship no per-test selectors at all, so neither is in
+#: scope and neither is touched.
+PYTEST_ALLOWLIST_KIND = 'pytest-allowlist'
+
+#: Fences around the collected ids, so the parse does not have to guess which
+#: of the container's lines are node ids and which are pytest's own chatter.
+COLLECT_BEGIN = '---HARBOR-COLLECT-BEGIN---'
+COLLECT_END = '---HARBOR-COLLECT-END---'
+
+
+def collect_only_script(relpaths, workdir: str = langs_base.WORKDIR) -> str:
+    """`pytest --collect-only` over the allowlist's own test files, fenced.
+
+    Deliberately WITHOUT `-p harbor_filter`: the filter is the thing under
+    test, and running it here would hide the very deselection being hunted.
+    The flags otherwise mirror the graded run (langs/python.py:222-228) so what
+    is collected is what the graded run would collect.
+    """
+    targets = ' '.join(shlex.quote(str(rel)) for rel in relpaths)
+    return (
+        f'cd {shlex.quote(workdir)} || exit 9; '
+        f'echo {COLLECT_BEGIN}; '
+        "uv run --no-sync --offline pytest -o addopts='' -p no:xdist "
+        f'-p no:cacheprovider --collect-only -q {targets} 2>&1; '
+        f'echo {COLLECT_END}'
+    )
+
+
+def allowlist_test_files(allowlist_ids) -> tuple[str, ...]:
+    return tuple(sorted({
+        str(node).split('::', 1)[0] for node in allowlist_ids if '::' in str(node)
+    }))
+
+
+def parse_collected_ids(output: str) -> list[str]:
+    """The node ids pytest reported, read from between the fences.
+
+    A missing fence means the collection never ran -- a container that could
+    not `cd`, an image without uv, a killed run -- and an unproven allowlist is
+    not a matching one, so it fails closed rather than reporting "nothing was
+    collected, therefore nothing is wrong".
+    """
+    lines = [ln.rstrip() for ln in output.splitlines()]
+    try:
+        start = lines.index(COLLECT_BEGIN)
+    except ValueError:
+        raise VerifyError(
+            'the `pytest --collect-only` cross-check produced no output fence, so '
+            'collection never ran inside the image and the allowlist is unproven. '
+            f'Output was:\n{output.strip()[-2000:] or "(empty)"}'
+        ) from None
+    try:
+        end = lines.index(COLLECT_END, start + 1)
+    except ValueError:
+        end = len(lines)
+
+    seen: list[str] = []
+    for line in lines[start + 1:end]:
+        candidate = line.strip()
+        if '::' in candidate and candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
+def crosscheck_allowlist(allowlist_ids: list[str], collected_ids: list[str]) -> list[str]:
+    """Human-readable PROBLEMS with the emitted allowlist. Empty list == OK.
+
+    An id is fine only when some collected id equals it EXACTLY, because that
+    is the one relation harbor_filter implements. The parametrized case is
+    called out by name: the bare id looks perfectly plausible in
+    `tests/allowlist.txt`, matches nothing at run time, and is otherwise
+    indistinguishable from a typo.
+    """
+    wanted = [str(node) for node in allowlist_ids]
+    collected = [str(node) for node in collected_ids]
+    exact = set(collected)
+
+    problems: list[str] = []
+    for node in wanted:
+        if node in exact:
+            continue
+        expansions = sorted(c for c in collected if c.startswith(f'{node}['))
+        if expansions:
+            problems.append(
+                f'{node}: PARAMETRIZED base id -- pytest collects no node with this '
+                f'exact id. Its real ids are the {len(expansions)} expansion(s) '
+                + ', '.join(expansions)
+                + '. harbor_filter matches node ids exactly, so it deselects every '
+                'one of them and the graded run scores 0.0 with only "the '
+                'denominator moved" to show for it. Parametrized graded selection '
+                'is not supported yet: regenerate this task against a '
+                'non-parametrized target test.'
+            )
+        else:
+            problems.append(
+                f'{node}: pytest collects NO node with this id, and no '
+                f'"{node}[...]" expansions either -- the allowlist names a test the '
+                'built image does not have (renamed, moved, skipped at collection, '
+                'or mistyped).'
+            )
+    return problems
+
+
+def read_allowlist_ids(entry_dir) -> list[str]:
+    path = Path(entry_dir) / 'tests' / 'allowlist.txt'
+    if not path.is_file():
+        return []
+    return [ln.strip() for ln in path.read_text().splitlines() if ln.strip()]
+
+
+def wants_allowlist_crosscheck(graded_kind: str, allowlist_ids) -> bool:
+    """True only for the python `pytest-allowlist` path.
+
+    Keyed on the graded set's own declared kind rather than on the language
+    name, so a whole-suite entry (rust/c/cpp/java, `whole-suite`) or go
+    (`go-run`) can never reach a pytest-shaped probe.
+    """
+    return graded_kind == PYTEST_ALLOWLIST_KIND and bool(allowlist_ids)
+
+
+def crosscheck_entry_allowlist(spec: EntrySpec, runner, echo=print) -> CheckResult:
+    ids = read_allowlist_ids(spec.entry_dir)
+    if not wants_allowlist_crosscheck(spec.graded_kind, ids):
+        return CheckResult('COLLECT', [])
+    files = allowlist_test_files(ids)
+    if not files:
+        return CheckResult('COLLECT', [
+            f'{len(ids)} allowlist id(s) name no test file (no "::" in any of them), '
+            'so there is nothing for pytest to collect against'
+        ])
+
+    echo('')
+    echo(f'== ALLOWLIST CROSS-CHECK: pytest --collect-only over {len(files)} file(s) ==')
+    output = runner.run(
+        spec.image, collect_only_script(files), quiet=True, network='none',
+    )
+    collected = parse_collected_ids(output)
+    problems = crosscheck_allowlist(ids, collected)
+    echo(f'allowlist={len(ids)} collected={len(collected)} '
+         f'-> {"PASS" if not problems else "FAIL"}')
+    return CheckResult('COLLECT', problems)
 
 
 # -------------------------------------------------------- layer archaeology --
@@ -587,6 +749,8 @@ class EntrySpec:
     repo_url: str | None = None
     commit: str = ''
     clone_kind: str = ''
+    #: graded.json's own `kind` -- read, never inferred from `lang`.
+    graded_kind: str = ''
 
     @property
     def repo_dirname(self) -> str:
@@ -669,6 +833,7 @@ def load_entry(entry_dir: Path) -> EntrySpec:
         repo_url=prov.get('repo_url') or None,
         commit=str(prov.get('commit') or ''),
         clone_kind=str(prov.get('clone_kind') or ''),
+        graded_kind=str(graded_doc.get('kind') or ''),
     )
 
 
@@ -969,15 +1134,17 @@ class DockerRunner:
             raise VerifyError(f'docker build failed (exit {status}) for image {plan.image}')
         return out
 
-    def run(self, image, script, quiet=False, mounts=()) -> str:
+    def run(self, image, script, quiet=False, mounts=(), network=None) -> str:
         binds = []
         for source, target in mounts:
             binds += ['-v', f'{source}:{target}:ro']
-        argv = [self._binary, 'run', '--rm', *binds, image, 'bash', '-lc', script]
+        # `--network=none` is opt-in, never the default: RED and GREEN run the
+        # real graded command and must keep whatever network the task declares.
+        net = [f'--network={network}'] if network else []
+        argv = [self._binary, 'run', '--rm', *net, *binds, image, 'bash', '-lc', script]
         self._echo(
-            f'$ docker run --rm {" ".join(binds)} {image} bash -lc {script!r}'.replace(
-                '  ', ' '
-            )
+            f'$ docker run --rm {" ".join(net + binds)} {image} bash -lc '
+            f'{script!r}'.replace('  ', ' ')
         )
         status, out = self._stream(argv, quiet=quiet)
         # A non-zero exit is NOT fatal on its own: test.sh always exits 0 and
@@ -1334,6 +1501,18 @@ def verify_entry(
     echo(f'build finished in {elapsed:.1f}s')
 
     try:
+        crosscheck = crosscheck_entry_allowlist(spec, runner, echo=echo)
+        if not crosscheck.ok:
+            for reason in crosscheck.reasons:
+                echo(f'FAIL [COLLECT] {reason}')
+            raise VerifyError(
+                'the emitted allowlist does not match what pytest collects in the '
+                f'built image ({len(crosscheck.reasons)} mismatched id(s)). '
+                'harbor_filter selects by exact node-id equality, so each of these '
+                'is silently deselected and the graded run can only report "the '
+                'denominator moved":\n  ' + '\n  '.join(crosscheck.reasons)
+            )
+
         result = run_states(
             spec.image,
             runner,
