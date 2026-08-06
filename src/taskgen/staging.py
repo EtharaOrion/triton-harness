@@ -420,14 +420,44 @@ def merge_bundle_tripwires(staged: StagedTree, bundle_dir: Path, *,
 # --------------------------------------------------------------------------
 
 
+def _lift_preserved(out_dir: Path, preserve) -> dict[str, bytes]:
+    """The bytes of `preserve`d top-level files, read before the restage wipe.
+
+    Only direct children are eligible, and only regular files: a name with a
+    separator in it, or a directory, would let a caller carry a whole subtree
+    across the wipe, and the wipe's entire job is that nothing stale survives it
+    by accident. Something survives here only because it was NAMED.
+    """
+    lifted: dict[str, bytes] = {}
+    for name in preserve:
+        if '/' in name or '\\' in name or name in ('', '.', '..'):
+            raise StagingError(f'preserve names one direct child, not {name!r}')
+        path = out_dir / name
+        if path.is_file():
+            lifted[name] = path.read_bytes()
+    return lifted
+
+
 def stage_carved_tree(
     repo: Path,
     carved_relpaths,
     stubbed_texts: dict[str, str],
     deleted_relpaths,
     out_dir: Path,
+    *,
+    preserve: tuple[str, ...] = (),
 ) -> StagedTree:
-    """Materialise the carved tree on the HOST. The intact tree is never shipped."""
+    """Materialise the carved tree on the HOST. The intact tree is never shipped.
+
+    `preserve` names direct children of `out_dir` that OUTLIVE the restage wipe.
+    Everything this function writes is scratch, re-derived from the repo on every
+    run, so wiping is correct for it -- but the staging directory is also where
+    the measure phase pins `graded.lock.json`, and that file is the opposite: a
+    provenance record whose whole value is that it survives to be reused. Since
+    the carve runs BEFORE the measure phase reads it, an unconditional wipe
+    deletes every lock before it can ever be consulted, and "regeneration reads
+    the lock and never re-runs the LLM" becomes unreachable.
+    """
     repo = Path(repo).resolve()
     out_dir = Path(out_dir).resolve()
     if not repo.is_dir():
@@ -463,10 +493,13 @@ def stage_carved_tree(
         except UnicodeDecodeError as exc:
             raise StagingError(f'{rel}: not utf-8 text, refusing to stage') from exc
 
+    lifted = _lift_preserved(out_dir, preserve)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
     _assert_dest_is_safe(out_dir)
+    for name, blob in lifted.items():
+        (out_dir / name).write_bytes(blob)
 
     ctx_dir = out_dir / 'ctx'
     ctx_dir.mkdir()

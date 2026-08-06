@@ -259,6 +259,37 @@ def test_gather_exposes_the_inputs_without_sending_them(repo):
     assert inputs.test_paths == ('tests/unit/test_gc.c',)
 
 
+def test_building_a_resolver_announces_nothing_only_asking_does(repo):
+    """The banner belongs to the ASK, not to the object. A run that reuses a
+    pinned lock builds a resolver it never calls, and a banner printed at
+    construction reports an LLM round trip that did not happen -- which is the
+    determinism contract read straight off the log."""
+    said: list[str] = []
+    resolver = LlmEnvResolver(
+        client=MockClient(GOOD_JSON), capabilities=C.BAKED_CAPABILITIES,
+        endpoint='http://127.0.0.1:8765', model='anthropic/claude-opus-4-8',
+        echo=said.append,
+    )
+    assert said == []
+
+    resolver(lang='c', repo=repo, base_image=BASE_IMAGE)
+    assert said == ['resolve-env  asking anthropic/claude-opus-4-8 '
+                    'via http://127.0.0.1:8765']
+
+
+def test_a_repaired_second_ask_does_not_announce_itself_again(repo):
+    """One banner per run, however many attempts the refine loop spends."""
+    said: list[str] = []
+    resolver = LlmEnvResolver(
+        client=MockClient(GOOD_JSON), capabilities=C.BAKED_CAPABILITIES,
+        endpoint='http://127.0.0.1:8765', model='m', echo=said.append,
+    )
+    resolver(lang='c', repo=repo, base_image=BASE_IMAGE)
+    resolver(lang='c', repo=repo, base_image=BASE_IMAGE, repair='try again')
+
+    assert len([line for line in said if 'asking' in line]) == 1
+
+
 def test_the_module_imports_no_model_sdk():
     """`litellm` must stay out of this import graph: the adapter takes a built
     client precisely so the offline suite can drive it."""

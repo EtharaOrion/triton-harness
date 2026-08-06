@@ -118,13 +118,13 @@ def build_env_resolver(args, *, echo=print) -> EnvResolver:
         raise SystemExit(f'--resolve-env: {exc}') from exc
 
     endpoint = str(cfg['base_url'])
-    echo(f'resolve-env  asking {cfg["model"]} via {endpoint}')
     plugin = base.get(args.lang)
     return LlmEnvResolver(
         client=client_from_config(cfg),
         capabilities=base_capabilities(plugin),
         required_slots=required_plan_slots(plugin),
         endpoint=endpoint,
+        model=str(cfg['model']),
         echo=echo,
     )
 

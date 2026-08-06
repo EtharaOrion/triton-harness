@@ -13,6 +13,11 @@ The flag's whole promise is asymmetric, so this module tests it from both sides:
 Everything here is offline and hermetic: docker is a fake runner returning a
 canned measure.json, the resolver is a stub returning a canned plan, and no
 network, no LLM and no real container are reachable from any path under test.
+
+Most tests here drive `_measure_and_pin` directly, which is the right unit for
+what the gap is made of -- but reuse is not a property of that function alone.
+It is a property of the ORDER `emit_all` runs its phases in, so the reuse claim
+is additionally proved end to end through `emit_all` at the bottom of the file.
 """
 
 from __future__ import annotations
@@ -409,6 +414,140 @@ def test_the_flag_refuses_a_parser_backed_language_before_it_carves(repo, tmp_pa
 def test_the_flag_without_a_resolver_is_loud(plan, tmp_path):
     with pytest.raises(B.LangError, match='no resolver was injected'):
         pin(plan, tmp_path / 'out', resolve_env=True, resolver=None)
+
+
+# ------------------------------------------------------ the key, at the unit ---
+
+
+# ------------------------------------------- reuse through the REAL flow ---
+#
+# `pin()` above enters at `_measure_and_pin`, so it never runs the phase BEFORE
+# it: `emit_all` carves first, and carving restages `_staging/<key>/` -- the
+# directory the lock lives in. Every test above can pass while a real run finds
+# no lock, re-resolves and rebuilds the measure image every time.
+
+#: c-xs's harness list is 13 unit files, and the plugin refuses a tree whose
+#: sub-counts disagree with it, so the fixture repo mirrors that shape exactly.
+E2E_UNIT_FILES = 13
+E2E_TOTAL = E2E_UNIT_FILES + 2
+E2E_MEASURE_JSON = json.dumps(
+    {'tests_total': E2E_TOTAL, 'graded': [f'unit::{i:02d}' for i in range(E2E_TOTAL)]}
+)
+
+
+class E2ERunner(FakeRunner):
+    """`FakeRunner` whose canned count matches the end-to-end fixture's corpus."""
+
+    def run(self, image: str, script: str) -> str:
+        self.runs.append((image, script))
+        return E2E_MEASURE_JSON
+
+
+@pytest.fixture
+def e2e_docker(monkeypatch, no_docker):
+    monkeypatch.setattr('taskgen.verify.DockerRunner', E2ERunner)
+    return E2ERunner
+
+
+@pytest.fixture
+def e2e_repo(tmp_path) -> Path:
+    """A tree `emit_all` can carve, grade and measure without a container."""
+    repo = tmp_path / 'c-xs-e2e'
+    (repo / 'src' / 'runtime').mkdir(parents=True)
+    for sub in ('conformance', 'regression', 'unit'):
+        (repo / 'tests' / sub).mkdir(parents=True)
+    (repo / 'Makefile').write_text(
+        'test:\n\t$(CC) -o xs src/runtime/gc.c\n', encoding='utf-8')
+    (repo / 'src' / 'runtime' / 'gc.c').write_text(
+        'int gc_collect(int generation) {\n    return generation + 1;\n}\n',
+        encoding='utf-8')
+    (repo / 'tests' / 'conformance' / 'a.xs').write_text('1\n', encoding='utf-8')
+    (repo / 'tests' / 'regression' / 'b.xs').write_text('2\n', encoding='utf-8')
+    for i in range(E2E_UNIT_FILES):
+        (repo / 'tests' / 'unit' / f'u{i:02d}_test.c').write_text(
+            'int main(void) { return 0; }\n', encoding='utf-8')
+    (repo / 'tests' / 'run-all.sh').write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+    return repo
+
+
+def generate(repo: Path, out: Path, resolver, **kwargs) -> None:
+    emit.emit_all(
+        repo=repo, out=out, lang='c', carve_scope='folder',
+        include=('src/runtime/**',), delete_whole_file=True,
+        resolver=resolver, echo=lambda *_: None, **kwargs,
+    )
+
+
+def e2e_lock_path(out: Path) -> Path:
+    return next(out.resolve().glob(f'_staging/*/{M.LOCK_FILENAME}'))
+
+
+def test_a_warm_pinned_lock_survives_the_carve_and_is_reused(
+        e2e_repo, tmp_path, e2e_docker):
+    """The live regression: regenerate into a directory that already holds a
+    valid pinned lock and NOTHING is asked and NOTHING is built."""
+    out = tmp_path / 'out'
+    cold = StubResolver(C.C_MEASURE_DEP_PLAN)
+    generate(e2e_repo, out, cold, resolve_env=True)
+
+    assert cold.calls == 1
+    measured = FakeRunner.instances[-1]
+    assert len(measured.builds) == 1 and len(measured.runs) == 1
+
+    warm = StubResolver(C.C_MEASURE_DEP_PLAN)
+    generate(e2e_repo, out, warm, resolve_env=True)
+
+    assert warm.calls == 0, 'a warm pinned lock must never reach the resolver'
+    reusing = FakeRunner.instances[-1]
+    assert reusing is not measured
+    assert (reusing.builds, reusing.runs) == ([], []), 'no measure image on a warm lock'
+
+
+def test_the_carve_does_not_delete_the_lock_it_is_about_to_be_asked_for(
+        e2e_repo, tmp_path, e2e_docker):
+    """The mechanism, named: the pinned bytes survive the restage untouched."""
+    out = tmp_path / 'out'
+    generate(e2e_repo, out, StubResolver(C.C_MEASURE_DEP_PLAN), resolve_env=True)
+    before = e2e_lock_path(out).read_bytes()
+
+    emit.plan_carve(
+        e2e_repo, out, lang='c', carve_scope='folder',
+        include=('src/runtime/**',), delete_whole_file=True,
+    )
+
+    assert e2e_lock_path(out).read_bytes() == before
+
+
+def test_the_warm_flag_run_emits_the_same_bytes_the_cold_one_did(
+        e2e_repo, tmp_path, e2e_docker):
+    """Reuse is a shortcut, not a different task: nothing shipped may move."""
+    cold_out = tmp_path / 'cold'
+    generate(e2e_repo, cold_out, StubResolver(C.C_MEASURE_DEP_PLAN), resolve_env=True)
+    before = _entry_bytes(cold_out)
+
+    generate(e2e_repo, cold_out, StubResolver(C.C_MEASURE_DEP_PLAN), resolve_env=True)
+
+    assert _entry_bytes(cold_out) == before
+
+
+def test_the_default_path_reuses_its_lock_through_the_real_flow_too(
+        e2e_repo, tmp_path, e2e_docker):
+    """Without the flag there is no resolver to skip, but there is still an image
+    not to rebuild -- and `graded.lock.json` has always promised that."""
+    out = tmp_path / 'out'
+    generate(e2e_repo, out, None)
+    assert len(FakeRunner.instances[-1].builds) == 1
+
+    generate(e2e_repo, out, None)
+    assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
+
+
+def _entry_bytes(out: Path) -> dict[str, bytes]:
+    return {
+        p.relative_to(out).as_posix(): p.read_bytes()
+        for p in sorted(out.rglob('*'))
+        if p.is_file() and '_staging' not in p.relative_to(out).parts
+    }
 
 
 # ------------------------------------------------------ the key, at the unit ---

@@ -217,3 +217,20 @@ def test_build_env_resolver_is_the_only_place_a_client_is_made(llm_config):
     resolver = cli.build_env_resolver(Args(str(llm_config)), echo=lambda _: None)
     assert callable(resolver)
     assert isinstance(resolver, LlmEnvResolver)
+
+
+def test_the_config_is_handed_over_to_be_announced_not_announced_here(
+        llm_config, capsys):
+    """Building a resolver is not asking one. A `--resolve-env` run that reuses
+    a pinned lock builds this object and never calls it, so the cli hands the
+    model down and lets the first actual ask say so."""
+    @dataclass
+    class Args:
+        llm_config: str
+        lang: str = 'c'
+
+    resolver = cli.build_env_resolver(Args(str(llm_config)))
+
+    assert isinstance(resolver, LlmEnvResolver)
+    assert resolver.model == CONFIG['model']
+    assert 'asking' not in capsys.readouterr().out

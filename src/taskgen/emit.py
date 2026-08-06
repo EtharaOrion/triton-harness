@@ -317,6 +317,8 @@ def plan_carve(
     provenance: Provenance | None = None,
 ) -> CarvePlan:
     """Everything that is independent of the context type, done exactly once."""
+    from . import measure as measure_mod
+
     plugin = langs_base.get(lang)
     scope = CarveScope.parse(carve_scope)
     repo = Path(repo).resolve()
@@ -402,6 +404,9 @@ def plan_carve(
     staging_dir = Path(out).resolve() / '_staging' / key
     staged = stage_carved_tree(
         repo, carve.carved_relpaths, carve.overlay, carve.deleted_relpaths, staging_dir,
+        # Carving runs BEFORE `_measure_and_pin` reads the lock, so without this
+        # the wipe deletes every lock before the reuse check can consult it.
+        preserve=(measure_mod.LOCK_FILENAME,),
     )
     _copy_leakscan(staging_dir / 'tooling', plugin=plugin)
 

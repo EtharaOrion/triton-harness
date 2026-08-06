@@ -69,17 +69,36 @@ class ResolverTransportError(RuntimeError):
 class LlmEnvResolver:
     """`EnvResolver` bound to a real client, one round trip per call.
 
-    Stateless between calls by construction: the checkout is re-walked every
+    Stateless between calls where it counts: the checkout is re-walked every
     time, so a repaired ask sees the same repo the first ask did and the only
     thing that differs between attempt 1 and attempt 2 is the repair block --
     which is the invariant `refine`'s prompt test pins.
+
+    The one exception carries no answer: `_announced` latches the "asking ..."
+    banner so it is printed by the FIRST ask rather than by construction. That
+    distinction is the determinism contract, not cosmetics -- a run that reused
+    a pinned lock builds a resolver it never calls, and a banner printed at
+    construction reports an LLM round trip that did not happen.
     """
 
     client: ResolverClient
     capabilities: tuple[str, ...] = ()
     required_slots: tuple[str, ...] = ()
     endpoint: str = ''
+    model: str = ''
     echo: Callable[[str], object] = field(default=print)
+    _announced: list[bool] = field(
+        default_factory=list, repr=False, compare=False,
+    )
+
+    def _announce(self) -> None:
+        if self._announced:
+            return
+        self._announced.append(True)
+        self.echo(
+            f'resolve-env  asking {self.model or "the configured model"} '
+            f'via {self.endpoint}'
+        )
 
     def gather(self, *, lang: str, repo: Path, base_image: str) -> ResolverInputs:
         """The leak-safe inputs for one ask. Exposed so a caller can inspect
@@ -96,6 +115,7 @@ class LlmEnvResolver:
 
     def __call__(self, *, lang: str, repo: Path, base_image: str,
                  repair: str | None = None) -> DepPlan | Refuse:
+        self._announce()
         inputs = self.gather(lang=lang, repo=repo, base_image=base_image)
         user = build_user_prompt(
             lang=lang,
