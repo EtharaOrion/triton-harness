@@ -1,4 +1,4 @@
-"""Full harbor entry emission: nine dirs, valid task.toml, byte-identical reruns."""
+"""Full harbor entry emission: eleven dirs, valid task.toml, byte-identical reruns."""
 
 from __future__ import annotations
 
@@ -35,13 +35,13 @@ def emitted(repo, tmp_path_factory):
     return out, entries
 
 
-def test_emits_nine_entries(emitted):
+def test_emits_eleven_entries(emitted):
     out, entries = emitted
-    assert len(entries) == 9
+    assert len(entries) == 11
     assert {e.context_type for e in entries} == set(CONTEXT_TYPES)
     # `_staging/` sits alongside the entries and is deliberately not one: it is
     # the shared host-side carve, keyed by task.toml's absence.
-    assert len([p for p in out.iterdir() if (p / 'task.toml').is_file()]) == 9
+    assert len([p for p in out.iterdir() if (p / 'task.toml').is_file()]) == 11
 
 
 def test_entry_dirs_are_the_uuid5_ids(emitted):
@@ -201,10 +201,10 @@ def test_default_selection_generalises_to_an_unnamed_target(repo, tmp_path):
     runs the whole pipeline on whatever function the deterministic order picks.
     """
     entries = emit_all(repo=repo, out=tmp_path / 'auto', package_base='src/')
-    assert len(entries) == 9
+    assert len(entries) == 11
     assert {e.context_type for e in entries} == set(CONTEXT_TYPES)
     picked = {(e.target_relpath, e.nodeids) for e in entries}
-    assert len(picked) == 1, 'the nine entries must share one carve'
+    assert len(picked) == 1, 'the eleven entries must share one carve'
     for e in entries:
         data = tomllib.loads((e.path / 'task.toml').read_text())
         assert data['schema_version'] == '1.4'

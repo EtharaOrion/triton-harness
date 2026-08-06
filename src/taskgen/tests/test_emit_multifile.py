@@ -5,7 +5,7 @@ Three claims are under test, and they pull against each other:
   MULTI-FILE   `file`/`folder` scope carve N files, stage them all, union their
                graded sets and ship an oracle that restores every one of them
   BACKWARD     the default invocation (`python`, `function`) still selects the
-  COMPAT       same target, mints the SAME nine uuid5 entry ids, and grades the
+  COMPAT       same target, mints the SAME uuid5 entry ids, and grades the
                same five node ids -- the ids are pinned as literals below, so a
                change to the id key is a failing test rather than a silent
                re-shuffle of every downstream artifact
@@ -26,13 +26,17 @@ from taskgen.scope import CarveScopeError
 
 from .conftest import FROZEN_FILE, FROZEN_FUNC, FROZEN_NODEIDS, FROZEN_SHA256
 
-#: The nine ids the proven single-function entry has always had. They are the
+#: The ids the proven single-function entry has always had. They are the
 #: backward-compatibility contract: `--carve-scope`/`--lang` were added to the
-#: uuid5 key, and the key must collapse to its old form at the defaults.
+#: uuid5 key, and the key must collapse to its old form at the defaults. The
+#: nine originals are UNCHANGED by the caller_* conditions, which is the point:
+#: the key is per-context_type, so adding conditions cannot renumber the rest.
 FROZEN_ENTRY_IDS = {
     'no_context': '35424944-86c8-5f4d-98ba-75ec1f161c72',
     'callee_func': '1968d8d9-be80-5244-8375-a52438198268',
     'callee_sig': '15e2b5b1-95af-55e2-8cbd-7d48e9c76f66',
+    'caller_func': '98cfe292-5b96-5141-9476-0717b6262e02',
+    'caller_sig': '2dfa0757-f929-55c7-9c37-36f0a472deb3',
     'in_file': 'dcbdfe3c-9b88-584b-927f-b7a7ad167834',
     'project': 'd1005a35-ec29-5f77-b5ba-01ee90f3c86b',
     'bm25': 'cb55ac19-23b0-5ef7-ba70-c01caf04340e',
@@ -69,7 +73,7 @@ def test_defaults_are_python_function_scope(fn_scope):
     assert {e.carve_scope for e in entries} == {'function'}
 
 
-def test_the_nine_entry_ids_are_unchanged(fn_scope):
+def test_the_original_entry_ids_are_unchanged(fn_scope):
     _out, entries = fn_scope
     assert {e.context_type: e.entry_id for e in entries} == FROZEN_ENTRY_IDS
 
@@ -112,9 +116,9 @@ def file_scope(repo, tmp_path_factory):
     )
 
 
-def test_file_scope_emits_nine_entries(file_scope):
+def test_file_scope_emits_eleven_entries(file_scope):
     _out, entries = file_scope
-    assert len(entries) == 9
+    assert len(entries) == 11
     assert {e.context_type for e in entries} == set(CONTEXT_TYPES)
 
 

@@ -69,9 +69,9 @@ def go_entries(go_module, tmp_path_factory):
     )
 
 
-def test_go_emits_the_nine_entries(go_entries):
+def test_go_emits_the_eleven_entries(go_entries):
     _out, entries = go_entries
-    assert len(entries) == 9
+    assert len(entries) == 11
     assert {e.lang for e in entries} == {'go'}
     assert {e.carve_scope for e in entries} == {'function'}
 
@@ -86,6 +86,27 @@ def test_go_entry_layout(go_entries):
             'solution/solve.sh', f'solution/carved/{SRC}',
         ):
             assert (e.path / rel).is_file(), f'{e.context_type}: missing {rel}'
+
+
+def test_go_gets_caller_context_from_the_same_inversion(go_entries):
+    """`caller_*` is not a python-only feature bolted onto `select.py`.
+
+    `GoTarget` carries no callee/caller surface at all -- both are derived in
+    `carve.py` from the parser's graph, forwards and then backwards -- so if go
+    resolves callees it must resolve callers, off the same edges.
+    """
+    _out, entries = go_entries
+    by_type = {e.context_type: e for e in entries}
+    callee = (by_type['callee_func'].path / 'instruction.md').read_text()
+    assert '1 callee(s) were resolved' in callee
+    assert 'func helper() int' in callee
+
+    for ct, expected in (('caller_func', 'func TestAlphaOne('),
+                         ('caller_sig', 'func TestAlphaOne(t *testing.T) { ... }')):
+        text = (by_type[ct].path / 'instruction.md').read_text()
+        assert '2 caller(s) were resolved' in text, ct
+        assert expected in text, ct
+        assert 'No first-party callers were found' not in text, ct
 
 
 def test_go_ships_no_pytest_only_assets(go_entries):

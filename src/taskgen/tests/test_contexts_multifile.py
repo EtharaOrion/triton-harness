@@ -161,8 +161,29 @@ def test_project_and_retrieval_still_produce_content(multi_bodies):
         assert blocks, ct
 
 
-def test_all_nine_builders_still_run(multi_bodies):
+def test_all_eleven_builders_still_run(multi_bodies):
     assert set(multi_bodies) == set(CONTEXT_TYPES)
+
+
+def test_caller_context_degrades_exactly_like_callee_context(multi_bodies, multi):
+    """A file-scope view has no `fd` behind its functions, so BOTH graphs are empty.
+
+    The bar is symmetry, not emptiness: caller_* must not crash, must not be
+    silently populated from somewhere else, and must report the same nothing
+    callee_* reports on the same input.
+    """
+    _carve, inp = multi
+    assert inp.target.callees == ()
+    assert inp.target.callers == ()
+    for ct, key in (('caller_func', 'callers'), ('caller_sig', 'callers'),
+                    ('callee_func', 'callees'), ('callee_sig', 'callees')):
+        intro, blocks, stats = multi_bodies[ct]
+        assert blocks == [], ct
+        assert stats[f'{key}_resolved'] == 0, ct
+        assert stats[f'{key}_inlined'] == 0, ct
+        assert stats['context_tokens'] == 0, ct
+    for ct in ('caller_func', 'caller_sig'):
+        assert 'No first-party callers were found' in multi_bodies[ct][0], ct
 
 
 # --------------------------------------------------------------------------

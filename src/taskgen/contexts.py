@@ -1,11 +1,14 @@
-"""The nine deterministic context-provisioning bodies.
+"""The eleven deterministic context-provisioning bodies.
 
 Five come from the harness `context_type` enum (`src/eval/eval_llm.py`) and four
-from its `rag_type` enum (`src/eval/eval_rag.py`):
+from its `rag_type` enum (`src/eval/eval_rag.py`); `caller_*` is taskgen's own,
+the same call graph read backwards:
 
     no_context   nothing is inlined
     callee_func  full source of every first-party function the target calls
     callee_sig   signatures only of those callees
+    caller_func  full source of every first-party function that calls the target
+    caller_sig   signatures only of those callers
     in_file      the target's own file, with the target's body stubbed out
     project      whole surviving repo, path-sorted, truncated at the budget
     bm25         Okapi BM25 over ~512-token line chunks
@@ -141,7 +144,7 @@ def common_root(relpaths) -> str:
 
 @dataclass
 class ContextInputs:
-    """Everything the nine builders share, computed once per target."""
+    """Everything the eleven builders share, computed once per target."""
 
     repo: Path
     repo_name: str
@@ -281,43 +284,66 @@ def _body_no_context(inp: ContextInputs):
     return intro, [], {'selection': 'none', 'context_tokens': 0, 'files_eligible': 0}
 
 
-def _callee_sources(inp: ContextInputs) -> list[tuple[str, str, int, int]]:
-    """(relpath, source, start_line, end_line) per callee, path-sorted.
+def _graph_sources(inp: ContextInputs, funcs) -> list[tuple[str, str, int, int]]:
+    """(relpath, source, start_line, end_line) per function, path-sorted.
 
-    A callee whose own body the carve removed is dropped. For function scope
+    A neighbour whose own body the carve removed is dropped. For function scope
     that is the recursive self-reference only -- every other function in the
     target's file still has its body on disk and is legitimate context. For
     file/folder scope it is anything inside the carve set, because those bodies
     are gone and inlining one would hand over part of the answer.
+
+    That rule is what keeps the CALLER direction leak-safe as well: a caller's
+    source holds the call site, never the carved body, and the one caller that
+    could hold it -- the target calling itself -- is exactly what the carved
+    body owner check drops.
     """
     out = []
-    for callee in inp.target.callees:
-        rel = Path(callee.file_path).resolve()
+    for fn in funcs:
+        rel = Path(fn.file_path).resolve()
         try:
             rel = rel.relative_to(inp.repo.resolve()).as_posix()
         except ValueError:
-            rel = Path(callee.file_path).as_posix()
-        if inp.carve.carved_body_owner(rel, callee.name):
+            rel = Path(fn.file_path).as_posix()
+        if inp.carve.carved_body_owner(rel, fn.name):
             continue
-        source = callee.get_func()
-        start = callee.func_node.start_point[0] + 1
-        end = callee.func_node.end_point[0] + 1
+        source = fn.get_func()
+        start = fn.func_node.start_point[0] + 1
+        end = fn.func_node.end_point[0] + 1
         out.append((rel, source, start, end))
     out.sort(key=lambda t: (t[0], t[2], t[3]))
     return out
 
 
-def _body_callee_func(inp: ContextInputs):
-    sources = _callee_sources(inp)
+def _callee_sources(inp: ContextInputs) -> list[tuple[str, str, int, int]]:
+    return _graph_sources(inp, inp.target.callees)
+
+
+def _caller_sources(inp: ContextInputs) -> list[tuple[str, str, int, int]]:
+    return _graph_sources(inp, inp.target.callers)
+
+
+def _pack_sources(inp: ContextInputs, sources, render) -> tuple[list[str], int]:
+    """Render sources in order, keeping every block that still fits the budget."""
     blocks: list[str] = []
     used = 0
     for rel, source, start, end in sources:
-        block = render_file_block(rel, source, note=f'lines {start}-{end}')
+        block = render(rel, source, start, end)
         cost = inp.counter.count(block)
         if used + cost > inp.context_budget:
             continue
         blocks.append(block)
         used += cost
+    return blocks, used
+
+
+def _full_block(rel: str, source: str, start: int, end: int) -> str:
+    return render_file_block(rel, source, note=f'lines {start}-{end}')
+
+
+def _body_callee_func(inp: ContextInputs):
+    sources = _callee_sources(inp)
+    blocks, used = _pack_sources(inp, sources, _full_block)
     intro = (
         '## Pre-loaded context: callee function bodies\n\n'
         'The full source of every first-party function the carved function calls, '
@@ -368,22 +394,21 @@ def _brace_signature_of(source: str) -> str:
     return f'{head} {{ ... }}' if head else source.splitlines()[0]
 
 
-def _body_callee_sig(inp: ContextInputs):
-    sources = _callee_sources(inp)
-    blocks: list[str] = []
-    used = 0
-    for rel, source, start, end in sources:
+def _sig_block_renderer(inp: ContextInputs):
+    def render(rel: str, source: str, start: int, end: int) -> str:
         name = source.split('(', 1)[0].split()[-1] if '(' in source else ''
         sig = (
             _signature_of(source, name) if inp.language == 'python'
             else _brace_signature_of(source)
         )
-        block = render_file_block(rel, sig, note=f'signature only, lines {start}-{end}')
-        cost = inp.counter.count(block)
-        if used + cost > inp.context_budget:
-            continue
-        blocks.append(block)
-        used += cost
+        return render_file_block(rel, sig, note=f'signature only, lines {start}-{end}')
+
+    return render
+
+
+def _body_callee_sig(inp: ContextInputs):
+    sources = _callee_sources(inp)
+    blocks, used = _pack_sources(inp, sources, _sig_block_renderer(inp))
     intro = (
         '## Pre-loaded context: callee signatures\n\n'
         'Signatures ONLY of every first-party function the carved function calls. '
@@ -397,6 +422,65 @@ def _body_callee_sig(inp: ContextInputs):
         'files_eligible': len(sources),
         'callees_resolved': len(sources),
         'callees_inlined': len(blocks),
+    }
+
+
+#: Lets a reader tell "nothing calls this" from "the caller condition broke".
+_NO_CALLERS = (
+    '\nNo first-party callers were found: nothing else in this repository '
+    'calls the carved function through an edge the parser can resolve. This '
+    'condition is therefore empty for this target, which is information in '
+    'itself -- there is no in-repo usage example to copy.\n'
+)
+
+
+def _body_caller_func(inp: ContextInputs):
+    sources = _caller_sources(inp)
+    blocks, used = _pack_sources(inp, sources, _full_block)
+    intro = (
+        '## Pre-loaded context: caller function bodies\n\n'
+        'The full source of every first-party function that CALLS the carved '
+        'function, as resolved by inverting this repository\'s call graph. This is '
+        'the mirror image of `callee_func`: instead of what the carved code '
+        'depends on, you are given what depends on IT -- the call sites that fix '
+        'how it is invoked and what its return value is used for. '
+        f'{len(sources)} caller(s) were resolved; {len(blocks)} were inlined within '
+        'the token budget. A test function that calls the carved function directly '
+        'is a caller like any other and is included here; it is on disk either way, '
+        'and `project` inlines it too. Nothing else from the repository is '
+        'pre-loaded.\n'
+    )
+    if not sources:
+        intro += _NO_CALLERS
+    return intro, blocks, {
+        'selection': 'caller function bodies',
+        'context_tokens': used,
+        'files_eligible': len(sources),
+        'callers_resolved': len(sources),
+        'callers_inlined': len(blocks),
+    }
+
+
+def _body_caller_sig(inp: ContextInputs):
+    sources = _caller_sources(inp)
+    blocks, used = _pack_sources(inp, sources, _sig_block_renderer(inp))
+    intro = (
+        '## Pre-loaded context: caller signatures\n\n'
+        'Signatures ONLY of every first-party function that CALLS the carved '
+        'function. Their bodies -- and with them the actual call sites -- are '
+        'withheld, so this tells you WHO depends on the carved function and in '
+        f'what part of the repository, but not how they invoke it. '
+        f'{len(sources)} caller(s) were resolved (test functions that call it '
+        f'directly included); {len(blocks)} were inlined within the token budget.\n'
+    )
+    if not sources:
+        intro += _NO_CALLERS
+    return intro, blocks, {
+        'selection': 'caller signatures',
+        'context_tokens': used,
+        'files_eligible': len(sources),
+        'callers_resolved': len(sources),
+        'callers_inlined': len(blocks),
     }
 
 
@@ -610,6 +694,8 @@ _BUILDERS = {
     'no_context': _body_no_context,
     'callee_func': _body_callee_func,
     'callee_sig': _body_callee_sig,
+    'caller_func': _body_caller_func,
+    'caller_sig': _body_caller_sig,
     'in_file': _body_in_file,
     'project': _body_project,
     'bm25': _body_bm25,

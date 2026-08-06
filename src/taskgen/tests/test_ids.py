@@ -30,7 +30,7 @@ def test_entry_id_is_a_v5_uuid():
 
 def test_entry_id_differs_per_context_type():
     ids = {ct: entry_id(*ARGS, ct) for ct in CONTEXT_TYPES}
-    assert len(set(ids.values())) == len(CONTEXT_TYPES) == 9
+    assert len(set(ids.values())) == len(CONTEXT_TYPES) == 11
 
 
 def test_entry_id_differs_per_function():

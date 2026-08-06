@@ -1,4 +1,4 @@
-"""All nine context builders run, differ, and leak nothing."""
+"""All eleven context builders run, differ, and leak nothing."""
 
 from __future__ import annotations
 
@@ -28,12 +28,12 @@ def bodies(inputs):
     return {ct: build_body(ct, inputs) for ct in CONTEXT_TYPES}
 
 
-def test_there_are_nine_context_types():
-    assert len(CONTEXT_TYPES) == 9
-    assert set(CONTEXT_TYPES) == {
-        'no_context', 'callee_func', 'callee_sig', 'in_file',
-        'project', 'bm25', 'embedding', 'mix', 'repo_coder',
-    }
+def test_there_are_eleven_context_types():
+    assert len(CONTEXT_TYPES) == 11
+    assert CONTEXT_TYPES == (
+        'no_context', 'callee_func', 'callee_sig', 'caller_func', 'caller_sig',
+        'in_file', 'project', 'bm25', 'embedding', 'mix', 'repo_coder',
+    )
 
 
 def test_every_builder_runs(bodies):
@@ -59,6 +59,69 @@ def test_callee_sig_has_signatures_but_not_the_callee_body(bodies):
     assert blocks
     assert 'HasField' in joined
     assert ': ...' in joined
+
+
+#: A frozen production caller of the target: it is not a callee and not in the
+#: target's file, so it discriminates caller_* from every condition we had.
+CALLER_QUALNAME = 'DefaultRequestHandlerV2.on_message_send'
+CALLER_FILE = 'src/a2a/server/request_handlers/default_request_handler_v2.py'
+CALLER_DECL = 'async def on_message_send('
+
+
+def test_the_target_knows_its_callers(target):
+    quals = target.caller_qualnames()
+    assert CALLER_QUALNAME in quals
+    assert quals, 'the frozen target has in-repo callers; an empty set is a bug'
+    assert set(quals).isdisjoint(target.callee_qualnames())
+
+
+def test_caller_func_inlines_a_real_callers_whole_body(bodies):
+    _intro, blocks, stats = bodies['caller_func']
+    joined = ''.join(blocks)
+    assert blocks
+    assert CALLER_FILE in joined
+    assert CALLER_DECL in joined
+    assert 'apply_history_length' in joined, 'the call site itself must be present'
+    assert stats['callers_resolved'] == stats['callers_inlined'] == len(blocks)
+
+
+def test_caller_sig_has_the_caller_signature_but_not_its_body(bodies):
+    _intro, blocks, _stats = bodies['caller_sig']
+    joined = ''.join(blocks)
+    assert blocks
+    assert CALLER_DECL in joined
+    assert ': ...' in joined
+    assert 'apply_history_length' not in joined, 'a signature must not carry a call site'
+
+
+def test_only_the_caller_conditions_inline_the_caller(bodies):
+    """The discriminator: caller_* is not a rename of a condition we already had."""
+    for ct in ('no_context', 'callee_func', 'callee_sig', 'in_file'):
+        _intro, blocks, _stats = bodies[ct]
+        assert CALLER_DECL not in ''.join(blocks), ct
+
+
+def test_caller_ordering_is_sorted_and_stable(target, repo):
+    from taskgen.select import _sort_key
+
+    keys = [_sort_key(repo, c) for c in target.callers]
+    assert keys == sorted(keys)
+    assert len(keys) == len(set(keys)), 'a caller must not be reported twice'
+
+
+def test_caller_context_never_carries_the_carved_body(bodies, inputs):
+    from taskgen.contexts import assert_no_leakage
+
+    assert inputs.tripwires
+    body = inputs.carve.original_text.split(inputs.carve.signature, 1)[1]
+    for ct in ('caller_func', 'caller_sig'):
+        intro, blocks, _stats = bodies[ct]
+        document = intro + ''.join(blocks)
+        assert_no_leakage(document, inputs.tripwires)
+        for line in body.splitlines():
+            stripped = line.strip()
+            if len(stripped) >= 24:
+                assert stripped not in document, f'{ct} leaked {stripped!r}'
 
 
 def test_in_file_inlines_the_stubbed_target_file(bodies, inputs):
@@ -89,7 +152,7 @@ def test_every_builder_respects_the_budget(bodies, inputs):
 
 def test_bodies_differ_across_context_types(bodies):
     rendered = {ct: ''.join(b) for ct, (_i, b, _s) in bodies.items()}
-    assert len(set(rendered.values())) >= 8
+    assert len(set(rendered.values())) >= 10
 
 
 def test_no_builder_leaks_the_carved_body(bodies, inputs):

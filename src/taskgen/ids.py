@@ -13,13 +13,17 @@ import uuid
 #: Fixed namespace for every id this package mints.
 NS = uuid.uuid5(uuid.NAMESPACE_URL, 'mrgctx.taskgen')
 
-#: The nine harness context-provisioning conditions, in canonical order.
-#: First five are `eval_llm.py`'s context_type enum, last four `eval_rag.py`'s
-#: rag_type enum.
+#: The eleven harness context-provisioning conditions, in canonical order.
+#: Five are `eval_llm.py`'s context_type enum and four `eval_rag.py`'s rag_type
+#: enum; `caller_func`/`caller_sig` are taskgen's own, and sit next to the
+#: callee pair they invert (gap B1) rather than at the end, because the reading
+#: order of the tuple IS the documented order of the conditions.
 CONTEXT_TYPES = (
     'no_context',
     'callee_func',
     'callee_sig',
+    'caller_func',
+    'caller_sig',
     'in_file',
     'project',
     'bm25',

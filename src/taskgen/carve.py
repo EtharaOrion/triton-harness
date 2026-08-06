@@ -2,7 +2,7 @@
 
 `carve_fn.py` stubs one function body; `carve_file.py` skeletonises or deletes
 whole files. They produce different shapes, and every consumer downstream --
-staging, the nine context builders, the oracle, instruction.md -- needs the same
+staging, the eleven context builders, the oracle, instruction.md -- needs the same
 questions answered regardless of which one ran:
 
     what did we remove          `carved_relpaths` / `deleted_relpaths`
@@ -51,6 +51,13 @@ class CarveError(RuntimeError):
     """A carve that must not be shipped. Always raised, never downgraded."""
 
 
+def _qualnames(funcs) -> list[str]:
+    return [
+        f'{f.class_name}.{f.name}' if getattr(f, 'class_name', '') else f.name
+        for f in funcs
+    ]
+
+
 @dataclass(frozen=True)
 class TargetView:
     """What the prompt and the context builders need to call "the target".
@@ -66,13 +73,14 @@ class TargetView:
     class_name: str
     relpath: str
     callees: tuple = ()
+    callers: tuple = ()
     kind: str = 'files'
 
     def callee_qualnames(self) -> list[str]:
-        return [
-            f'{c.class_name}.{c.name}' if getattr(c, 'class_name', '') else c.name
-            for c in self.callees
-        ]
+        return _qualnames(self.callees)
+
+    def caller_qualnames(self) -> list[str]:
+        return _qualnames(self.callers)
 
 
 @dataclass(frozen=True)
@@ -202,44 +210,78 @@ def _primary(carved: tuple[str, ...], target) -> str:
     return carved[0]
 
 
+def _fds(functions) -> list:
+    return [fd for fd in (getattr(f, 'fd', None) for f in functions) if fd is not None]
+
+
 def _callees_outside(carved_functions, carved_relpaths, repo) -> tuple:
     """Callees of the carved functions whose bodies still exist on disk."""
+    return _outside(
+        ((fd, getattr(fd, 'callee', ()) or ()) for fd in _fds(carved_functions)),
+        carved_relpaths, repo,
+    )
+
+
+def _callers_outside(carved_functions, all_functions, carved_relpaths, repo) -> tuple:
+    """Callers of the carved functions whose bodies still exist on disk.
+
+    The exact mirror of `_callees_outside` over the INVERTED graph. It needs the
+    whole parsed set because a forward edge is stored on the CALLER, so nothing
+    reachable from the carved functions alone can answer "who calls me".
+
+    Degrades to `()` on precisely the inputs `_callees_outside` degrades on: a
+    subject with no `FunctionData` behind it (whole-suite languages have no
+    parser at all), and here additionally an empty universe -- never a raise.
+    """
+    from .select import invert_callee_edges
+
+    subjects = _fds(carved_functions)
+    universe = _fds(all_functions)
+    if not subjects or not universe:
+        return ()
+    inverse = invert_callee_edges(universe)
+    return _outside(
+        ((fd, inverse.get(fd, ())) for fd in subjects), carved_relpaths, repo,
+    )
+
+
+def _outside(edges, carved_relpaths, repo) -> tuple:
+    """`(relpath, name)`-deduplicated, path-sorted neighbours outside the carve."""
     carved = set(carved_relpaths)
     repo = Path(repo).resolve()
     seen: dict[tuple[str, str], object] = {}
-    for fn in carved_functions:
-        fd = getattr(fn, 'fd', None)
-        if fd is None:
-            continue
-        for callee in getattr(fd, 'callee', ()) or ():
+    for _fd, neighbours in edges:
+        for neighbour in neighbours:
             try:
-                rel = Path(callee.file_path).resolve().relative_to(repo).as_posix()
+                rel = Path(neighbour.file_path).resolve().relative_to(repo).as_posix()
             except ValueError:
-                rel = Path(callee.file_path).as_posix()
+                rel = Path(neighbour.file_path).as_posix()
             if rel in carved:
                 continue
-            seen[(rel, callee.name)] = callee
+            seen[(rel, neighbour.name)] = neighbour
     return tuple(v for _k, v in sorted(seen.items()))
 
 
-def _function_target_view(target, repo):
-    """Give a function-scope target the callee surface the contexts read.
+def _function_target_view(target, repo, all_functions=()):
+    """Give a function-scope target the callee/caller surface the contexts read.
 
-    `select.Target` already has one. `go_select.GoTarget` deliberately does not:
-    it models a Go method's identity (receiver + package + `-run` selector) and
-    has no business also modelling MRG-Bench's callee-context notion. Rather
-    than widen it, the callee view is derived here from the parser's own graph.
+    `select.Target` already has both. `go_select.GoTarget` deliberately does
+    not: it models a Go method's identity (receiver + package + `-run`
+    selector) and has no business also modelling MRG-Bench's callee-context
+    notion. Rather than widen it, both views are derived here from the parser's
+    own graph -- the same graph, read forwards and then backwards.
     """
     if hasattr(target, 'callees') and hasattr(target, 'callee_qualnames'):
         return target
     fd = getattr(target, 'fd', None)
-    callees = _callees_outside([_FdHolder(fd)], (), repo) if fd is not None else ()
+    subjects = [_FdHolder(fd)] if fd is not None else []
     return TargetView(
         qualname=target.qualname,
         name=target.name,
         class_name=getattr(target, 'receiver', '') or '',
         relpath=target.relpath,
-        callees=callees,
+        callees=_callees_outside(subjects, (), repo),
+        callers=_callers_outside(subjects, all_functions, (), repo),
         kind='function',
     )
 
@@ -249,7 +291,7 @@ class _FdHolder:
     fd: object
 
 
-def _files_target_view(carved, carved_functions, repo, scope) -> TargetView:
+def _files_target_view(carved, carved_functions, repo, scope, all_functions=()) -> TargetView:
     root = _carve_root(carved)
     return TargetView(
         qualname=root,
@@ -257,6 +299,7 @@ def _files_target_view(carved, carved_functions, repo, scope) -> TargetView:
         class_name='',
         relpath=carved[0],
         callees=_callees_outside(carved_functions, carved, repo),
+        callers=_callers_outside(carved_functions, all_functions, carved, repo),
         kind=scope.value,
     )
 
@@ -283,8 +326,15 @@ def build_carve_set(
     delete_whole_file: bool = False,
     stub_body: str | None = None,
     carved_functions=(),
+    all_functions=(),
 ) -> CarveSet:
-    """Carve, whichever scope this is. Deterministic; writes nothing to disk."""
+    """Carve, whichever scope this is. Deterministic; writes nothing to disk.
+
+    `all_functions` is the parsed universe the caller view is inverted out of.
+    Omitting it is not an error -- a language with no parser has no call graph
+    to invert, and its caller context is empty for the same reason its callee
+    context is.
+    """
     scope = CarveScope.parse(scope)
     repo = Path(repo)
 
@@ -301,7 +351,7 @@ def build_carve_set(
             originals={carve.relpath: carve.original_text},
             primary_relpath=carve.relpath,
             function_carve=carve,
-            target_view=_function_target_view(target, repo),
+            target_view=_function_target_view(target, repo, all_functions),
             carved_functions=tuple(carved_functions),
         )
 
@@ -326,7 +376,9 @@ def build_carve_set(
     result = carve_files(repo, keep, mode=mode, stub_body=stub, language=language)
     view = (
         target if target is not None
-        else _files_target_view(result.carved_relpaths, carved_functions, repo, scope)
+        else _files_target_view(
+            result.carved_relpaths, carved_functions, repo, scope, all_functions,
+        )
     )
     return CarveSet(
         scope=scope,
