@@ -1022,6 +1022,7 @@ def emit_verifier_bundle(plan: CarvePlan, entries, *, llm_config=None,
 
 def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
                       base_image: str, *, build_and_measure: refine.MeasureAttempt,
+                      validate_candidate: refine.PlanValidator,
                       echo, clock=time.monotonic) -> refine.RefinedEnv:
     """The refine loop, wired to this repo. A validated, MEASURED plan, or a raise.
 
@@ -1031,9 +1032,14 @@ def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
 
     The loop itself is `refine.refine_dep_plan` and knows nothing about docker;
     everything container-shaped arrives as `build_and_measure`, so the bound and
-    the budget stay testable offline. What this wrapper adds is the one thing
-    only emit can answer -- that a flag with no resolver behind it is a caller
-    error, not a refusal to be retried.
+    the budget stay testable offline. It knows nothing about languages either,
+    which is why `validate_candidate` -- the plugin's own pre-render gate -- is
+    injected the same way: it is the check that a schema-valid plan is one THIS
+    gap can actually render, and it runs before the build so an unrenderable
+    answer is repaired rather than paid for in docker time.
+
+    What this wrapper adds is the one thing only emit can answer -- that a flag
+    with no resolver behind it is a caller error, not a refusal to be retried.
     """
     if resolver is None:
         raise langs_base.LangError(
@@ -1050,6 +1056,7 @@ def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
         repo=plan.repo,
         base_image=base_image,
         build_and_measure=build_and_measure,
+        validate_candidate=validate_candidate,
         echo=echo,
         clock=clock,
     )
@@ -1157,7 +1164,9 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
     if resolve_env:
         refined = _resolve_env_plan(
             resolver, plan, base_image,
-            build_and_measure=_run_measure, echo=echo, clock=clock,
+            build_and_measure=_run_measure,
+            validate_candidate=plugin.validate_dep_plan,
+            echo=echo, clock=clock,
         )
         lock = refined.lock
     else:

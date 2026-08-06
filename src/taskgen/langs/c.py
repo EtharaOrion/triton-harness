@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan, FlagValue, canonicalize, validate
+from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
@@ -43,6 +43,9 @@ __all__ = [
     'C_MEASURE_DEP_PLAN',
     'GRADER_FINGERPRINT_GLOBS',
     'MEASURE_NO_WARM_COMMENT',
+    'REQUIRED_BUILD_FLAGS',
+    'REQUIRED_PLAN_SLOTS',
+    'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
     'UNIT_NAMES',
 ]
@@ -122,6 +125,31 @@ _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
 #: How the gap's prose names each package manager `depplan` allows for c.
 _MANAGER_LABELS: Mapping[str, str] = {'make': 'GNU Make', 'cmake': 'CMake'}
 
+#: Every `build_flags` key `render_gap` interpolates. Enumerated once, read by
+#: BOTH the renderer and `CPlugin.validate_dep_plan`, so a flag added to the
+#: rendered text without being added here is the only way the two can disagree.
+REQUIRED_BUILD_FLAGS: tuple[str, ...] = ('link_libraries', 'make_version')
+
+#: Every `test_invocation` key the c measure path needs. `render_gap` itself
+#: does not interpolate one -- the measure script runs the graded targets -- but
+#: a plan that does not state the command it was resolved FOR is a plan nobody
+#: can check against the image it produced, so it is required at the same gate.
+REQUIRED_TEST_INVOCATION_KEYS: tuple[str, ...] = ('command',)
+
+#: The same requirements as the resolver is told them, before it answers. Kept
+#: adjacent to the checks above so the ask and the rejection cannot drift apart.
+REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
+    'build_flags["link_libraries"] must be a non-empty string: the linker flags '
+    'the repo builds with, e.g. "-lm -lpthread -ldl"',
+    'build_flags["make_version"] must be a non-empty string: the GNU make '
+    'version the base image ships, e.g. "4.3"',
+    'package_manager must be one of: cmake, make',
+    'test_invocation["command"] must be a non-empty list of argv tokens: the '
+    'command that runs the whole graded suite, e.g. ["make", "test"]',
+    'toolchain_version must carry at least major.minor, e.g. "13.3.0": the gcc '
+    'pin asserted at build time is derived from its first two components',
+)
+
 
 def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
     """A build flag the gap's rendered text needs, or a refusal to render at all."""
@@ -131,10 +159,45 @@ def _flag_str(build_flags: tuple[tuple[str, FlagValue], ...], key: str) -> str:
                 return value
             break
     raise B.LangError(
-        f'the c gap needs build_flags[{key!r}] as a non-empty string; a plan '
-        'without it would render a Dockerfile comment with a hole in it, and a '
-        'hole in the toolchain description is how a base swap goes unnoticed'
+        f'the c gap needs build_flags[{key!r}]: it must be a non-empty string. '
+        'A plan without it would render a Dockerfile comment with a hole in it, '
+        'and a hole in the toolchain description is how a base swap goes unnoticed'
     )
+
+
+def _test_tokens(
+    test_invocation: tuple[tuple[str, TestValue], ...], key: str,
+) -> tuple[str, ...]:
+    """A test_invocation entry the c measure path needs, as argv tokens."""
+    for name, value in test_invocation:
+        if name == key:
+            tokens = (value,) if isinstance(value, str) else tuple(value)
+            if tokens and all(token.strip() for token in tokens):
+                return tokens
+            break
+    raise B.LangError(
+        f'the c plan needs test_invocation[{key!r}]: it must be a non-empty list '
+        'of argv tokens naming the command that runs the graded suite. A plan '
+        'that does not state what it was resolved to RUN cannot be checked '
+        'against the image it produced'
+    )
+
+
+def _major_minor(toolchain_version: str) -> str:
+    """The `major.minor` the image's gcc pin asserts, or a refusal to render.
+
+    A one-component version would widen the pin from `*13.3*` to `*13*`, which
+    matches every 13.x the base ever ships -- an assert that cannot fail is not
+    an assert, so an under-specified version is rejected instead of narrowed.
+    """
+    pin = '.'.join(toolchain_version.split('.')[:2])
+    if pin.count('.') != 1:
+        raise B.LangError(
+            f'toolchain_version {toolchain_version!r} has no major.minor to pin '
+            'gcc against; a one-component version would make the pin assert '
+            'match every 13.x the base image ever ships'
+        )
+    return pin
 
 
 class CPlugin(B.LangPlugin):
@@ -155,6 +218,11 @@ class CPlugin(B.LangPlugin):
     #: because principle 5 allows apt and ONLY apt, and a model not told so
     #: reaches for curl.
     baked_capabilities: ClassVar[tuple[str, ...]] = BAKED_CAPABILITIES
+
+    #: What `render_gap` reads and `depplan.validate` cannot know about. Stated
+    #: to the model in the prompt, enforced by `validate_dep_plan` before a
+    #: build; the two read the same tuple.
+    required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
     unit_names: ClassVar[tuple[str, ...]] = UNIT_NAMES
@@ -519,6 +587,39 @@ class CPlugin(B.LangPlugin):
 
     # --- axis 8 + the image ----------------------------------------------
 
+    def validate_dep_plan(self, plan: DepPlan) -> None:
+        """Every precondition `render_gap` has, checked before a container exists.
+
+        A real model returned a plan that cleared `depplan.validate` -- correct
+        schema, allowlisted manager, no metacharacter -- and still exploded
+        inside `render_gap`, because the generic validator is lang-agnostic and
+        c's gap interpolates two `build_flags` the schema has never heard of.
+        Reached from the refine loop, that crash escaped a handler that only
+        knew `MeasureError` and aborted the whole generate.
+
+        This is the same set of checks `render_gap` makes, hoisted to where they
+        cost nothing and can still be repaired: same helpers, same messages, so
+        a plan accepted here cannot then fail to render.
+        """
+        validate(plan)
+        plan = canonicalize(plan)
+        if plan.lang != self.name:
+            raise B.LangError(
+                f'the c gap cannot render a {plan.lang!r} plan; a gap is the one '
+                'part of a Dockerfile that is language-specific by definition'
+            )
+        _major_minor(plan.toolchain_version)
+        if plan.package_manager not in _MANAGER_LABELS:
+            raise B.LangError(
+                f'the c gap has no prose for package_manager '
+                f'{plan.package_manager!r}; expected one of '
+                f'{", ".join(sorted(_MANAGER_LABELS))}'
+            )
+        for key in REQUIRED_BUILD_FLAGS:
+            _flag_str(plan.build_flags, key)
+        for key in REQUIRED_TEST_INVOCATION_KEYS:
+            _test_tokens(plan.test_invocation, key)
+
     def render_gap(self, plan: DepPlan) -> str:
         """c's toolchain + dependency bytes, rendered from a plan instead of a literal.
 
@@ -545,13 +646,7 @@ class CPlugin(B.LangPlugin):
                 'part of a Dockerfile that is language-specific by definition'
             )
 
-        pin = '.'.join(plan.toolchain_version.split('.')[:2])
-        if pin.count('.') != 1:
-            raise B.LangError(
-                f'toolchain_version {plan.toolchain_version!r} has no major.minor '
-                'to pin gcc against; a one-component version would make the pin '
-                'assert match every 13.x the base image ever ships'
-            )
+        pin = _major_minor(plan.toolchain_version)
         manager = plan.package_manager
         lines = [
             f'# harbor-base already ships gcc {plan.toolchain_version} and '

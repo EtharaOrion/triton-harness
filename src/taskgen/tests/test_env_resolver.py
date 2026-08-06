@@ -236,7 +236,8 @@ def test_the_prompt_cannot_contain_a_test_body_because_nothing_accepts_one() -> 
     assert body not in prompt
     assert 'assert' not in prompt
     # Structural, not incidental: the only parameters are the manifest map, the
-    # capability list, the test PATHS, the framework and a repair message.
+    # capability list, the test PATHS, the framework, the per-language required
+    # slot list (plugin-declared, never repo-derived) and a repair message.
     params = set(inspect.signature(R.build_user_prompt).parameters)
     assert params == {
         'lang',
@@ -244,6 +245,7 @@ def test_the_prompt_cannot_contain_a_test_body_because_nothing_accepts_one() -> 
         'manifest_files',
         'test_paths',
         'framework',
+        'required_slots',
         'repair',
     }
     assert set(inspect.signature(R.resolve_dep_plan).parameters) == {
@@ -253,8 +255,22 @@ def test_the_prompt_cannot_contain_a_test_body_because_nothing_accepts_one() -> 
         'manifest_files',
         'test_paths',
         'framework',
+        'required_slots',
         'repair',
     }
+
+
+def test_a_required_slot_cannot_smuggle_a_body_either() -> None:
+    """The new channel gets the same multi-line gate every other one has."""
+    with pytest.raises(R.ResolverError, match='spans multiple lines'):
+        R.build_user_prompt(
+            lang='c',
+            toolchain_capabilities=CAPABILITIES,
+            manifest_files={'Makefile': 'all:\n'},
+            test_paths=['tests/unit/gc_test.c'],
+            framework='make',
+            required_slots=['build_flags["make_version"]\nvoid xs_gc_mark(void) {}'],
+        )
 
 
 def test_a_multiline_test_path_is_a_body_and_is_refused() -> None:

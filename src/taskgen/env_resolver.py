@@ -179,18 +179,34 @@ def build_user_prompt(
     manifest_files: dict[str, str],
     test_paths: list[str],
     framework: str,
+    required_slots: list[str] | None = None,
     repair: str | None = None,
 ) -> str:
     """The user half of the resolution request. Deterministic, and body-free.
 
     Every list is sorted, so two callers holding the same facts in a different
     order send the same bytes and (for a temperature-0 client) get the same plan.
+
+    `required_slots` is the per-language contract the generic OUTPUT schema
+    above cannot express: c's gap interpolates `build_flags['make_version']`,
+    and a model never told so emits a schema-valid plan that cannot be rendered.
+    Stating the slots up front is what makes attempt 1 succeed instead of
+    spending a repair on a requirement we already knew. It carries slot names
+    and shapes only -- it comes off the plugin, never off the repo, so the leak
+    boundary the rest of this function holds is not weakened by it.
     """
     sections = [
         f'# Language\n{lang}',
         '# Base image capabilities\n'
         + ('\n'.join(f'- {c}' for c in sorted(set(toolchain_capabilities))) or '- (none given)'),
     ]
+
+    slots = sorted({_reject_multiline(s, 'a required slot') for s in required_slots or ()})
+    if slots:
+        sections.append(
+            f'# Required plan slots for {lang} (the renderer REFUSES a plan '
+            'missing any of these)\n' + '\n'.join(f'- {s}' for s in slots)
+        )
 
     manifests = [
         f'## {name}\n```\n{content}\n```'
@@ -366,6 +382,7 @@ def resolve_dep_plan(
     manifest_files: dict[str, str],
     test_paths: list[str],
     framework: str,
+    required_slots: list[str] | None = None,
     repair: str | None = None,
 ) -> DepPlan | Refuse:
     """One resolution round trip: ask the injected client, parse, validate.
@@ -387,6 +404,7 @@ def resolve_dep_plan(
         manifest_files=manifest_files,
         test_paths=test_paths,
         framework=framework,
+        required_slots=required_slots,
         repair=repair,
     )
     response = client.complete(SYSTEM_PROMPT, user, max_tokens=MAX_RESPONSE_TOKENS)

@@ -49,6 +49,7 @@ __all__ = [
     'base_capabilities',
     'detect_framework',
     'gather_resolver_inputs',
+    'required_plan_slots',
 ]
 
 
@@ -195,6 +196,19 @@ def base_capabilities(plugin) -> tuple[str, ...]:
     declared = tuple(str(c) for c in getattr(plugin, 'baked_capabilities', ()))
     env = plugin.toolchain_spec().env
     return tuple(sorted(set(declared) | {f'ENV {k}={v}' for k, v in env.items()}))
+
+
+def required_plan_slots(plugin) -> tuple[str, ...]:
+    """The plan slots this language's gap cannot render without.
+
+    Read off the plugin for the same reason `base_capabilities` is: the plugin
+    already had to know them to write `render_gap`, and `validate_dep_plan`
+    enforces exactly this list. A second spelling anywhere else is how the model
+    starts being rejected for a requirement it was never shown.
+
+    Not gathered from the repo, so nothing here can carry a body.
+    """
+    return tuple(sorted({str(s) for s in getattr(plugin, 'required_plan_slots', ())}))
 
 
 # --------------------------------------------------------------------------

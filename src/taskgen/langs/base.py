@@ -440,6 +440,16 @@ class LangPlugin(abc.ABC):
     #: the prompt and the image start disagreeing about what is installed.
     baked_capabilities: ClassVar[tuple[str, ...]] = ()
 
+    #: The plan slots THIS language's `render_gap` cannot render without, each
+    #: one imperative sentence naming the slot, as `--resolve-env` states them
+    #: to the model. `depplan.validate` is lang-AGNOSTIC and by design knows
+    #: nothing about `build_flags['make_version']`, so a schema-valid plan can
+    #: still be unrenderable; this is the half of that gap the model is TOLD,
+    #: and `validate_dep_plan` is the half that is ENFORCED. Declared on one
+    #: class so an unannounced rejection and an unenforced promise are both a
+    #: one-file review. Leak-safe: slot names and shapes only, never a body.
+    required_plan_slots: ClassVar[tuple[str, ...]] = ()
+
     def __init__(self) -> None:
         if not self.name:
             raise LangError(f'{type(self).__name__}: name is required')
@@ -582,6 +592,27 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
         pinned version.
         """
         return ()
+
+    def validate_dep_plan(self, plan: DepPlan) -> None:
+        """Raise `LangError` unless `render_gap` could render this plan.
+
+        The lang-aware half of admissibility. `depplan.validate` closes the
+        enums and the metacharacter gate for EVERY language, which is exactly
+        why it cannot know that c's gap interpolates `build_flags`
+        ['make_version'] into a comment: a schema-valid plan is therefore not
+        yet a renderable one, and the difference used to surface as a crash
+        halfway through rendering a Dockerfile.
+
+        Called BEFORE the docker build, so a plan that cannot be rendered costs
+        no image; the raised message is fed back to the model as the repair, so
+        it must name the missing slot in words a resolver can act on and must
+        carry no source, no test body and no repo path.
+
+        The default is a no-op because most gaps read only the fields
+        `depplan.validate` already guarantees. A plugin that overrides
+        `render_gap` and reads more than that overrides this too.
+        """
+        return None
 
     def render_gap(self, plan: DepPlan) -> str:
         """The language GAP: the toolchain/dependency provisioning bytes, from a plan.

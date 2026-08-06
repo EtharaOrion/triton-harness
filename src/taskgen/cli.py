@@ -30,7 +30,7 @@ from .emit import DEFAULT_BUDGET, DEFAULT_SEED, emit_all
 from .env_resolver import EnvResolver, ResolveRefused
 from .langs import base
 from .llm_resolver import LlmEnvResolver, ResolverTransportError
-from .resolver_inputs import base_capabilities
+from .resolver_inputs import base_capabilities, required_plan_slots
 from .scope import CarveScope
 
 #: Where `--repo-url` clones land by default: the same directory `verify`
@@ -119,9 +119,11 @@ def build_env_resolver(args, *, echo=print) -> EnvResolver:
 
     endpoint = str(cfg['base_url'])
     echo(f'resolve-env  asking {cfg["model"]} via {endpoint}')
+    plugin = base.get(args.lang)
     return LlmEnvResolver(
         client=client_from_config(cfg),
-        capabilities=base_capabilities(base.get(args.lang)),
+        capabilities=base_capabilities(plugin),
+        required_slots=required_plan_slots(plugin),
         endpoint=endpoint,
         echo=echo,
     )

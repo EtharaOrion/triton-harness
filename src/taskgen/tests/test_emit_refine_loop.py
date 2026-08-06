@@ -54,6 +54,13 @@ TWO_APT_RESPELT = dataclasses.replace(GOOD_PLAN, apt_packages=('libpq-dev', ' li
 #: Rejected by `depplan.validate`: c is provisioned by cmake or make, never npm.
 INVALID_PLAN = dataclasses.replace(GOOD_PLAN, package_manager='npm')
 
+#: Accepted by `depplan.validate` and FATAL to `render_gap` -- the live failure.
+#: `CPlugin.validate_dep_plan` is the only thing standing between it and a
+#: traceback out of `generate`.
+UNRENDERABLE_PLAN = dataclasses.replace(
+    GOOD_PLAN, build_flags=(('link_libraries', '-lm -lpthread -ldl'),),
+)
+
 LINKER_ERROR = "undefined reference to `xs_gc_mark'"
 
 
@@ -449,11 +456,31 @@ class FailThenBuildRunner:
         self.removed.append(image)
 
 
+class AlwaysBuildsRunner(FailThenBuildRunner):
+    """docker that never fails, so a build COUNT is a statement about the gate.
+
+    `FailThenBuildRunner` scripts a failing first build, which is the wrong
+    instrument for "the plan was rejected before docker was asked": that has to
+    be measured against a runner whose only reason not to have built is that it
+    was never called.
+    """
+
+    def build_with_contexts(self, *, image, dockerfile, context, contexts):
+        self.builds.append(Path(dockerfile).read_text())
+        return 'BUILD OK'
+
+
 @pytest.fixture(autouse=True)
 def fake_docker(monkeypatch):
     FailThenBuildRunner.instances = []
     monkeypatch.setattr('taskgen.verify.DockerRunner', FailThenBuildRunner)
     return FailThenBuildRunner
+
+
+@pytest.fixture
+def docker_that_always_builds(monkeypatch):
+    monkeypatch.setattr('taskgen.verify.DockerRunner', AlwaysBuildsRunner)
+    return AlwaysBuildsRunner
 
 
 def lock_path(out: Path, plan_obj) -> Path:
@@ -481,6 +508,57 @@ def test_the_lock_pins_the_repaired_plan_and_never_the_failed_one(plan, tmp_path
     assert env['dep_plan_digest'] == depplan.dep_plan_digest(OTHER_PLAN)
     assert env['dep_plan_digest'] != depplan.dep_plan_digest(GOOD_PLAN)
     assert pinned.graded.expected == 3
+
+
+def test_an_unrenderable_plan_is_repaired_before_docker_is_ever_asked(
+    plan, tmp_path, docker_that_always_builds,
+):
+    """The live crash, end to end through emit -- now a repair instead of an abort.
+
+    `_run_measure` is the frame the `LangError` was raised in; asserting there
+    was exactly ONE docker build proves the plugin gate ran BEFORE it, so the
+    unrenderable answer cost no image rather than half of one.
+    """
+    out = tmp_path / 'out'
+    resolver = ScriptedResolver(UNRENDERABLE_PLAN, GOOD_PLAN)
+
+    pinned = emit._measure_and_pin(
+        plan, B.get('c'), out, echo=lambda *_: None,
+        resolve_env=True, resolver=resolver,
+    )
+
+    assert resolver.calls == 2
+    repair = resolver.repairs[1]
+    assert repair is not None and 'make_version' in repair
+    assert str(plan.repo) not in repair
+
+    runner = FailThenBuildRunner.instances[-1]
+    assert len(runner.builds) == 1
+
+    env = json.loads(lock_path(out, plan).read_text())[M.LOCK_ENV_BLOCK]
+    assert env['dep_plan_digest'] == depplan.dep_plan_digest(GOOD_PLAN)
+    assert pinned.graded.expected == 3
+
+
+def test_an_unrenderable_plan_the_model_never_fixes_is_a_clean_refusal(
+    plan, tmp_path, docker_that_always_builds,
+):
+    """Exit 3 with no lock, not exit 1 with a traceback."""
+    out = tmp_path / 'out'
+    resolver = ScriptedResolver(*(
+        dataclasses.replace(UNRENDERABLE_PLAN, apt_packages=(pkg,))
+        for pkg in ('libffi-dev', 'libpq-dev', 'libssl-dev')
+    ))
+
+    with pytest.raises(ResolveRefused) as excinfo:
+        emit._measure_and_pin(
+            plan, B.get('c'), out, echo=lambda *_: None,
+            resolve_env=True, resolver=resolver,
+        )
+
+    assert 'make_version' in excinfo.value.reason
+    assert not lock_path(out, plan).exists()
+    assert FailThenBuildRunner.instances[-1].builds == []
 
 
 def test_a_refine_that_refuses_writes_no_lock_at_all(plan, tmp_path):

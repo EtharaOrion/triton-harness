@@ -53,15 +53,18 @@ from . import depplan
 from . import measure as measure_mod
 from .depplan import DepPlan
 from .env_resolver import EnvResolver, Refuse, ResolveRefused
+from .langs.base import LangError
 
 __all__ = [
     'MeasureAttempt',
     'NO_COLLECT_REPAIR',
     'NO_PROGRESS_REASON',
+    'PlanValidator',
     'RESOLVE_ATTEMPT_BUDGET_S',
     'RESOLVE_ATTEMPT_CAP',
     'RESOLVE_TOTAL_BUDGET_S',
     'RefinedEnv',
+    'accept_any_plan',
     'refine_dep_plan',
 ]
 
@@ -106,6 +109,28 @@ class MeasureAttempt(Protocol):
     """
 
     def __call__(self, dep_plan: DepPlan) -> dict: ...
+
+
+class PlanValidator(Protocol):
+    """Reject a candidate this language could not RENDER, before it is built.
+
+    `depplan.validate` is lang-agnostic and cannot know that c's gap
+    interpolates `build_flags['make_version']`, so a schema-valid plan can still
+    be unrenderable. `langs.base.LangPlugin.validate_dep_plan` is what emit
+    passes here; the loop only needs it to raise `LangError` with a message a
+    model can act on, which is why it arrives as a callable rather than as a
+    plugin -- this module stays free of the plugin registry, as it is of docker.
+
+    Positional-only: the loop passes the candidate by position, so a plugin
+    method is bindable here whatever it calls its own parameter.
+    """
+
+    def __call__(self, plan: DepPlan, /) -> None: ...
+
+
+def accept_any_plan(plan: DepPlan, /) -> None:
+    """The default `PlanValidator`: the generic schema gate is the only gate."""
+    return None
 
 
 @dataclass(frozen=True)
@@ -154,6 +179,7 @@ def refine_dep_plan(
     repo: Path,
     base_image: str,
     build_and_measure: MeasureAttempt,
+    validate_candidate: PlanValidator = accept_any_plan,
     echo: Callable[[str], object] = print,
     clock: Callable[[], float] = time.monotonic,
     attempt_cap: int = RESOLVE_ATTEMPT_CAP,
@@ -174,9 +200,19 @@ def refine_dep_plan(
       3. dedupe              -- an already-tried plan. Checked before the build,
                                 because rebuilding it would burn the budget to
                                 re-derive a failure we have already seen.
-      4. build/collect       -- `MeasureError.stderr`, already scrubbed once by
-                                `measure`, is the repair.
-      5. `expected < 1`      -- built, ran, collected nothing.
+      4. `validate_candidate` -- admissible, but not RENDERABLE by this
+                                language: a slot its gap interpolates is missing
+                                or empty. Lang-aware, so `depplan.validate`
+                                structurally cannot catch it, and checked here
+                                rather than at render time so the answer costs
+                                no image and stays repairable.
+      5. build/collect       -- `MeasureError.stderr`, already scrubbed once by
+                                `measure`, is the repair. A `LangError` escaping
+                                the renderer here is repaired the same way: (4)
+                                should have caught it, and a gap between the two
+                                is a bug to be repaired, never a crash that
+                                aborts the generate.
+      6. `expected < 1`      -- built, ran, collected nothing.
 
     Only (1), the dedupe gate, the budgets and a cap exhaustion leave this
     function as a `ResolveRefused`; only a plan that cleared ALL of them leaves
@@ -221,6 +257,17 @@ def refine_dep_plan(
             echo(f'resolve attempt {attempt}/{attempt_cap}: plan rejected by validate; repairing')
             continue
 
+        try:
+            validate_candidate(candidate)
+        except LangError as exc:
+            last_failure = _repair_message(str(exc), repo)
+            repair = last_failure
+            echo(
+                f'resolve attempt {attempt}/{attempt_cap}: plan is not renderable '
+                f'by the {lang} gap; repairing without building it'
+            )
+            continue
+
         attempt_started = clock()
         try:
             lock = dict(build_and_measure(candidate))
@@ -228,6 +275,13 @@ def refine_dep_plan(
             last_failure = _repair_message(exc.stderr or str(exc), repo)
             repair = last_failure
             echo(f'resolve attempt {attempt}/{attempt_cap}: measure failed; repairing')
+        except LangError as exc:
+            last_failure = _repair_message(str(exc), repo)
+            repair = last_failure
+            echo(
+                f'resolve attempt {attempt}/{attempt_cap}: the {lang} gap refused '
+                'to render the plan; repairing'
+            )
         else:
             expected = int(lock.get('expected', 0) or 0)
             if expected >= 1:

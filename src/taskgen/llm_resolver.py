@@ -77,6 +77,7 @@ class LlmEnvResolver:
 
     client: ResolverClient
     capabilities: tuple[str, ...] = ()
+    required_slots: tuple[str, ...] = ()
     endpoint: str = ''
     echo: Callable[[str], object] = field(default=print)
 
@@ -106,6 +107,10 @@ class LlmEnvResolver:
             manifest_files=dict(inputs.manifest_files),
             test_paths=list(inputs.test_paths),
             framework=inputs.framework,
+            # The plugin's own pre-render gate rejects a plan missing one of
+            # these, so a model not shown them is being marked against a rubric
+            # it was never given.
+            required_slots=list(self.required_slots),
             repair=repair,
         )
 
