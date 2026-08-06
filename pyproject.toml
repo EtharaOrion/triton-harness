@@ -17,7 +17,7 @@ dependencies = [
     "tree-sitter-go==0.23.4",
     "tqdm",
     "numpy>=1.26",
-    "harbor",
+    "harbor==0.20.0",
 ]
 
 [project.scripts]
@@ -26,11 +26,8 @@ taskgen = "taskgen.cli:main"
 [dependency-groups]
 dev = ["pytest"]
 
-# harbor is the benchmarking runtime CLI (`harbor run -a oracle`, etc.).
-# It is pulled as an out-of-workspace uv path source: a git submodule of
-# github.com/harbor-framework/harbor pinned in triton/.gitmodules.
-[tool.uv.sources]
-harbor = { path = "../../harbor" }
+# harbor is the benchmarking runtime CLI (`harbor run -a oracle`, etc.), pinned
+# to the public PyPI release (github.com/harbor-framework/harbor, Apache-2.0).
 
 # Package only taskgen: the sibling src/eval (MRGBench GPU) and src/parser are
 # deliberately excluded so uv never pulls the heavy inference stack. The parser

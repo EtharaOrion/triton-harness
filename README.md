@@ -151,13 +151,13 @@ A parser-backed language can carve a single function body, or every function bod
 
 ## Environment
 
-The generator is a uv project rooted at this directory (the taskgen harness). It pins the taskgen dependencies and pulls the shared harbor tooling as an editable path dependency. The MRGBench GPU stack in `requirement.txt` is separate and untouched.
+The generator is a uv project rooted at this directory (the taskgen harness). It pins the taskgen dependencies and the `harbor` runtime CLI from PyPI (`harbor==0.20.0`); the shared harbor tooling is vendored in-tree under `src/harbor_tooling`. The MRGBench GPU stack in `requirement.txt` is separate and untouched.
 
 ```bash
 uv sync
 ```
 
-That creates `.venv` and installs the pinned dependencies (tree-sitter, numpy, tqdm), the harbor tooling package (editable, from `../../harbor-tasks`), and the dev tools (pytest). Run everything through `uv run`, which keeps the environment in sync:
+That creates `.venv` and installs the pinned dependencies (tree-sitter, numpy, tqdm, and the `harbor` CLI from PyPI) plus the dev tools (pytest); the harbor tooling package is vendored in-tree (`src/harbor_tooling`). Run everything through `uv run`, which keeps the environment in sync:
 
 ```bash
 uv run taskgen --help    # console entry point
