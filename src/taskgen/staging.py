@@ -83,6 +83,8 @@ __all__ = [
     'StagingError',
     'Tripwire',
     'TripwireError',
+    'bundle_tripwire_lines',
+    'merge_bundle_tripwires',
     'stage_carved_tree',
 ]
 
@@ -317,6 +319,100 @@ def _derive_tripwires(
         out.append(tw)
         chosen.add(harbor_stage_context.norm(tw.pattern) if tw.kind == 'line' else tw.pattern)
     return tuple(out)
+
+
+#: How many verifier-bundle lines are merged into the tripwire set. leakscan.sh
+#: greps the whole image once per pattern, so an unbounded merge would turn a
+#: cheap gate into a multi-minute one for no extra coverage: the longest lines
+#: are the distinctive ones, and a leak large enough to matter carries several.
+MAX_BUNDLE_TRIPWIRES = 64
+
+
+def _read_all(root: Path) -> str:
+    texts = []
+    for path in sorted(Path(root).rglob('*')):
+        if not path.is_file() or path.is_symlink():
+            continue
+        text = harbor_stage_context.read_text(path)
+        if text is not None:
+            texts.append(text)
+    return '\n'.join(texts)
+
+
+def bundle_tripwire_lines(bundle_dir: Path, repo_dir: Path, oracle_dir: Path, *,
+                          existing=(), limit: int = MAX_BUNDLE_TRIPWIRES) -> tuple[str, ...]:
+    """ORACLE lines that a verifier bundle quotes, as `grep -F` tripwires (D6).
+
+    Candidates are drawn from the ORACLE, not from the bundle, and one is kept
+    only when the bundle's text actually contains it. Substring, not line
+    equality: a generated test quotes an answer fragment INSIDE a larger line
+    (`expected = "<answer line>"`), which a line-for-line comparison misses.
+
+    Acceptance, and the last rule is the one that was MEASURED:
+
+      * `STRONG_TRIPWIRE_CHARS`, not harbor's 24, for the reason recorded above;
+      * absent from every surviving line of the STAGED tree, so a pattern can
+        never fire on content the image is supposed to contain;
+      * no tab/NUL, which `grep -F -f` round-trips badly;
+      * ORACLE-ANCHORED -- the pattern is carved source, never bundle prose.
+
+    WHY ORACLE-ANCHORED RATHER THAN "any distinctive bundle line". Merging the
+    bundle's own distinctive lines was tried and it FAILS the leak gate. A
+    generated pytest module offered
+    `if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):` -- 61 chars,
+    absent from the entire a2a-python tree, so every length/survivor rule
+    accepted it -- and leakscan then hit it in `coverage/regions.py` inside the
+    graded image's own `.venv` and failed the build. Bundle text is
+    model-authored general-purpose code and prose; length plus survivor-absence
+    does NOT make it repo-specific, and a tripwire that is not repo-specific is a
+    false-positive generator. An oracle line carries the carved code's own
+    distinctiveness, so it is exactly as collision-safe as the per-file tripwire
+    beside it.
+
+    This is also precisely the case PLAN 8/D6 names: "a generated test quotes an
+    answer fragment that then somehow reaches a layer". The per-file picker binds
+    ONE line per carved file; a bundle quoting any OTHER oracle line was
+    uncovered before, and is not now.
+    """
+    survivors = harbor_stage_context.surviving_lines(Path(repo_dir))
+    bundle_text = _read_all(bundle_dir)
+    seen = {harbor_stage_context.norm(line) for line in existing}
+    candidates: list[str] = []
+    for line in _read_all(oracle_dir).splitlines():
+        stripped = line.strip()
+        if len(stripped) < STRONG_TRIPWIRE_CHARS:
+            continue
+        if '\t' in stripped or '\x00' in stripped:
+            continue
+        n = harbor_stage_context.norm(stripped)
+        if n in survivors or n in seen:
+            continue
+        if stripped not in bundle_text:
+            continue
+        seen.add(n)
+        candidates.append(stripped)
+    candidates.sort(key=lambda s: (-len(s), s))
+    return tuple(sorted(candidates[:limit]))
+
+
+def merge_bundle_tripwires(staged: StagedTree, bundle_dir: Path, *,
+                           limit: int = MAX_BUNDLE_TRIPWIRES) -> tuple[str, ...]:
+    """Append the bundle's tripwires to the trip context. Returns what was added.
+
+    Rewrites `trip/tripwires.txt` in place, which is the single file both
+    `leakscan.sh` (in-build) and verify's layer archaeology read, so one write
+    hardens both. Only ever called when a bundle was actually produced: a run
+    without `--verifier` leaves the file byte-identical.
+    """
+    path = staged.tripwire_path
+    current = [ln for ln in path.read_text(encoding='utf-8').splitlines() if ln.strip()]
+    added = bundle_tripwire_lines(bundle_dir, staged.repo_dir, staged.oracle_dir,
+                                  existing=current, limit=limit)
+    if not added:
+        return ()
+    merged = current + list(added)
+    path.write_text('\n'.join(merged) + '\n', encoding='utf-8', newline='\n')
+    return added
 
 
 # --------------------------------------------------------------------------

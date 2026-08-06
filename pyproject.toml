@@ -39,7 +39,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["taskgen*", "harbor_tooling*"]
+include = ["taskgen*", "harbor_tooling*", "verifier*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

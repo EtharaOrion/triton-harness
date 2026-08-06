@@ -107,3 +107,6 @@ Temporary Items
 .venv-taskgen/
 src/taskgen/**/__pycache__/
 *.pyc
+
+# verifier LLM endpoint config (D7): points at the local proxy, never committed
+.llm_config
