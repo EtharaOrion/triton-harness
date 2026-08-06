@@ -9,8 +9,11 @@
     python -m taskgen.cli verify --entry <dir> [--repo <repo>] [--keep-image]
     python -m taskgen.cli verify --all <out-dir> [--repo <repo>] [--keep-image]
 
-`generate` is offline and deterministic: run it twice into two directories and
-`diff -r` them.
+`generate` is offline and deterministic for python and go, and for any run that
+reuses a pinned `graded.lock.json`: run it twice into two directories and
+`diff -r` them. A COLD whole-suite run (c, cpp, java, rust) resolves its
+environment from a model first, which is a normal step of generating those
+tasks; `--no-resolve-env` opts out to the plugin's hardcoded environment.
 
 `verify` needs docker: it builds the entry's carved image and reads the reward
 out of two real container runs -- untouched (must be 0.0) and after the oracle
@@ -87,35 +90,49 @@ def resolve_source(args, echo=print) -> tuple[Path, str | None, str | None, str 
     return repo, source, '', 'floating'
 
 
+def no_llm_config_message(lang: str, detail: str) -> str:
+    """The refusal a cold whole-suite run gets when no model is reachable.
+
+    Both remedies by name, because the two are genuinely different decisions and
+    neither is the tool's to make: a resolved environment is what the task's
+    floor is measured in, so degrading quietly to the hardcoded one would ship a
+    task whose environment nobody chose and nobody could tell apart afterwards.
+    """
+    return (
+        f'resolving the environment for --lang {lang}: {detail}\n'
+        'Resolving is a normal step of generating a whole-suite task -- the '
+        'DepPlan it produces builds the measure image AND the environment the '
+        'task ships -- and this run has no valid pinned environment in '
+        'graded.lock.json to reuse, so there is nothing to fall back on that '
+        'anybody vouched for. Either:\n'
+        '  * point --llm-config at the JSON naming your bridge, e.g. '
+        '--llm-config .llm_config/claude-code-oauth.json (or put one at the '
+        'repo-root .llm_config, which is discovered automatically); or\n'
+        f'  * pass --no-resolve-env to generate against the hardcoded {lang} '
+        'environment instead.\n'
+        'The run refuses rather than silently degrading to an environment '
+        'nobody resolved.'
+    )
+
+
 def build_env_resolver(args, *, echo=print) -> EnvResolver:
-    """The real resolver for a `--resolve-env` run: config in, client out.
+    """The real resolver: config in, client out.
 
     The ONLY place a generate run learns how to reach a model, at the cli
     boundary so `emit`'s import graph stays free of anything that opens a socket.
 
-    `--llm-config` is REQUIRED, unlike `--verifier`'s: a wrong proxy costs that
-    feature a bundle, but costs this one the task's floor, and a run that
-    resolved against whatever `.llm_config` was lying in the repo root would pin
-    a lock nobody chose.
+    `--llm-config` is discovered exactly the way `--verifier`'s is, through
+    `verifier.llm_config.resolve_config`: one repo has one bridge, and making
+    the user retype its path for a step that now runs by default would be
+    friction with nothing behind it. What is NOT shared with `--verifier` is the
+    consequence of not finding one -- see `no_llm_config_message`.
     """
-    if not args.llm_config:
-        raise SystemExit(
-            '--resolve-env requires --llm-config PATH: the environment is '
-            'resolved by a model, and there is no default proxy to fall back '
-            'to. Point it at the JSON naming your bridge, e.g. '
-            '--llm-config .llm_config/claude-code-oauth.json'
-        )
-    try:
-        emit_mod.assert_resolve_env_supported(args.lang)
-    except base.LangError as exc:
-        raise SystemExit(f'--resolve-env: {exc}') from exc
-
-    from verifier.llm_config import LLMConfigError, client_from_config, load_llm_config
+    from verifier.llm_config import LLMConfigError, client_from_config, resolve_config
 
     try:
-        cfg = load_llm_config(args.llm_config)
+        cfg = resolve_config(args.llm_config)
     except LLMConfigError as exc:
-        raise SystemExit(f'--resolve-env: {exc}') from exc
+        raise SystemExit(no_llm_config_message(args.lang, str(exc))) from exc
 
     endpoint = str(cfg['base_url'])
     plugin = base.get(args.lang)
@@ -129,9 +146,61 @@ def build_env_resolver(args, *, echo=print) -> EnvResolver:
     )
 
 
+class DeferredEnvResolver:
+    """A resolver that discovers its config on the FIRST ASK, not before.
+
+    Deferred because a WARM lock never asks. `_measure_and_pin` returns the
+    pinned environment before it reaches a resolver, so a regeneration over a
+    valid lock needs no config, no bridge and no model -- and building the
+    client up front would demand all three of a run that provably uses none of
+    them, and would drag the model sdk into a process that contacts nothing.
+
+    The first ask is also the first moment the failure is REAL, which is why the
+    loud message lives here rather than in argument parsing: "cold" is not
+    knowable until the lock has been read.
+    """
+
+    def __init__(self, args, *, echo=print):
+        self._args = args
+        self._echo = echo
+        self._delegate: EnvResolver | None = None
+
+    def built(self) -> EnvResolver:
+        if self._delegate is None:
+            self._delegate = build_env_resolver(self._args, echo=self._echo)
+        return self._delegate
+
+    def __call__(self, *, lang: str, repo: Path, base_image: str,
+                 repair: str | None = None):
+        return self.built()(
+            lang=lang, repo=repo, base_image=base_image, repair=repair,
+        )
+
+
+def env_resolution_mode(args) -> bool | None:
+    """`--no-resolve-env` off, `--resolve-env` forced, neither the default."""
+    if args.no_resolve_env:
+        return False
+    return True if args.resolve_env else None
+
+
+def build_generate_resolver(args, *, echo=print) -> EnvResolver | None:
+    """The resolver this run will use, or None because it will not resolve.
+
+    None is returned for the opted-out run AND for a parser-backed language,
+    which runs no measure phase at all: constructing a resolver for a run that
+    structurally cannot use one would be a promise the pipeline cannot keep.
+    """
+    try:
+        wanted = emit_mod.resolution_wanted(args.lang, env_resolution_mode(args))
+    except base.LangError as exc:
+        raise SystemExit(f'--resolve-env: {exc}') from exc
+    return DeferredEnvResolver(args, echo=echo) if wanted else None
+
+
 def cmd_generate(args) -> int:
     repo, repo_url, commit, clone_kind = resolve_source(args)
-    resolver = build_env_resolver(args) if args.resolve_env else None
+    resolver = build_generate_resolver(args)
     try:
         entries = _emit(args, repo, repo_url, commit, clone_kind, resolver)
     except ResolveRefused as exc:
@@ -140,7 +209,7 @@ def cmd_generate(args) -> int:
         print(f'REFUSE({exc.reason})', file=sys.stderr)
         return 3
     except ResolverTransportError as exc:
-        raise SystemExit(f'--resolve-env: {exc}') from exc
+        raise SystemExit(f'environment resolution: {exc}') from exc
 
     first = entries[0]
     print(f'language    {first.lang}')
@@ -181,7 +250,7 @@ def _emit(args, repo, repo_url, commit, clone_kind, resolver):
         verifier=args.verifier,
         llm_config=args.llm_config,
         verifier_min_criteria=args.verifier_min_criteria,
-        resolve_env=args.resolve_env,
+        resolve_env=env_resolution_mode(args),
         resolver=resolver,
     )
 
@@ -270,23 +339,34 @@ def build_parser() -> argparse.ArgumentParser:
                           'the run emits is unchanged')
     gen.add_argument('--llm-config', default=None, metavar='PATH',
                      help='the JSON config naming the LLM proxy (model, base_url, '
-                          'api_key). --verifier defaults it to the git-ignored '
-                          '.llm_config at the repo root; --resolve-env REQUIRES it '
-                          'explicitly, because the environment it resolves is the '
-                          "task's floor. Missing or unreachable is a LOUD failure, "
-                          'never a silently empty bundle or an unvouched-for lock')
+                          'api_key). Both --verifier and environment resolution '
+                          'default it to the git-ignored .llm_config at the repo '
+                          'root. Missing or unreachable is a LOUD failure, never a '
+                          'silently empty bundle or an unvouched-for lock -- but a '
+                          'run that reuses a pinned graded.lock.json resolves nothing '
+                          'and needs no config at all')
     gen.add_argument('--verifier-min-criteria', type=int,
                      default=emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA, metavar='INT',
                      help='--verifier: how many rubric criteria must survive '
                           'golden-pass AND stub-fail before a bundle ships (default: '
                           f'{emit_mod.DEFAULT_VERIFIER_MIN_CRITERIA}). Below the floor '
                           'the task ships WITHOUT a bundle -- additive and non-blocking')
-    gen.add_argument('--resolve-env', action='store_true',
-                     help='resolve the measure image\'s toolchain and dependency '
-                          'block from a structured DepPlan instead of the plugin\'s '
-                          'hardcoded lines, and pin that plan into graded.lock.json. '
-                          'OFF by default: without it the emitted bytes and the lock '
-                          'are exactly what they always were. c only in this slice; a '
+    env = gen.add_mutually_exclusive_group()
+    env.add_argument('--no-resolve-env', action='store_true',
+                     help='do NOT resolve the environment: build the measure image '
+                          "and ship the environment from the plugin's hardcoded "
+                          'toolchain and dependency lines, exactly as they were '
+                          'before resolution existed. The emitted bytes and the lock '
+                          'are byte-identical to that behaviour, and no model config '
+                          'is looked for or needed')
+    env.add_argument('--resolve-env', action='store_true',
+                     help='ON by default for c, cpp, java and rust, so this flag asks '
+                          'for nothing extra: resolving the toolchain and dependency '
+                          "block from a structured DepPlan -- instead of the plugin's "
+                          'hardcoded lines -- and pinning that plan into '
+                          'graded.lock.json is a normal step of generating those '
+                          'tasks. Passing it explicitly makes an unsupported --lang a '
+                          'LOUD error instead of the silent no-op it is by default. A '
                           'reused lock never re-resolves')
     gen.set_defaults(func_impl=cmd_generate)
 

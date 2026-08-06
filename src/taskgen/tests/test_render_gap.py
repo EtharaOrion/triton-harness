@@ -340,22 +340,37 @@ def test_default_measure_dockerfile_still_hashes_to_the_pre_seam_digest(plugin, 
     assert hashlib.sha256(text.encode()).hexdigest() == PRE_SEAM_MEASURE_SHA256
 
 
-def test_emit_calls_the_default_path(plugin, env):
-    """`dep_plan` is opt-in: the generator's DEFAULT call site passes no plan.
+def test_emit_keeps_a_call_site_that_passes_no_plan(plugin, env):
+    """The plan-free call site still EXISTS and is still reachable on demand.
 
-    This once read `'dep_plan' not in inspect.getsource(emit)`, which held only
-    while emit could not thread a plan at all. `--resolve-env` gives it a way,
-    so the guarantee is restated where it actually lives -- the default of the
-    flag that reaches it -- and the behavioural half (default path renders the
-    pre-seam bytes and never calls a resolver) is proved against a real emission
-    in test_emit_resolve_env.py.
+    This once read `'dep_plan' not in inspect.getsource(emit)`, then became "the
+    flag that reaches it defaults to off". Resolution is now a default step, so
+    neither phrasing is true -- but the guarantee underneath both of them is
+    unchanged and is what this asserts: emit still calls
+    `render_measure_dockerfile(env)` with no plan, and `resolve_env=False` is
+    what selects it, for EVERY language. The behavioural half (the opt-out
+    renders the pre-seam bytes and never calls a resolver) is proved against a
+    real emission in test_emit_resolve_env.py.
     """
     from taskgen import emit
 
     source = inspect.getsource(emit)
     assert 'plugin.render_measure_dockerfile(env)' in source
     for entry in (emit.emit_all, emit._measure_and_pin):
-        assert inspect.signature(entry).parameters['resolve_env'].default is False
+        assert inspect.signature(entry).parameters['resolve_env'].default is None
+    for lang in B.PLANNED_LANGS:
+        assert emit.resolution_wanted(lang, False) is False
+
+
+def test_the_default_resolves_exactly_the_languages_with_a_gap(plugin, env):
+    """AUTO is not "on": it is on where a gap exists and silent where none does."""
+    from taskgen import emit
+
+    resolving = {
+        lang for lang in B.PLANNED_LANGS if emit.resolution_wanted(lang, None)
+    }
+    assert resolving == set(emit.RESOLVE_ENV_LANGS)
+    assert not any(B.get(lang).parser_backed for lang in resolving)
 
 
 # ------------------------------------------- the same seam, every language ---

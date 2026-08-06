@@ -105,20 +105,27 @@ DEFAULT_VERIFIER_MIN_CRITERIA = 6
 #: never COPYed into a layer, so the bundle inherits the oracle's exclusion.
 VERIFIER_SUBDIR = 'solution/verifier'
 
-#: Which languages `--resolve-env` will render a resolved gap for. It is a
-#: whitelist rather than a `hasattr(plugin, 'render_gap')` probe because every
-#: plugin HAS the method -- `langs.base` defines it to raise -- so a probe would
-#: green-light a language whose only implementation is the refusal.
+#: Which languages resolve their environment. It is a whitelist rather than a
+#: `hasattr(plugin, 'render_gap')` probe because every plugin HAS the method --
+#: `langs.base` defines it to raise -- so a probe would green-light a language
+#: whose only implementation is the refusal.
+#:
+#: It is also exactly the set of whole-suite (non-parser-backed) languages, so
+#: it doubles as the answer to "does a DEFAULT run of this language resolve":
+#: those four run a measure phase and have a gap to render, and the parser-backed
+#: rest have neither.
 RESOLVE_ENV_LANGS: frozenset[str] = frozenset({'c', 'cpp', 'java', 'rust'})
 
 
 def assert_resolve_env_supported(lang: str) -> None:
-    """Refuse `--resolve-env` for a language whose gap cannot be rendered yet.
+    """Refuse EXPLICITLY-forced resolution for a language with no rendered gap.
 
-    Checked at the TOP of `emit_all`, not only in the measure phase: a
-    parser-backed language never reaches that phase, so a check living only
-    there would accept `--resolve-env --lang python` and then quietly ignore it.
-    A flag that silently does nothing is worse than one that refuses.
+    Only reached from the forced branch of `resolution_wanted`. It stays loud
+    there for the same reason it always was: a user who typed `--resolve-env
+    --lang python` asked for something this language cannot do, and a flag that
+    silently does nothing is worse than one that refuses. The DEFAULT path never
+    calls it -- see `resolution_wanted`, where an inapplicable language is a
+    no-op rather than an error.
     """
     if lang in RESOLVE_ENV_LANGS:
         return
@@ -129,6 +136,36 @@ def assert_resolve_env_supported(lang: str) -> None:
         'render_gap, and only those langs have one proven byte-identical to '
         'the gap they hardcode today'
     )
+
+
+def resolution_wanted(lang: str, resolve_env: bool | None) -> bool:
+    """Does THIS run resolve its environment? The ONE place the default lives.
+
+    Three states, because "resolve the environment" has three honest answers and
+    a bool only carries two:
+
+      * `None`  -- DEFAULT/AUTO. Resolution is a normal phase of generate, so it
+        runs for every language that has a gap to render, and is a silent no-op
+        for the parser-backed ones, which run no measure phase at all and for
+        which the question is not "off" but INAPPLICABLE. Refusing python here
+        would turn a step nobody asked for into an error nobody can act on.
+      * `True`  -- FORCED (`--resolve-env`, kept as an explicit opt-in). Same
+        behaviour for a supported language, but a language with no gap is a LOUD
+        refusal rather than a no-op: the user named the step, so silence would
+        be a lie about what the run did.
+      * `False` -- OPTED OUT (`--no-resolve-env`). The environment is the
+        plugin's hardcoded one, and no resolver is called for any language.
+
+    Both `emit_all` and `_measure_and_pin` answer through this function rather
+    than each testing the flag, so the default cannot drift between the gate
+    that runs before the carve and the phase that acts on it.
+    """
+    if resolve_env is None:
+        return lang in RESOLVE_ENV_LANGS
+    if resolve_env:
+        assert_resolve_env_supported(lang)
+        return True
+    return False
 
 #: Test/dev hook: `module:callable` returning a ModelClient, used INSTEAD of the
 #: configured proxy. It exists so the offline suite can drive the whole pipeline
@@ -843,18 +880,24 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
              clone_kind: str | None = None,
              verifier: bool = False, llm_config: str | Path | None = None,
              verifier_min_criteria: int = DEFAULT_VERIFIER_MIN_CRITERIA,
-             resolve_env: bool = False, resolver: EnvResolver | None = None,
+             resolve_env: bool | None = None, resolver: EnvResolver | None = None,
              echo=print) -> list[Entry]:
     """Select, carve, stage, and write one full harbor entry per context type.
 
     `verifier=False` is the whole existing behaviour, byte-for-byte: nothing in
     the verifier package is imported, no LLM is contacted, and the run stays
-    offline and `diff -r`-reproducible. `resolve_env=False` is the same promise
-    for the measure phase's environment -- see `_measure_and_pin`.
+    offline and `diff -r`-reproducible.
+
+    `resolve_env` is NOT that shape. It defaults to `None` -- AUTO -- because
+    resolving the environment is a phase of generating a whole-suite task, not a
+    feature bolted onto one: the same DepPlan decides the measure image and the
+    SHIPPED image, so a task generated without it ships an environment nobody
+    resolved. `resolve_env=False` is the opt-out that restores the plugin's
+    hardcoded environment byte-for-byte. See `resolution_wanted` for the three
+    states and `_measure_and_pin` for what a warm lock costs (nothing).
     """
     out = Path(out)
-    if resolve_env:
-        assert_resolve_env_supported(lang)
+    resolving = resolution_wanted(lang, resolve_env)
     plugin = langs_base.get(lang)
     plan = plan_carve(
         repo, out, lang=lang, carve_scope=carve_scope, package_base=package_base,
@@ -869,7 +912,7 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
     if not plugin.parser_backed:
         plan, dep_plan = _measure_and_pin(
             plan, plugin, out, echo=echo,
-            resolve_env=resolve_env, resolver=resolver,
+            resolve_env=resolving, resolver=resolver,
         )
 
     inp = ContextInputs.build(
@@ -1049,17 +1092,22 @@ def _resolve_env_plan(resolver: EnvResolver | None, plan: CarvePlan,
     gap can actually render, and it runs before the build so an unrenderable
     answer is repaired rather than paid for in docker time.
 
-    What this wrapper adds is the one thing only emit can answer -- that a flag
-    with no resolver behind it is a caller error, not a refusal to be retried.
+    What this wrapper adds is the one thing only emit can answer -- that a run
+    that needs an environment resolved and has nothing to resolve it WITH is a
+    caller error, not a refusal to be retried.
     """
     if resolver is None:
         raise langs_base.LangError(
-            '--resolve-env was passed but no resolver was injected, so there is '
-            'nothing to resolve the environment WITH. emit does not construct '
-            'one itself -- that would make a generate run reach the network from '
-            'a call chain whose whole contract is that it does not -- so the '
-            'caller passes one in; binding the flag to a real model client is a '
-            'later slice'
+            f'this {plan.lang} run has to resolve its environment -- it is a '
+            'whole-suite language and no valid pinned environment was found in '
+            'graded.lock.json -- but no resolver was injected, so there is '
+            'nothing to resolve it WITH. emit does not construct one itself: '
+            'that would make a generate run reach the network from a call chain '
+            'whose whole contract is that it does not. Either give the caller a '
+            'way to reach a model (taskgen.cli: --llm-config PATH, or a '
+            'discoverable .llm_config) or ask for the plugin\'s hardcoded '
+            'environment explicitly (--no-resolve-env / resolve_env=False). It '
+            'refuses rather than falling back to an environment nobody chose'
         )
     return refine.refine_dep_plan(
         resolver=resolver,
@@ -1107,7 +1155,7 @@ def _pinned_dep_plan(lock: Mapping[str, object], lang: str) -> DepPlan | None:
 
 
 def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
-                     resolve_env: bool = False,
+                     resolve_env: bool | None = None,
                      resolver: EnvResolver | None = None,
                      clock=time.monotonic) -> tuple[CarvePlan, DepPlan | None]:
     """Phase 1 of the two-phase build for whole-suite languages.
@@ -1130,13 +1178,22 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
         constructed, no model is contacted; regenerating over a warm lock stays
         offline and byte-identical, which is the entire point of pinning.
 
-    None on both paths for a lock with no `env` block, which is every lock a
-    default (`--resolve-env`-free) run has ever written.
+    None on both paths for a lock with no `env` block, which is every lock an
+    opted-out (`--no-resolve-env`) run writes, and every lock written before
+    resolution existed.
 
-    `resolve_env=False` is every byte of that, unchanged: no resolver is called,
-    no plan is rendered and the lock grows no key -- the measurement is the same
-    single call it always was, now reached through `_run_measure(None)`. With it
-    on, the GAP of the measure Dockerfile comes from the injected resolver's
+    ORDER IS THE CONTRACT. The lock fast-path below runs BEFORE any resolver is
+    touched, and the reuse decision is taken from the PINNED bytes alone
+    (`check_provenance` + `check_env_lock_key`, neither of which asks anybody
+    anything). That is what makes a warm regeneration model-free and config-free
+    even though resolution is now the default: moving the resolve above it would
+    put an LLM call in the path of every rebuild and end determinism.
+
+    `resolve_env=False` is the default path as it was before resolution existed,
+    byte for byte: no resolver is called, no plan is rendered and the lock grows
+    no key -- the measurement is the same single call it always was, reached
+    through `_run_measure(None)`. Resolving (the default for these languages),
+    the GAP of the measure Dockerfile comes from the injected resolver's
     `DepPlan` instead of the plugin's hardcoded lines, that measurement may
     happen more than once (the refine loop rebuilds a repaired plan), and only
     the plan that finally built and collected is pinned into the lock so the
@@ -1146,8 +1203,7 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
     from . import measure as measure_mod
     from . import verify as verify_mod
 
-    if resolve_env:
-        assert_resolve_env_supported(plan.lang)
+    resolving = resolution_wanted(plan.lang, resolve_env)
 
     staging_dir = Path(out).resolve() / '_staging' / plan.staging_key
     measure_ctx = staging_dir / 'measure'
@@ -1224,7 +1280,7 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
         )
         return measure_mod.measure(request, plugin, runner_with_tooling, echo=echo)
 
-    if resolve_env:
+    if resolving:
         refined = _resolve_env_plan(
             resolver, plan, base_image,
             build_and_measure=_run_measure,

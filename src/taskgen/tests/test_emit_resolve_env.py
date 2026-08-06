@@ -1,14 +1,15 @@
-"""`--resolve-env`: the measure gap comes from a DepPlan, and the lock pins it.
+"""Env resolution: the measure gap comes from a DepPlan, and the lock pins it.
 
-The flag's whole promise is asymmetric, so this module tests it from both sides:
+Resolution is a DEFAULT step for the whole-suite languages, and `--no-resolve-env`
+is the opt-out. The promise is asymmetric, so this module tests both sides:
 
-  * OFF is not "almost the same", it is THE SAME. The default measure Dockerfile
-    and the default lock are pinned to digests captured from the tree before the
-    flag existed, and the default path never touches the resolver.
-  * ON changes the SOURCE of the gap without changing the gap. Fed the canonical
-    libc-only plan, `render_measure_dockerfile` must emit the identical bytes --
-    that is what makes the substitution reviewable rather than a leap of faith.
-    What DOES change is the lock, which grows the pinned plan and its key.
+  * OPTED OUT is not "almost the same", it is THE SAME. That measure Dockerfile
+    and that lock are pinned to digests captured from the tree before resolution
+    existed, and the opt-out path never touches the resolver.
+  * RESOLVING changes the SOURCE of the gap without changing the gap. Fed the
+    canonical libc-only plan, `render_measure_dockerfile` must emit the identical
+    bytes -- that is what makes the substitution reviewable rather than a leap of
+    faith. What DOES change is the lock, which grows the pinned plan and its key.
 
 Everything here is offline and hermetic: docker is a fake runner returning a
 canned measure.json, the resolver is a stub returning a canned plan, and no
@@ -254,9 +255,9 @@ def test_dep_plan_none_adds_no_key_and_reorders_none():
     assert list(without) == list(json.loads(DEFAULT_LOCK_JSON))
 
 
-def test_default_path_emits_the_baseline_and_never_resolves(plan, tmp_path):
+def test_the_opt_out_emits_the_baseline_and_never_resolves(plan, tmp_path):
     resolver = StubResolver(C.C_MEASURE_DEP_PLAN)
-    pinned = pin(plan, tmp_path / 'out', resolver=resolver)
+    pinned = pin(plan, tmp_path / 'out', resolve_env=False, resolver=resolver)
 
     assert resolver.calls == 0
     assert pinned.graded.expected == 3
@@ -421,12 +422,40 @@ def test_the_measure_phase_itself_refuses_a_language_with_no_rendered_gap(plan, 
         )
 
 
-def test_the_flag_refuses_a_parser_backed_language_before_it_carves(repo, tmp_path):
+def test_explicitly_forcing_a_parser_backed_language_refuses_before_it_carves(
+        repo, tmp_path):
+    """Asked for BY NAME, an inapplicable language is still a refusal."""
     with pytest.raises(B.LangError, match='only supported for c, cpp, java, rust'):
         emit.emit_all(repo=repo, out=tmp_path / 'out', lang='python', resolve_env=True)
 
 
-def test_the_flag_without_a_resolver_is_loud(plan, tmp_path):
+def test_a_parser_backed_language_defaults_to_a_silent_no_op(repo, tmp_path):
+    """The DEFAULT path may not turn a step python cannot run into an error."""
+    entries = emit.emit_all(repo=repo, out=tmp_path / 'out', lang='python')
+    assert entries
+
+
+def test_no_resolver_on_a_cold_default_run_is_loud_and_pins_nothing(plan, tmp_path):
+    """NEVER SILENTLY DEGRADE: with resolution due and nothing to resolve WITH,
+    the run refuses instead of quietly measuring the hardcoded environment.
+
+    The message names both remedies, because a refusal a user cannot act on is
+    only a slower failure. Nothing is written: no lock to reuse and no measure
+    Dockerfile, so a later run cannot inherit an environment nobody resolved.
+    """
+    out = tmp_path / 'out'
+    with pytest.raises(B.LangError) as excinfo:
+        pin(plan, out, resolver=None)
+
+    message = str(excinfo.value)
+    assert '--llm-config' in message
+    assert '--no-resolve-env' in message
+    assert not lock_path(out, plan).exists()
+    assert not dockerfile_path(out, plan).exists()
+    assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
+
+
+def test_forcing_it_without_a_resolver_is_equally_loud(plan, tmp_path):
     with pytest.raises(B.LangError, match='no resolver was injected'):
         pin(plan, tmp_path / 'out', resolve_env=True, resolver=None)
 
@@ -518,6 +547,62 @@ def test_a_warm_pinned_lock_survives_the_carve_and_is_reused(
     assert (reusing.builds, reusing.runs) == ([], []), 'no measure image on a warm lock'
 
 
+def test_a_cold_default_generate_resolves_with_no_flag_at_all(
+        e2e_repo, tmp_path, e2e_docker):
+    """The flip, end to end: resolution is a phase of `generate`, not a request."""
+    resolver = StubResolver(C.C_MEASURE_DEP_PLAN)
+    generate(e2e_repo, tmp_path / 'out', resolver)
+
+    assert resolver.calls == 1
+    lock = json.loads(e2e_lock_path(tmp_path / 'out').read_text())
+    assert M.LOCK_ENV_BLOCK in lock, 'a default run pins the environment it resolved'
+
+
+def test_a_warm_default_generate_never_reaches_the_resolver(
+        e2e_repo, tmp_path, e2e_docker):
+    """The determinism contract on the DEFAULT path: warm costs no model.
+
+    The resolver is injected and would raise if asked, so "no call" is proved by
+    the run succeeding rather than by a counter alone.
+    """
+    out = tmp_path / 'out'
+    generate(e2e_repo, out, StubResolver(C.C_MEASURE_DEP_PLAN))
+
+    class Unreachable(StubResolver):
+        def __call__(self, **kwargs):
+            raise AssertionError('a warm lock must never reach a resolver')
+
+    warm = Unreachable(C.C_MEASURE_DEP_PLAN)
+    generate(e2e_repo, out, warm)
+
+    assert warm.calls == 0
+    assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
+
+
+def test_a_warm_default_generate_needs_no_resolver_at_all(
+        e2e_repo, tmp_path, e2e_docker):
+    """`resolver=None` is what "needs no llm config" looks like from emit's side:
+    the run that would REFUSE cold sails through warm, off the pinned bytes."""
+    out = tmp_path / 'out'
+    generate(e2e_repo, out, StubResolver(C.C_MEASURE_DEP_PLAN))
+
+    generate(e2e_repo, out, None)
+
+    assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
+
+
+def test_the_opt_out_ships_exactly_what_the_pre_resolution_default_shipped(
+        e2e_repo, tmp_path, e2e_docker):
+    """`--no-resolve-env` is the old default, byte for byte, resolver or not."""
+    opted_out = tmp_path / 'off'
+    generate(e2e_repo, opted_out, StubResolver(C.C_MEASURE_DEP_PLAN), resolve_env=False)
+    no_resolver = tmp_path / 'off2'
+    generate(e2e_repo, no_resolver, None, resolve_env=False)
+
+    assert _entry_bytes(opted_out) == _entry_bytes(no_resolver)
+    assert M.LOCK_ENV_BLOCK not in json.loads(e2e_lock_path(opted_out).read_text())
+
+
 def test_the_carve_does_not_delete_the_lock_it_is_about_to_be_asked_for(
         e2e_repo, tmp_path, e2e_docker):
     """The mechanism, named: the pinned bytes survive the restage untouched."""
@@ -545,15 +630,15 @@ def test_the_warm_flag_run_emits_the_same_bytes_the_cold_one_did(
     assert _entry_bytes(cold_out) == before
 
 
-def test_the_default_path_reuses_its_lock_through_the_real_flow_too(
+def test_the_opt_out_path_reuses_its_lock_through_the_real_flow_too(
         e2e_repo, tmp_path, e2e_docker):
-    """Without the flag there is no resolver to skip, but there is still an image
-    not to rebuild -- and `graded.lock.json` has always promised that."""
+    """Opted out there is no resolver to skip, but there is still an image not to
+    rebuild -- and `graded.lock.json` has always promised that."""
     out = tmp_path / 'out'
-    generate(e2e_repo, out, None)
+    generate(e2e_repo, out, None, resolve_env=False)
     assert len(FakeRunner.instances[-1].builds) == 1
 
-    generate(e2e_repo, out, None)
+    generate(e2e_repo, out, None, resolve_env=False)
     assert (FakeRunner.instances[-1].builds, FakeRunner.instances[-1].runs) == ([], [])
 
 
@@ -682,11 +767,11 @@ def test_a_legacy_lock_surfaces_no_plan_and_ships_the_default_bytes(plan, tmp_pa
     assert shipped_bytes(dep_plan) == shipped_bytes(None)
 
 
-def test_the_default_path_surfaces_no_plan_at_all(plan, tmp_path):
-    """No `--resolve-env` means no environment to pin and no shipped byte moved."""
+def test_the_opt_out_path_surfaces_no_plan_at_all(plan, tmp_path):
+    """`--no-resolve-env` means no environment to pin and no shipped byte moved."""
     out = tmp_path / 'out'
 
-    _pinned, dep_plan = pin_full(plan, out)
+    _pinned, dep_plan = pin_full(plan, out, resolve_env=False)
 
     assert dep_plan is None
     assert M.LOCK_ENV_BLOCK not in M.load_lock(lock_path(out, plan))
