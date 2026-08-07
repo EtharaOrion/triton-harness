@@ -51,14 +51,36 @@ PRE_HARNESS_SOLVE_SH = (
 #: empty-lib-stub vendor, strings leak-assert -- plus the two Dockerfiles they
 #: compose into. These are the leak-critical bytes: the strings assert and the
 #: vendor stub are what prove no carved symbol reaches a layer.
+#:
+#: MOVED, deliberately, for two live-diagnosed defects. Both moves are in RUN
+#: blocks whose OLD text was wrong for every repository but rust-spacewasm:
+#:
+#: 1. the strings leak-assert used to grep target/ for the BARE crate name, so
+#:    the gate fired on any crate whose name is a substring of a std symbol
+#:    (`log` collides with `core::num::int_log10`). It now matches the crate by
+#:    rust MANGLING STRUCTURE -- see `leak_symbol_ere` for why that is strictly
+#:    more precise rather than more permissive. Shipped render only; the
+#:    measure image has never carried the assert.
+#: 2. the workspace prune replaced the whole array literal (`members = ["x"]`
+#:    -> `members = []`), which matches only a SOLE member. On a multi-member
+#:    workspace it silently did nothing while the `rm -rf` beside it still
+#:    deleted the directory, and `cargo vendor` died. It now drops the named
+#:    element and leaves the others. This one is in BOTH images, which is why
+#:    the measure digest moves too.
+#:
+#: For rust-spacewasm both edits are behaviour-preserving: its `members` and
+#: `exclude` arrays hold one entry each, so the element-wise prune writes the
+#: same `members = []` / `exclude = []` the replacement did, and its crate name
+#: (`spacewasm`) was never a std substring. The rust row of
+#: `test_render_dockerfile_golden` moves with these. Nothing else was touched.
 PRE_HARNESS_PRELEAK = (
-    'fad354f4e65fb2cb421f4ea6e2abaa73419b25b6e9bb716de8c50a7a094dbb96', 4045,
+    '59007566c85bb2cf9726a851a3b3432ae4c9e20414efd370895f181fd1d1bdf0', 5281,
 )
 PRE_HARNESS_MEASURE_DOCKERFILE = (
-    'e6ca8107cdc9c5da01489502d9817376541effffd1c0c3bcb54471717266f514', 3430,
+    '284e9c74ef97db74f2bc0661218332ceaa93b4fe3dc55b68006fe51c00e0bea9', 3956,
 )
 PRE_HARNESS_SHIPPED_DOCKERFILE = (
-    'f458166e339531ede8195e711053d75a1730cae5b8521efe8be6b073867913f3', 6409,
+    'f54fb16d07a3efd52000bc68419cfd1c2dda73cbdd47a54806a89abf530477ef', 7645,
 )
 
 #: The empirically-measured intact denominator for rust-spacewasm, and the four
@@ -265,18 +287,18 @@ def test_a_repo_with_no_corpus_and_no_tool_gets_neither_block(plugin, graded):
 def test_a_different_prune_renders_a_different_manifest_edit(plugin):
     pruned = plan_with(
         prune_paths=('tools', 'bench'),
-        prune_manifest_keys=('members',),
-        prune_manifest_entries=('tools/*',),
+        prune_manifest_keys=('members', 'members'),
+        prune_manifest_entries=('tools/*', 'bench'),
     )
     plugin.validate_dep_plan(pruned)
     blocks = '\n'.join(
         plugin.pre_leakgate_blocks_for(B.EnvSpec(repo_name='r'), pruned)
     )
     assert 'RUN rm -rf tools bench \\' in blocks
-    assert 's = s.replace(\'members = ["tools/*"]\', \'members = []\')' in blocks
+    assert 'for key, entry in [("members", "tools/*"), ("members", "bench")]:' in blocks
     assert 'rm -rf crates' not in blocks
     assert 'crates/*' not in blocks
-    assert "'exclude = " not in blocks
+    assert '"exclude"' not in blocks
 
 
 @pytest.mark.parametrize(

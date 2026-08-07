@@ -35,6 +35,11 @@ from taskgen.langs import base as B
 #: registered language, measured against the tree BEFORE the shipped render took
 #: a `dep_plan`. `(lang, repo, sha256, length)` -- the length is carried too so a
 #: digest mismatch reports whether the rendering grew, shrank or merely moved.
+#: The rust row is the ONE deliberate exception: its strings leak-assert used to
+#: grep target/ for the bare crate name and false-positived on every crate whose
+#: name is a substring of a std symbol, so the assert now matches by rust
+#: mangling structure and the block's bytes moved with it (see
+#: `taskgen.langs.rust.leak_symbol_ere`). No other row may ever move.
 SHIPPED_DOCKERFILE_GOLDENS: tuple[tuple[str, str, str, int], ...] = (
     ('c', 'c-xs',
      'f6f4dacff417dadbfdcca5ba135ce93d6c9ddb5179fd68a38f81fa98098a8c9d', 2427),
@@ -43,7 +48,7 @@ SHIPPED_DOCKERFILE_GOLDENS: tuple[tuple[str, str, str, int], ...] = (
     ('java', 'java-tamboui',
      'fcf95d7e1891e04e75cac57e91202026f9d678ac678a045d62b90532f9c205ab', 10164),
     ('rust', 'rust-spacewasm',
-     'f458166e339531ede8195e711053d75a1730cae5b8521efe8be6b073867913f3', 6409),
+     'f54fb16d07a3efd52000bc68419cfd1c2dda73cbdd47a54806a89abf530477ef', 7645),
     ('python', 'python-a2a-python',
      '684a019f17ab5794f4a68b9535511a96abed98feccb2733c16cfc3b7774675c5', 4623),
     ('go', 'go-multigres',

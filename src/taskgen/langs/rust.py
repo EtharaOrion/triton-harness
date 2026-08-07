@@ -272,8 +272,14 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'members before vendoring, e.g. paths ["crates", "fuzz"], keys ["members", '
     '"exclude"], entries ["crates/*", "fuzz"] for a Cargo.toml declaring '
     'members = ["crates/*"] and exclude = ["fuzz"]. keys and entries are '
-    'parallel; each key must be "members" or "exclude". OMIT ALL THREE for a '
-    'single-package crate with no [workspace] section',
+    'parallel; each key must be "members" or "exclude". The paths and the '
+    'entries are ONE operation and must AGREE: every directory in prune_paths '
+    'must also be dropped from the manifest by a matching entry, and every '
+    'entry must name a directory prune_paths removes. Deleting a directory the '
+    '[workspace] arrays still list makes cargo fail to load a member manifest '
+    'that is no longer there, and the vendor step -- and the whole image build '
+    '-- dies. OMIT ALL THREE for a single-package crate with no [workspace] '
+    'section',
 )
 
 #: The one package manager rust's gap has prose for. `depplan.PACKAGE_MANAGERS`
@@ -338,6 +344,132 @@ def _rustc_version(toolchain_version: str) -> str:
 #: rendered edit is a literal string replacement, and a key cargo does not
 #: define would render an edit that silently matches nothing.
 _WORKSPACE_ARRAYS: frozenset[str] = frozenset({'members', 'exclude'})
+
+
+def leak_symbol_ere(sym: str, length: str, crate: str, workdir: str) -> str:
+    """The POSIX ERE the strings-target leak assert greps `target/` with.
+
+    Built here rather than spelled into the RUN line so a test can render it
+    with LITERAL values (`sym='log'`, `length='3'`) and feed the very same
+    pattern to `grep -E`. The rendered Dockerfile passes shell expansions
+    (`${SYM}`, `${N}`, `${CRATE}`) for the same three holes, so what the test
+    proves and what the image runs are one string.
+
+    The pattern is PRECISE, not a substring search. A bare `grep <crate>` fires
+    on any identifier that merely CONTAINS the crate name, and the standard
+    library is full of them: for a crate called `log`, `core::num::int_log10`,
+    `core::slice::sort::stable::drift::logical_merge` and
+    `core::ptr::Alignment::log2` all match and the gate refuses a repository it
+    has no business refusing. What makes a symbol a LEAK is not the letters but
+    the STRUCTURE around them:
+
+    * `_ZN{n}{sym}[0-9]` -- legacy (`_ZN`) mangling is a run of
+      `<byte-length><identifier>` path components, and a symbol DEFINED by the
+      carved crate opens with the crate as its first component, so `log` leaks
+      as exactly `_ZN3log` followed by the next component's length digit.
+      `13logical_merge` cannot match: its `3log` is preceded by the `1` of the
+      length `13` and followed by `i`, and neither sits where the ERE demands.
+      `_ZN4core3f64...3log17h...E` cannot match either -- its `3log` is a
+      METHOD deep in the path, not the crate root right after `_ZN`.
+    * `(^|[^0-9A-Za-z_]){sym}\\.\\.` -- an impl/generic component escapes its
+      path as `$LT$log..Level$u20$as$u20$...`, so a crate referenced from
+      ANOTHER crate's symbol still appears as `log..`, delimited on both sides.
+      `int_log..` cannot match: `_` is an identifier character.
+    * the two `_R...C` alternatives -- the same idea for v0 mangling, whose
+      crate root is the `C` tag followed by `{n}{sym}`, optionally behind an
+      `s<base62>_` disambiguator, inside a symbol that opens `_R`.
+    * `{workdir}/src` and `{workdir}/{crate}/` -- debug-info paths. The first
+      is every carved file under a top-level `src/`; the second is the carved
+      package's own directory when it is a workspace member. Vendored crates
+      live at `{workdir}/vendor/...` and rustc's own sources at `/rustc/...`,
+      so neither trips.
+
+    Note what is NOT here: an ignore list. Naming `int_log10` and
+    `logical_merge` would fix `log` and nothing else -- the next crate called
+    `str`, `num` or `sort` would trip a different std symbol. Anchoring on the
+    mangling grammar generalises because the grammar, not the vocabulary, is
+    what distinguishes a leaked definition from an incidental substring.
+    """
+    return '|'.join((
+        f'_ZN{length}{sym}[0-9]',
+        f'(^|[^0-9A-Za-z_]){sym}\\.\\.',
+        f'_R[0-9A-Za-z_]*Cs[0-9A-Za-z]*_{length}{sym}[0-9]',
+        f'_R[0-9A-Za-z_]*C{length}{sym}[0-9]',
+        f'{workdir}/src',
+        f'{workdir}/{crate}/',
+    ))
+
+
+def _prune_dir(entry: str) -> str:
+    """The DIRECTORY a `[workspace]` array entry names: `crates/*` -> `crates`.
+
+    Cargo's member globs are path globs, so everything up to the first `*` is
+    the literal prefix on disk -- which is precisely what the `rm -rf` beside
+    the manifest edit has to have removed.
+    """
+    return entry.split('*', 1)[0].rstrip('/')
+
+
+def _same_subtree(one: str, other: str) -> bool:
+    """True when two repo-relative paths name the same directory or nest.
+
+    Either direction counts: `crates` covers `crates/foo`, and `crates/foo` is
+    covered by the `crates/*` member glob.
+    """
+    one, other = one.strip('/'), other.strip('/')
+    return one == other or one.startswith(f'{other}/') or other.startswith(f'{one}/')
+
+
+def _assert_prune_agrees(
+    paths: tuple[str, ...],
+    pairs: tuple[tuple[str, str], ...],
+) -> None:
+    """Refuse a prune whose disk half and manifest half contradict each other.
+
+    The two slots are ONE operation rendered in two places: `rm -rf <paths>`
+    deletes directories, and the manifest edit drops the matching `[workspace]`
+    array entries. Split them and cargo refuses to do anything at all --
+    `cargo vendor` errors with "failed to load manifest for workspace member"
+    the moment `members` still lists a directory the prune deleted, which kills
+    the image build long after a repair is cheap. The reverse half is the same
+    contradiction viewed from the other side: an entry dropped from the
+    workspace whose directory is still on disk describes a prune nobody asked
+    for.
+
+    Checked from the PLAN alone, before any container exists, so a resolver
+    that gets it wrong is handed a repairable message rather than a build log.
+    """
+    entries = [entry for _key, entry in pairs]
+    for path in paths:
+        if any(_same_subtree(path, _prune_dir(entry)) for entry in entries):
+            continue
+        raise B.LangError(
+            f'the rust harness prunes {path!r} from disk in '
+            f'harness["prune_paths"], but no harness["prune_manifest_entries"] '
+            f'entry removes it from a Cargo.toml [workspace] array (the entries '
+            f'are {entries}). Those two slots are one operation: the image runs '
+            f'`rm -rf {path}` and then vendors, so a [workspace] members/exclude '
+            f'array that still lists {path!r} makes cargo fail to load a manifest '
+            f'that is no longer there and the build dies. Either add the entry '
+            f'for {path!r} exactly as Cargo.toml spells it (e.g. {path!r} or '
+            f'"{path}/*") together with its "members" or "exclude" key in '
+            f'harness["prune_manifest_keys"], or stop pruning {path!r} by '
+            f'dropping it from harness["prune_paths"]'
+        )
+    for key, entry in pairs:
+        directory = _prune_dir(entry)
+        if any(_same_subtree(path, directory) for path in paths):
+            continue
+        raise B.LangError(
+            f'the rust harness drops {entry!r} from the Cargo.toml [workspace] '
+            f'{key} array in harness["prune_manifest_entries"], but '
+            f'harness["prune_paths"] never removes the directory it names '
+            f'({directory!r}; the pruned paths are {list(paths)}). Those two '
+            f'slots are one operation: de-listing a member while leaving its '
+            f'tree on disk vendors a workspace nobody described. Either add '
+            f'{directory!r} to harness["prune_paths"], or drop {entry!r} (and '
+            f'its {key!r} key) from the manifest edit'
+        )
 
 
 def _slot_error(key: str, want: str) -> B.LangError:
@@ -608,6 +740,10 @@ def read_harness(plan: DepPlan) -> Harness:
                 'neither. The prune rewrites a cargo WORKSPACE array, and a key '
                 'cargo does not define is an edit no manifest would ever match',
             )
+    _assert_prune_agrees(
+        tuple(_require_relative(p, 'prune_paths') for p in prune_paths),
+        tuple(zip(prune_keys, prune_entries)),
+    )
 
     harness = Harness(
         names=names,
@@ -1177,25 +1313,51 @@ class RustPlugin(B.LangPlugin):
         ]
 
         # Prune out-of-scope workspace members so cargo vendor covers only the
-        # graded package. A LITERAL string replacement, not a toml rewrite: no
-        # toml emitter in the image preserves key order and comments, and
-        # reformatting the whole manifest would perturb far more of the graded
-        # tree than the one array entry being dropped.
+        # graded package. An ELEMENT-WISE edit of the one array, not a toml
+        # rewrite: no toml emitter in the image preserves key order and
+        # comments, and reformatting the whole manifest would perturb far more
+        # of the graded tree than the entries being dropped.
+        #
+        # Element-wise because a workspace usually lists several members. The
+        # edit used to replace the whole array literal (`members = ["x"]` ->
+        # `members = []`), which matched only a SOLE member: on any repo whose
+        # members array holds more than one entry the replacement silently did
+        # nothing, the directory was still removed by the `rm -rf` beside it,
+        # and `cargo vendor` then died on "failed to load manifest for
+        # workspace member". Dropping just the named element leaves the other
+        # members intact and is what the plan actually asked for; for a
+        # single-entry array it produces the same `key = []` as before.
+        #
+        # It fails LOUD when the array does not list the entry, because a prune
+        # that matches nothing is a plan that disagrees with the manifest, and
+        # the refine loop can only repair a mismatch it is told about.
         prune = ''
         if harness.prune_paths or harness.prune_manifest:
-            edits = [
-                f"s = s.replace('{key} = [\"{entry}\"]', '{key} = []')"
-                for key, entry in harness.prune_manifest
-            ]
+            pairs = ', '.join(
+                f'("{key}", "{entry}")' for key, entry in harness.prune_manifest
+            )
             rewrite = [
                 " && python3 - <<'PY'",
-                'import pathlib',
+                'import pathlib, re',
                 f'p = pathlib.Path("{env.workdir}/Cargo.toml")',
                 's = p.read_text()',
-                *edits,
+                f'for key, entry in [{pairs}]:',
+                "    m = re.search('(?m)^(' + key + r'[ \\t]*=[ \\t]*)"
+                "\\[([^\\]]*)\\]', s)",
+                '    if m is None:',
+                "        raise SystemExit('PRUNE FAILED: Cargo.toml declares no "
+                "[workspace] ' + key + ' array to drop \"' + entry + '\" from')",
+                '    items = re.findall(\'"[^"]*"\', m.group(2))',
+                '    if \'"\' + entry + \'"\' not in items:',
+                "        raise SystemExit('PRUNE FAILED: [workspace] ' + key + "
+                "' is [' + ', '.join(items) + '], which does not list \"' "
+                "+ entry + '\"')",
+                '    kept = [t for t in items if t != \'"\' + entry + \'"\']',
+                "    s = s[:m.start()] + m.group(1) + '[' + ', '.join(kept) "
+                "+ ']' + s[m.end():]",
                 'p.write_text(s)',
                 'PY',
-            ] if edits else []
+            ] if harness.prune_manifest else []
             removal = (
                 f'RUN rm -rf {" ".join(harness.prune_paths)}'
                 if harness.prune_paths
@@ -1256,26 +1418,38 @@ class RustPlugin(B.LangPlugin):
         strings_assert = '\n'.join([
             '# strings-target leak assert. target/ is the one place where compiling',
             '# the crate could have left a structural fossil of the carved API. Require',
-            '# that the crate name and every "<workdir>/src" debug-info path appear',
-            '# NOWHERE in target/: the first catches every mangled symbol, the second',
-            '# catches every debug-info path that would enumerate the carved file list.',
-            '# Vendored crates reference "<workdir>/vendor/<crate>/src/..." and so do',
-            '# not trip this. This is BELT-AND-BRACES: the generic leak scan below is',
-            '# what catches content leaks, but a symbol-only leak in an .o would slip',
-            '# past a content grep and be recoverable with `strings`.',
+            '# that no symbol DEFINED BY the crate and no "<workdir>/src" debug-info',
+            '# path appear anywhere in target/: the first catches every mangled symbol,',
+            '# the second catches every debug-info path that would enumerate the carved',
+            '# file list. The crate is matched by MANGLING STRUCTURE, not as a bare',
+            '# substring: "_ZN<len><crate>" is the crate as the first path component of',
+            '# a legacy-mangled symbol, "<crate>.." is it inside an escaped impl',
+            '# component, and the _R forms are the v0 crate-root tag. A substring grep',
+            '# would fire on std symbols that merely contain the name (a crate called',
+            '# "log" collides with core::num::int_log10 and with drift::logical_merge),',
+            '# refusing repositories that leak nothing. Vendored crates reference',
+            '# "<workdir>/vendor/<crate>/src/..." and so do not trip this either. This',
+            '# is BELT-AND-BRACES: the generic leak scan below is what catches content',
+            '# leaks, but a symbol-only leak in an .o would slip past a content grep',
+            '# and be recoverable with `strings`.',
             'RUN set -eu; \\',
             '    CRATE=$(sed -n \'/^\\[package\\]/,/^\\[/p\' Cargo.toml \\',
             '            | sed -n \'s/^name[[:space:]]*=[[:space:]]*"\\([^"]*\\)".*/\\1/p\' \\',
             '            | head -1); \\',
+            "    SYM=$(printf '%s' \"${CRATE}\" | sed 's/-/_/g'); \\",
+            '    N=${#SYM}; \\',
             f'    hits=$(find {env.workdir}/target -type f -print0 2>/dev/null \\',
             '             | xargs -0 -r strings -a 2>/dev/null \\',
-            f'             | grep -E "${{CRATE}}|{env.workdir}/src" || true); \\',
+            '             | grep -E "'
+            + leak_symbol_ere('${SYM}', '${N}', '${CRATE}', env.workdir)
+            + '" || true); \\',
             '    if [ -n "$hits" ]; then \\',
             '        echo "LEAK: rustc artifacts under target/ reveal carved internals:" >&2; \\',
             '        echo "$hits" | sort -u | head -40 >&2; \\',
             '        exit 1; \\',
             '    fi; \\',
-            f'    echo "ASSERT: target/ carries no ${{CRATE}} symbols and no {env.workdir}/src paths"',
+            f'    echo "ASSERT: target/ defines no ${{CRATE}} symbols and carries no '
+            f'{env.workdir}/src paths"',
         ])
 
         return _Scaffold(

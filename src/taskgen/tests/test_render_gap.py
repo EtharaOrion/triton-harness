@@ -52,8 +52,15 @@ PRE_SEAM_CPP_MEASURE_SHA256 = (
 PRE_SEAM_JAVA_MEASURE_SHA256 = (
     '093eb2e5ad93ac675a0e405c5470c23087ef3b907823df713e0a127c1c1c84b7'
 )
+#: rust's moved once, and only in the workspace prune: the prune used to
+#: replace the whole `members = ["x"]` array literal, which matches nothing on
+#: a workspace with more than one member and left `cargo vendor` staring at a
+#: member directory the prune had already deleted. Element-wise now. For
+#: rust-spacewasm, whose arrays hold one entry each, the manifest the measure
+#: image ends up with is byte-identical either way -- what moved is the RUN
+#: text that produces it. See `test_rust_harness_golden` for the full note.
 PRE_SEAM_RUST_MEASURE_SHA256 = (
-    'e6ca8107cdc9c5da01489502d9817376541effffd1c0c3bcb54471717266f514'
+    '284e9c74ef97db74f2bc0661218332ceaa93b4fe3dc55b68006fe51c00e0bea9'
 )
 
 #: c's gap, byte-for-byte, as it appears in the shipped measure Dockerfile:
