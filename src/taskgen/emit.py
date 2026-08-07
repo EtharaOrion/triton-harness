@@ -289,6 +289,19 @@ class CarvePlan:
     provenance: Provenance | None = None
 
 
+def _target_label(carve) -> str:
+    """`relpath::qualname` -- how a refusal names what was carved.
+
+    The user chose the target by `--file`/`--func`, so a refusal has to hand
+    both back or it names nothing they typed.
+    """
+    view = carve.target_view
+    if view is None:
+        return ', '.join(carve.carved_relpaths)
+    qual = view.qualname or view.name
+    return f'{view.relpath}::{qual}' if qual else view.relpath
+
+
 def _resolve_target(lang: str, repo: Path, *, package_base, file, func, cls, receiver,
                     project):
     if lang == 'python':
@@ -446,6 +459,7 @@ def plan_carve(
         # Carving runs BEFORE `_measure_and_pin` reads the lock, so without this
         # the wipe deletes every lock before the reuse check can consult it.
         preserve=(measure_mod.LOCK_FILENAME,),
+        target_label=_target_label(carve),
     )
     _copy_leakscan(staging_dir / 'tooling', plugin=plugin)
 
@@ -1351,6 +1365,25 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
     )
 
 
+#: One line still gates, but it is one short-or-duplicated line from the
+#: all-digest carve that cannot build; two real passing runs sat on that number.
+#: LOG ONLY -- the run is not altered, or the warning would be a degrade.
+THIN_TRIPWIRE_MARGIN = 1
+
+
+def _warn_thin_tripwire_margin(plan: CarvePlan, echo) -> None:
+    n = len(plan.staged.tripwire_patterns)
+    if n > THIN_TRIPWIRE_MARGIN:
+        return
+    echo(
+        f'warning     only {n} grep tripwire line(s) cover this carve '
+        f'({_target_label(plan.carve)}). The leak gate holds, but one fewer '
+        'distinctive carved line and generate would refuse: an all-digest '
+        'tripwire set cannot be given to the in-build leakscan. A larger target '
+        'or a wider --carve-scope buys margin.'
+    )
+
+
 def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
              func: str | None = None, cls: str | None = None,
              budget: int = DEFAULT_BUDGET, seed: int = DEFAULT_SEED,
@@ -1387,6 +1420,7 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
         include=include, exclude=exclude, delete_whole_file=delete_whole_file,
         provenance=make_provenance(repo_url, commit, clone_kind),
     )
+    _warn_thin_tripwire_margin(plan, echo)
 
     # None for a parser-backed language by construction: it runs no measure
     # phase, so there is no lock to pin an environment in and nothing to thread.

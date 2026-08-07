@@ -35,6 +35,7 @@ from .langs import base
 from .llm_resolver import LlmEnvResolver, ResolverTransportError
 from .resolver_inputs import base_capabilities, required_plan_slots
 from .scope import CarveScope
+from .staging import NoLineTripwireError
 
 #: Where `--repo-url` clones land by default: the same directory `verify`
 #: already searches when `--repo` is omitted (verify.REPOS_SRC_RELPATH), so a
@@ -203,9 +204,12 @@ def cmd_generate(args) -> int:
     resolver = build_generate_resolver(args)
     try:
         entries = _emit(args, repo, repo_url, commit, clone_kind, resolver)
-    except ResolveRefused as exc:
-        # SHIP or REFUSE: the measure phase raises before any entry or lock is
-        # written, so this path leaves the output directory empty on purpose.
+    except (ResolveRefused, NoLineTripwireError) as exc:
+        # SHIP or REFUSE: both raise before any entry or lock is written, so this
+        # path leaves the output directory free of task entries on purpose.
+        # NoLineTripwireError comes from staging, which every language reaches --
+        # a parser-backed run never touches the resolver but can still carve a
+        # target the leak gate cannot cover.
         print(f'REFUSE({exc.reason})', file=sys.stderr)
         return 3
     except ResolverTransportError as exc:

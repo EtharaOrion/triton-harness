@@ -311,7 +311,7 @@ def test_the_host_side_scan_counts_add_test_in_the_intact_tree(tmp_path):
     (repo / 'CMakeLists.txt').write_text(
         'project(fake)\nadd_subdirectory(Tests/Unit)\n'
     )
-    (repo / 'Compiler' / 'A.cpp').write_text('int a;\n')
+    (repo / 'Compiler' / 'A.cpp').write_text('int a;\nint compilerSemanticStageMarkerValue = 41;\n')
     (repo / 'Tests' / 'Unit' / 'CMakeLists.txt').write_text(
         '# add_test in a comment does not count\n'
         'add_test(NAME One COMMAND t)\n'
@@ -343,7 +343,7 @@ def test_the_registry_cross_check_reaches_the_refine_loop(tmp_path):
     (repo / 'Compiler').mkdir(parents=True)
     (repo / 'Tests').mkdir()
     (repo / 'CMakeLists.txt').write_text('project(fake)\n')
-    (repo / 'Compiler' / 'A.cpp').write_text('int a;\n')
+    (repo / 'Compiler' / 'A.cpp').write_text('int a;\nint compilerSemanticStageMarkerValue = 41;\n')
     (repo / 'Tests' / 'CMakeLists.txt').write_text(
         'add_test(NAME One COMMAND t)\nadd_test(NAME Two COMMAND t)\n'
     )
@@ -373,7 +373,7 @@ def test_a_registration_inside_a_repeated_cmake_block_refuses_to_be_counted(tmp_
     (repo / 'Compiler').mkdir(parents=True)
     (repo / 'Tests').mkdir()
     (repo / 'CMakeLists.txt').write_text('project(fake)\n')
-    (repo / 'Compiler' / 'A.cpp').write_text('int a;\n')
+    (repo / 'Compiler' / 'A.cpp').write_text('int a;\nint compilerSemanticStageMarkerValue = 41;\n')
     (repo / 'Tests' / 'CMakeLists.txt').write_text(
         'function(make_test target)\n'
         '  add_test(NAME ${target} COMMAND ${target})\n'

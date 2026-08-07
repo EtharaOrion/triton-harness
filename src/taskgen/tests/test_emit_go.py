@@ -40,8 +40,11 @@ def go_module(tmp_path_factory):
         '// Alpha returns the alpha number, which is helper plus one.\n'
         'func (a *Alpha) Alpha() int {\n'
         '\tbase := helper()\n'
-        '\treturn base + 1\n'
+        '\tadjusted := base + alphaWidgetOffset // widget-specific alpha shift\n'
+        '\treturn adjusted\n'
         '}\n'
+        '\n'
+        'const alphaWidgetOffset = 1\n'
     )
     (repo / 'pkg' / 'dual_test.go').write_text(
         'package pkg\n'

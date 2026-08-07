@@ -346,7 +346,9 @@ def test_the_host_side_scan_counts_junit_classes_including_nested(tmp_path):
     main.mkdir(parents=True)
     test.mkdir(parents=True)
     (repo / 'settings.gradle.kts').write_text('include("mod")\n')
-    (main / 'Widget.java').write_text('package com.demo;\npublic class Widget {}\n')
+    (main / 'Widget.java').write_text(
+        'package com.demo;\npublic class Widget { int carvedWidgetMarker = 41; }\n'
+    )
     (test / 'PlainTest.java').write_text(
         'package com.demo;\n'
         'class PlainTest {\n'
@@ -384,7 +386,9 @@ def test_a_test_method_on_an_abstract_class_refuses_to_be_counted(tmp_path):
     main.mkdir(parents=True)
     test.mkdir(parents=True)
     (repo / 'settings.gradle.kts').write_text('rootProject.name = "demo"\n')
-    (main / 'Widget.java').write_text('package com.demo;\npublic class Widget {}\n')
+    (main / 'Widget.java').write_text(
+        'package com.demo;\npublic class Widget { int carvedWidgetMarker = 41; }\n'
+    )
     (test / 'BaseTest.java').write_text(
         'package com.demo;\nabstract class BaseTest { @Test void shared() {} }\n'
     )
@@ -407,7 +411,9 @@ def test_a_junit_suite_aggregation_refuses_to_be_counted(tmp_path):
     main.mkdir(parents=True)
     test.mkdir(parents=True)
     (repo / 'settings.gradle.kts').write_text('rootProject.name = "demo"\n')
-    (main / 'Widget.java').write_text('package com.demo;\npublic class Widget {}\n')
+    (main / 'Widget.java').write_text(
+        'package com.demo;\npublic class Widget { int carvedWidgetMarker = 41; }\n'
+    )
     (test / 'AllTests.java').write_text(
         'package com.demo;\n@Suite\n@SelectClasses({OneTest.class})\nclass AllTests {}\n'
     )
@@ -439,7 +445,9 @@ def test_the_scope_cross_check_reaches_the_refine_loop(tmp_path):
     main.mkdir(parents=True)
     test.mkdir(parents=True)
     (repo / 'settings.gradle.kts').write_text('include("tamboui-widgets")\n')
-    (main / 'Widget.java').write_text('package dev.tamboui.widgets;\nclass Widget {}\n')
+    (main / 'Widget.java').write_text(
+        'package dev.tamboui.widgets;\nclass Widget { int carvedWidgetMarker = 41; }\n'
+    )
     (test / 'OneTest.java').write_text(
         'package dev.tamboui.widgets;\nclass OneTest { @Test void a() {} }\n'
     )

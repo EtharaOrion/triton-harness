@@ -79,6 +79,7 @@ import stage_carved as harbor_stage_carved  # noqa: E402
 import stage_context as harbor_stage_context  # noqa: E402
 
 __all__ = [
+    'NoLineTripwireError',
     'StagedTree',
     'StagingError',
     'Tripwire',
@@ -140,6 +141,24 @@ class StagingError(RuntimeError):
 
 class TripwireError(StagingError):
     """No tripwire could be derived. The leak gate is never downgraded."""
+
+
+class NoLineTripwireError(TripwireError):
+    """Every carved file fell to the digest rung, so `grep -F` has no pattern.
+
+    `leakscan.sh` fails closed on an empty pattern file ("LEAKSCAN FATAL: no
+    tripwires", exit 2), and it runs inside the Dockerfile -- so a carve in this
+    state emits eleven entries that can NEVER build. Refusing here is the same
+    SHIP-or-REFUSE rule `ResolveRefused` enforces for the environment: emitting
+    an unbuildable task is a silent degrade, not a partial success.
+
+    `reason` is the actionable text the cli prints; the class carries it so the
+    refusal cannot be mistaken for a staging bug and retried.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -321,6 +340,45 @@ def _derive_tripwires(
     return tuple(out)
 
 
+def _assert_greppable_tripwire(tripwires: tuple[Tripwire, ...], target_label: str,
+                               originals: dict[str, str]) -> None:
+    """Refuse a carve whose whole tripwire set is digests. EARLIEST DETECTION.
+
+    This is the first instant the outcome is knowable: `_derive_tripwires` has
+    just returned, and nothing under `trip/` has been written yet. Every later
+    point -- the trip context, the emitted entries, the docker build -- is
+    downstream of a decision that is already fixed here.
+
+    Digests are a REAL rung; they are what verify's layer archaeology reads. But
+    `leakscan.sh` consumes `grep -F -f`, and its pattern file is the LINE
+    patterns only, so an all-digest set writes an empty `tripwires.txt` and the
+    in-build gate fails closed at build time. The gate is correct; the carve is
+    not. Refuse instead of shipping a task that cannot build.
+    """
+    if any(t.kind != 'sha256' for t in tripwires):
+        return
+    label = target_label or ', '.join(sorted(originals))
+    rels = ', '.join(sorted(originals))
+    raise NoLineTripwireError(
+        f'no usable tripwire for the carved target {label}: leak-absence could '
+        'not be proven for this carve, so no task was written.\n'
+        f'  WHY: every carved line is either shorter than {STRONG_TRIPWIRE_CHARS} '
+        'characters (normalised) or also present in a surviving file, so not one '
+        'line is distinctive enough to hand to the leak gate. The whole tripwire '
+        f'set fell back to content digests ({rels}), which verify\'s layer '
+        'archaeology can use but the in-build leakscan cannot: it greps for FIXED '
+        'STRINGS, so an all-digest set means an empty trip/tripwires.txt and every '
+        'emitted entry would die at docker build with "LEAKSCAN FATAL: no '
+        'tripwires" (exit 2).\n'
+        '  DO: carve a larger target (a function whose body has at least one long, '
+        'repo-specific line), or a different function in the same file, or widen '
+        '--carve-scope to file/folder so the carve set contributes more candidate '
+        'lines.\n'
+        '  NOT: lowering the tripwire length bar or letting leakscan tolerate zero '
+        'tripwires -- both delete the check that proves the carved bytes are absent.'
+    )
+
+
 #: How many verifier-bundle lines are merged into the tripwire set. leakscan.sh
 #: greps the whole image once per pattern, so an unbounded merge would turn a
 #: cheap gate into a multi-minute one for no extra coverage: the longest lines
@@ -446,6 +504,7 @@ def stage_carved_tree(
     out_dir: Path,
     *,
     preserve: tuple[str, ...] = (),
+    target_label: str = '',
 ) -> StagedTree:
     """Materialise the carved tree on the HOST. The intact tree is never shipped.
 
@@ -457,6 +516,10 @@ def stage_carved_tree(
     the carve runs BEFORE the measure phase reads it, an unconditional wipe
     deletes every lock before it can ever be consulted, and "regeneration reads
     the lock and never re-runs the LLM" becomes unreachable.
+
+    `target_label` names the carved target in a refusal (`NoLineTripwireError`).
+    Staging knows relpaths but not which function inside them was carved, and a
+    refusal the user cannot act on is not actionable, so the caller supplies it.
     """
     repo = Path(repo).resolve()
     out_dir = Path(out_dir).resolve()
@@ -540,6 +603,7 @@ def stage_carved_tree(
         raise TripwireError(
             f'tripwire coverage {len(tripwires)} != {len(carved)} carved files'
         )
+    _assert_greppable_tripwire(tripwires, target_label, originals)
 
     # harbor's host-side pre-flight: the staged context must already be clean.
     try:

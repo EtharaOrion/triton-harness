@@ -15,6 +15,8 @@ from pathlib import Path
 import pytest
 
 from taskgen.staging import (
+    STRONG_TRIPWIRE_CHARS,
+    NoLineTripwireError,
     StagedTree,
     StagingError,
     TripwireError,
@@ -321,9 +323,18 @@ class ThingError(Exception):
 
 @pytest.fixture()
 def generic(repo: Path, tmp_path: Path) -> StagedTree:
+    """A generic-only file carved ALONGSIDE one that does carry a strong line.
+
+    Carved alone it is refused (`test_a_carve_with_no_grep_pattern_at_all_is_
+    refused`), because an all-digest set writes an empty `tripwires.txt` and
+    leakscan fails closed. Pairing it keeps the subject of these tests -- what
+    the line rung will and will not accept from `pkg/errors.py` -- while the
+    carve as a whole stays one a task could actually build.
+    """
     _write(repo, 'pkg/errors.py', GENERIC_BODY)
     return stage_carved_tree(
-        repo, ('pkg/errors.py',), {'pkg/errors.py': GENERIC_STUB},
+        repo, ('pkg/errors.py', 'pkg/carved_a.py'),
+        {'pkg/errors.py': GENERIC_STUB, 'pkg/carved_a.py': CARVED_A_STUB},
         (), tmp_path / 'staging-generic',
     )
 
@@ -350,7 +361,9 @@ def test_every_grep_pattern_clears_the_strong_floor(generic, staged):
 
 def test_a_file_with_only_generic_lines_still_gets_covered(generic):
     """Coverage is never dropped -- it degrades to the content digest."""
-    assert len(generic.tripwires) == 1
+    by_rel = {t.relpath: t for t in generic.tripwires}
+    assert set(by_rel) == {'pkg/errors.py', 'pkg/carved_a.py'}
+    assert by_rel['pkg/errors.py'].kind == 'sha256'
     assert generic.tripwire_digests
 
 
@@ -366,3 +379,68 @@ def test_no_grep_pattern_spans_more_than_one_line(staged, generic):
             assert '\n' not in pattern, f'{pattern!r} degrades into separate patterns'
         written = tree.tripwire_path.read_text().splitlines()
         assert [ln for ln in written if ln.strip()] == list(tree.tripwire_patterns)
+
+
+# --------------------------------------------------------------------------
+# an all-digest carve can never build, so generate refuses instead
+# --------------------------------------------------------------------------
+
+
+def test_a_carve_with_no_grep_pattern_at_all_is_refused(repo, tmp_path):
+    """Zero LINE tripwires == an empty tripwires.txt == a task that cannot build.
+
+    leakscan.sh runs INSIDE the Dockerfile and fails closed on an empty pattern
+    file ("LEAKSCAN FATAL: no tripwires", exit 2). Emitting the entries anyway
+    is the silent degrade the project forbids, so staging refuses first.
+    """
+    _write(repo, 'pkg/errors.py', GENERIC_BODY)
+    with pytest.raises(TripwireError) as exc:
+        stage_carved_tree(
+            repo, ('pkg/errors.py',), {'pkg/errors.py': GENERIC_STUB},
+            (), tmp_path / 'staging-all-digest', target_label='pkg/errors.py::__init__',
+        )
+    assert isinstance(exc.value, NoLineTripwireError)
+    reason = exc.value.reason
+    assert 'no usable tripwire for the carved target pkg/errors.py::__init__' in reason
+    assert 'leak-absence could not be proven' in reason
+    assert f'shorter than {STRONG_TRIPWIRE_CHARS} characters' in reason
+    assert 'also present in a surviving file' in reason
+    assert '--carve-scope' in reason
+
+
+def test_the_refusal_leaves_no_tripwire_file_to_be_built_from(repo, tmp_path):
+    """The refusal is EARLIER than the artefact it is refusing to write."""
+    _write(repo, 'pkg/errors.py', GENERIC_BODY)
+    out = tmp_path / 'staging-no-artefact'
+    with pytest.raises(NoLineTripwireError):
+        stage_carved_tree(
+            repo, ('pkg/errors.py',), {'pkg/errors.py': GENERIC_STUB}, (), out,
+        )
+    assert not (out / 'trip').exists()
+    assert list(out.rglob('tripwires.txt')) == []
+    assert list(out.rglob('tripwire-digests.txt')) == []
+
+
+def test_one_strong_line_anywhere_in_the_carve_is_enough_to_proceed(repo, tmp_path):
+    """The bar is the GREP SET, not the per-file rung. Digests stay legal."""
+    _write(repo, 'pkg/errors.py', GENERIC_BODY)
+    tree = stage_carved_tree(
+        repo, ('pkg/errors.py', 'pkg/carved_a.py'),
+        {'pkg/errors.py': GENERIC_STUB, 'pkg/carved_a.py': CARVED_A_STUB},
+        (), tmp_path / 'staging-mixed',
+    )
+    assert len(tree.tripwire_patterns) == 1
+    assert {t.kind for t in tree.tripwires} == {'sha256', 'line'}
+    assert tree.tripwire_path.read_text().strip() == tree.tripwire_patterns[0]
+
+
+def test_a_normal_carve_is_untouched_by_the_new_refusal(repo, tmp_path):
+    """The unchanged path: strong lines present, every file covered, no refusal."""
+    tree = stage_carved_tree(
+        repo, CARVED, {'pkg/carved_a.py': CARVED_A_STUB},
+        ('pkg/boiler.py', 'pkg/carved_b.py'), tmp_path / 'staging-normal',
+    )
+    assert len(tree.tripwires) == len(CARVED)
+    assert tree.tripwire_patterns
+    for pattern in tree.tripwire_patterns:
+        assert len(pattern) >= STRONG_TRIPWIRE_CHARS

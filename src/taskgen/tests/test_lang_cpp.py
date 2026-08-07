@@ -440,7 +440,7 @@ def test_plan_carve_expands_grader_fingerprint_globs(tmp_path):
     (repo / 'Tests' / 'Unit' / 'ThirdParty').mkdir(parents=True)
 
     (repo / 'CMakeLists.txt').write_text('project(fake)\n')
-    (repo / 'Compiler' / 'Semantic' / 'A.cpp').write_text('int a;\n')
+    (repo / 'Compiler' / 'Semantic' / 'A.cpp').write_text('int a;\nint compilerSemanticStageMarkerValue = 41;\n')
     (repo / 'Compiler' / 'Semantic' / 'A.h').write_text('#pragma once\n')
     (repo / 'Tests' / 'Unit' / 'Main.cpp').write_text('int main(void) { return 0; }\n')
     (repo / 'Tests' / 'Unit' / 'SemanticTests.cpp').write_text('// TEST_CASE\n')

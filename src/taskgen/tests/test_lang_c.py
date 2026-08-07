@@ -409,7 +409,9 @@ def test_plan_carve_expands_grader_fingerprint_globs(tmp_path):
     (repo / 'tests' / 'unit').mkdir(parents=True)
 
     (repo / 'Makefile').write_text('all:\n\techo hi\n')
-    (repo / 'src' / 'runtime' / 'a.c').write_text('int a;\n')
+    (repo / 'src' / 'runtime' / 'a.c').write_text(
+        'int a;\nint runtimeStageMarkerValueForCarve = 41;\n'
+    )
     (repo / 'src' / 'runtime' / 'b.c').write_text('int b;\n')
     (repo / 'tests' / 'conformance' / 'hello.xs').write_text('hi\n')
     (repo / 'tests' / 'unit' / 'lexer_test.c').write_text('int main(void) { return 0; }\n')

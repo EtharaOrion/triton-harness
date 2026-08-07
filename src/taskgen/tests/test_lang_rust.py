@@ -689,7 +689,9 @@ def test_plan_carve_takes_the_no_parser_branch_for_rust(tmp_path):
 
     repo = tmp_path / 'rust-spacewasm'
     (repo / 'src').mkdir(parents=True)
-    (repo / 'src' / 'lib.rs').write_text('pub fn foo() {}\n')
+    (repo / 'src' / 'lib.rs').write_text(
+        'pub fn foo() {}\npub const CARVED_CRATE_MARKER_VALUE: u32 = 41;\n'
+    )
     (repo / 'src' / 'util.rs').write_text('pub fn bar() {}\n')
     (repo / 'tests' / 'util').mkdir(parents=True)
     for rel in R.INTEGRITY_HARNESS_FILES:

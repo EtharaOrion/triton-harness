@@ -503,7 +503,9 @@ def e2e_repo(tmp_path) -> Path:
     (repo / 'Makefile').write_text(
         'test:\n\t$(CC) -o xs src/runtime/gc.c\n', encoding='utf-8')
     (repo / 'src' / 'runtime' / 'gc.c').write_text(
-        'int gc_collect(int generation) {\n    return generation + 1;\n}\n',
+        'int gc_collect(int generation) {\n'
+        '    return generation + xs_runtime_nursery_scale_factor;\n'
+        '}\n',
         encoding='utf-8')
     (repo / 'tests' / 'conformance' / 'a.xs').write_text('1\n', encoding='utf-8')
     (repo / 'tests' / 'regression' / 'b.xs').write_text('2\n', encoding='utf-8')
