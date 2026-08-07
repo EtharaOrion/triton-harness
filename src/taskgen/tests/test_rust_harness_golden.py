@@ -522,3 +522,146 @@ def test_the_scanner_matches_the_real_spacewasm_checkout():
     if not (repo / 'Cargo.toml').is_file():
         pytest.skip('rust-spacewasm checkout not present')
     assert set(_cargo_integration_targets(repo)) == set(R.HARNESSES)
+
+
+# ------------------------------------ measure/graded selection agreement ----
+#
+# THE REGRESSION GUARD. rust-spacewasm regenerated to a pinned denominator of
+# 92 while the graded run counted 93: the measure script preferred the stale
+# `graded.test_command` (the plugin class default, which still carried
+# rust-spacewasm's `-- --skip memory_max`) while `test.sh` rendered the
+# RESOLVED harness, which excludes nothing. Both sides must select units from
+# the same plan slots, so the tests below render both scripts from ONE plan and
+# compare what they run -- a divergence fails here rather than only at live
+# verify, six gates and one Docker build later.
+
+
+#: A plan whose harness disagrees with the rust-spacewasm default in every slot
+#: that affects COUNTING: different targets, and an exclusion the default lacks.
+def selection_plan(**overrides):
+    base = dict(
+        harness_names=('alpha', 'beta'),
+        harness_files=('tests/alpha.rs', 'tests/beta.rs'),
+        support_files=(),
+        exclude_names=('slow_case',),
+        corpus_dir='', corpus_label='', corpus_min=0, corpus_pattern='',
+        tool_names=(), tool_versions=(), tool_packages=(), tool_consumers=(),
+    )
+    base.update(overrides)
+    return plan_with(**base)
+
+
+def cargo_line(script: str) -> str:
+    """The single `cargo test ...` invocation a rendered script actually runs."""
+    lines = [
+        line.strip() for line in script.splitlines()
+        if line.strip().startswith('cargo test')
+    ]
+    assert len(lines) == 1, f'expected exactly one cargo invocation, got {lines}'
+    return lines[0]
+
+
+def graded_cargo(plugin, plan, graded) -> str:
+    line = cargo_line(plugin.render_test_sh(graded, dep_plan=plan, integration_targets=2))
+    return line.split(' > ')[0].strip()
+
+
+def measure_cargo(plugin, plan, graded) -> str:
+    line = cargo_line(plugin.measure_test_sh(graded=graded, dep_plan=plan))
+    return line.split(' > ')[0].strip()
+
+
+def test_measure_and_test_sh_select_units_from_the_same_plan_slots(plugin, graded):
+    """THE bug, as an offline assertion: one plan, one selection, both scripts.
+
+    `graded` deliberately still carries `R.TEST_COMMAND` -- rust-spacewasm's
+    default, with `--skip memory_max` -- because that is exactly the stale value
+    `emit` holds while the measure image runs. Neither script may read it.
+    """
+    plan = selection_plan()
+    plugin.validate_dep_plan(plan)
+
+    assert graded.test_command == R.TEST_COMMAND
+    assert measure_cargo(plugin, plan, graded) == graded_cargo(plugin, plan, graded)
+    assert measure_cargo(plugin, plan, graded) == (
+        'cargo test --offline --test alpha --test beta -- --skip slow_case'
+    )
+    for stale in ('core_integration', 'memory_max'):
+        assert stale not in plugin.measure_test_sh(graded=graded, dep_plan=plan)
+
+
+@pytest.mark.parametrize(
+    'exclusions',
+    [(), ('slow_case',), ('slow_case', 'flaky_case')],
+)
+def test_every_exclusion_reaches_both_scripts_identically(plugin, graded, exclusions):
+    """The exclusion list is the slot that broke; pin it across its whole range.
+
+    An exclusion applied to one path and not the other moves the two
+    denominators by exactly the number of tests it names.
+    """
+    plan = selection_plan(exclude_names=exclusions)
+    plugin.validate_dep_plan(plan)
+
+    measured, shipped = (
+        measure_cargo(plugin, plan, graded), graded_cargo(plugin, plan, graded),
+    )
+    assert measured == shipped
+    for name in exclusions:
+        assert f'--skip {name}' in measured
+    assert measured.count('--skip') == len(exclusions)
+
+
+def test_the_harness_target_list_reaches_both_scripts_identically(plugin, graded):
+    """The other counting slot: a target named in one script and not the other."""
+    plan = selection_plan(
+        harness_names=('alpha', 'beta', 'gamma'),
+        harness_files=('tests/alpha.rs', 'tests/beta.rs', 'tests/gamma.rs'),
+        exclude_names=(),
+    )
+    plugin.validate_dep_plan(plan)
+
+    measured = measure_cargo(plugin, plan, graded)
+    shipped = cargo_line(
+        plugin.render_test_sh(graded, dep_plan=plan, integration_targets=3)
+    ).split(' > ')[0].strip()
+    assert measured == shipped
+    for name in ('alpha', 'beta', 'gamma'):
+        assert f'--test {name}' in measured
+
+
+def test_the_spacewasm_default_still_agrees_across_both_scripts(plugin, graded):
+    """The shipped repo itself, on the pre-resolution path: 92 must equal 92."""
+    assert measure_cargo(plugin, R.RUST_MEASURE_DEP_PLAN, graded) == cargo_line(
+        plugin.render_test_sh(
+            graded, dep_plan=R.RUST_MEASURE_DEP_PLAN, integration_targets=4,
+        )
+    ).split(' > ')[0].strip() == R.TEST_COMMAND
+
+
+# ------------------------------------------------- the wast corpus floor ----
+
+
+def test_the_corpus_floor_is_the_host_count_not_the_plans_claim(plugin, graded):
+    """A plan understating its own corpus must not ship a slack gate.
+
+    spacewasm's resolved plan claimed `corpus_min=70` over a directory holding
+    75 files, so five could go missing unnoticed. The host count wins.
+    """
+    plan = selection_plan(
+        corpus_dir='tests/core', corpus_label='wast',
+        corpus_min=70, corpus_pattern='*.wast',
+    )
+    plugin.validate_dep_plan(plan)
+
+    sh = plugin.render_test_sh(
+        graded, dep_plan=plan, integration_targets=2, corpus_count=75,
+    )
+    assert '"${WAST_COUNT}" -ge 75' in sh
+    assert '-ge 70' not in sh
+
+
+def test_the_corpus_floor_falls_back_to_the_plan_when_no_host_count(plugin, graded):
+    """The pre-resolution path keeps rust-spacewasm's rendered bytes exactly."""
+    sh = plugin.render_test_sh(graded, dep_plan=R.RUST_MEASURE_DEP_PLAN)
+    assert f'"${{WAST_COUNT}}" -ge {R.MIN_WAST}' in sh

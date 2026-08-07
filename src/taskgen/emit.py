@@ -1216,12 +1216,12 @@ def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
             graded_spec, dep_plan=dep_plan, **_java_grader_metadata(plan),
         )
     if plan.lang == 'rust':
+        metadata = _rust_grader_metadata(plan, dep_plan)
         return plugin.render_test_sh(
             graded_spec,
             dep_plan=dep_plan,
-            integration_targets=len(
-                _rust_grader_metadata(plan, dep_plan)['integration_targets']
-            ),
+            integration_targets=len(metadata['integration_targets']),
+            corpus_count=metadata['corpus_count'],
         )
     return plugin.render_test_sh(graded_spec)
 

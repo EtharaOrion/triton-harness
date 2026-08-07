@@ -868,6 +868,7 @@ class RustPlugin(B.LangPlugin):
         expected: int | None = None,
         fingerprint: Mapping[str, str] | None = None,
         integration_targets: int | None = None,
+        corpus_count: int | None = None,
         dep_plan: DepPlan | None = None,
     ) -> str:
         expected = graded.expected if expected is None else int(expected)
@@ -910,12 +911,19 @@ class RustPlugin(B.LangPlugin):
         corpus_prose = ''
         if harness.has_corpus:
             var, label = harness.corpus_var, harness.corpus_label
+            # The floor is what the HOST counted in the intact tree, not the
+            # number the plan states about itself. `corpus_min` is only a
+            # resolver claim and is checked no harder than `<= actual`, so a
+            # plan understating it (spacewasm: 70 against 75 real files) ships a
+            # gate that a truncated corpus still clears. The count is the same
+            # independent signal `integration_targets` is.
+            floor = harness.corpus_min if corpus_count is None else int(corpus_count)
             corpus_block = [
                 f'{var}=$(find {harness.corpus_dir} -name '
                 f"'{harness.corpus_pattern}' | wc -l | tr -d ' ')",
-                f'[ "${{{var}}}" -ge {harness.corpus_min} ] \\',
+                f'[ "${{{var}}}" -ge {floor} ] \\',
                 f'    || fail "{label} corpus truncated: found ${{{var}}}, '
-                f'expected >={harness.corpus_min}"',
+                f'expected >={floor}"',
                 '',
             ]
             corpus_prose = f', ${{{var}}} {harness.corpus_suffix} files'
@@ -1048,11 +1056,13 @@ class RustPlugin(B.LangPlugin):
         -- against the intact tree, where they must all pass.
         """
         _plan, harness = self._harness(dep_plan)
-        test_cmd = (
-            graded.test_command
-            if graded and graded.test_command
-            else harness.graded_command
-        )
+        # The harness is the only authority, exactly as in `render_test_sh`.
+        # `graded.test_command` must NOT be preferred: `_measure_and_pin` runs
+        # BEFORE `emit._retitle_test_command`, so at measure time it still holds
+        # the plugin's class default (`TEST_COMMAND`) -- another repo's command.
+        # Reading it made this image count a different selection than the graded
+        # run whose denominator it pins.
+        test_cmd = harness.graded_command
         return '\n'.join([
             '#!/usr/bin/env bash',
             '# Harbor MEASURE (phase 1) -- rust. Floor-FREE by construction; the',
