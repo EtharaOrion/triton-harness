@@ -77,6 +77,15 @@ def graded():
         },
     )
 
+#: What `emit._render_test_sh` threads in for java: the INDEPENDENT host-side
+#: signals the plugin refuses to render without. 69 and 'tamboui-widgets' are
+#: java-tamboui's, measured by `emit._java_grader_metadata` from the intact tree.
+HOST_SIDE = {'test_suites': 69, 'graded_module': 'tamboui-widgets'}
+
+
+def render_test_sh(plugin, graded, **kwargs):
+    return plugin.render_test_sh(graded, **{**HOST_SIDE, **kwargs})
+
 
 def test_plugin_declares_its_five_axes(plugin):
     assert plugin.name == 'java'
@@ -287,12 +296,12 @@ def test_no_extra_ctx_assets(plugin):
 
 def test_render_test_sh_bakes_expected_from_graded(plugin, graded):
     """823 is threaded from graded.expected -- NOT a literal in the plugin source."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'EXPECTED=823' in script
 
 
 def test_render_test_sh_bakes_fingerprint_checks(plugin, graded):
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'check_sha256' in script
     a_line = (
         "check_sha256 'tamboui-widgets/src/test/java/dev/tamboui/widgets/"
@@ -303,21 +312,21 @@ def test_render_test_sh_bakes_fingerprint_checks(plugin, graded):
 
 def test_render_test_sh_runs_offline_no_daemon_rerun(plugin, graded):
     """The graded run must use exactly the flags the reference test.sh uses."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'gradle --offline --no-daemon --console=plain :tamboui-widgets:test --rerun' in script
 
 
 def test_render_test_sh_removes_stale_junit_xml_before_running(plugin, graded):
     """A stale XML from a prior run would let compilation-skipped tests
     report green via the cached counts."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'rm -rf "${RESULTS}"' in script
     assert 'tamboui-widgets/build/test-results/test' in script
 
 
 def test_render_test_sh_parses_junit_xml_via_python3(plugin, graded):
     """The JUnit XML is authoritative, not Gradle's console summary."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'python3 - ' in script
     assert 'xml.etree.ElementTree' in script
     assert "root.get('tests'" in script
@@ -328,15 +337,18 @@ def test_render_test_sh_parses_junit_xml_via_python3(plugin, graded):
 
 def test_render_test_sh_gates_suites_at_expected_suites(plugin, graded):
     """The structural anti-gaming gate: JUnit fanned out every declared suite."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert '"${SUITES}" -eq "${EXPECTED_SUITES}"' in script
+    # 69 is java-tamboui's, and it now reaches the script from emit's own
+    # host-side scan of the intact tree rather than from a plugin literal.
     assert 'EXPECTED_SUITES=69' in script
+    assert 'EXPECTED_SUITES=61' in render_test_sh(plugin, graded, test_suites=61)
 
 
 def test_render_test_sh_gates_suites_gt_zero_before_the_floor(plugin, graded):
     """No JUnit XML at all means compile failed; caught ahead of the floor
     so a build failure reports compiled=0.0 rather than tripping the equality gate."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert '"${SUITES}" -eq 0' in script
     assert 'compilation failed' in script
 
@@ -346,13 +358,13 @@ def test_render_test_sh_computes_passed_without_subtracting_skipped_from_denom(
 ):
     """A skipped test is not a passed test; but the denominator stays at
     EXPECTED so a solver cannot @Disabled their way to a perfect score."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert 'PASSED=$((TESTS - FAILURES - ERRORS - SKIPPED))' in script
 
 
 def test_render_test_sh_gates_binary_on_exit_zero_and_no_failures(plugin, graded):
     """BINARY==1 requires gradle exit==0 AND zero failures AND zero errors."""
-    script = plugin.render_test_sh(graded)
+    script = render_test_sh(plugin, graded)
     assert '"${STATUS}" -ne 0' in script
     assert '"${FAILURES}" -ne 0' in script
     assert '"${ERRORS}" -ne 0' in script
@@ -363,8 +375,9 @@ def test_render_test_sh_does_not_hardcode_repo_magic_numbers(plugin, graded):
 
     The plugin's own source is inspected here: 823 may appear ONLY inside
     docstrings/comments, never as a bare shell/python literal. It must always
-    thread through graded.expected. (EXPECTED_SUITES=69 is documented as the
-    one exception -- the measure schema does not carry a second scalar.)
+    thread through graded.expected. The suite count is no longer an exception:
+    it lives in `JAVA_TAMBOUI_HARNESS` -- java-tamboui's own plan -- and is
+    cross-checked against an independent host-side scan.
     """
     import inspect
 

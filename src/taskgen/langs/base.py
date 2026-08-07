@@ -55,6 +55,7 @@ from typing import ClassVar, Literal, Mapping
 from ..depplan import DepPlan
 
 __all__ = [
+    'CarveFacts',
     'DepWarmSpec',
     'EnvSpec',
     'FLOOR_MODES',
@@ -260,10 +261,41 @@ class GradedSet:
 
 
 @dataclass(frozen=True)
+class CarveFacts:
+    """What the HOST knows about the carve, for a plugin that has to describe it.
+
+    A `DepPlan` is what a resolver may state; this is what only the generator can
+    know, because it is the one party holding the intact tree AND the carve
+    arguments. The two are kept apart on purpose: the leak assert a java image
+    runs over its dependency cache has to name the package namespace that was
+    actually removed, and a namespace a MODEL supplied would be a leak check
+    whose subject was guessed. Guessed wrong, it passes vacuously.
+
+    `package_roots` are language-namespace directories relative to the source
+    root (`dev/tamboui/widgets`), never repo-relative paths, because what the
+    scan looks for is a namespace: `.class` files hold it as a UTF8 constant and
+    jar entries hold it as a path, and neither carries the repo prefix.
+
+    Empty is the PRE-CARVE default and means "this caller has no carve to
+    describe" -- a plugin that needs one falls back to its own reference repo's
+    facts (the same bytes under a name) rather than rendering a hole.
+    """
+
+    root: str = ''
+    package_roots: tuple[str, ...] = ()
+    file_count: int = 0
+    grader_source_count: int = 0
+
+
+@dataclass(frozen=True)
 class EnvSpec:
     """Where things live in the image, and which named context supplies them."""
 
     repo_name: str
+    #: What the host carved, for the blocks that have to name it (java's
+    #: gradle-home fossil scan). Defaults to the empty record, so every plugin
+    #: that does not read it renders exactly the bytes it rendered before.
+    carve: CarveFacts = field(default_factory=CarveFacts)
     workdir: str = WORKDIR
     tests_dir: str = TESTS_DIR
     logs_dir: str = LOGS_DIR
@@ -440,6 +472,10 @@ class LangPlugin(abc.ABC):
     #: the prompt and the image start disagreeing about what is installed.
     baked_capabilities: ClassVar[tuple[str, ...]] = ()
 
+    #: Intact-tree globs a whole-suite plugin locks per file against tampering.
+    #: Declared here so `grader_fingerprint_globs_for` has a base to narrow.
+    grader_fingerprint_globs: ClassVar[tuple[str, ...]] = ()
+
     #: The plan slots THIS language's `render_gap` cannot render without, each
     #: one imperative sentence naming the slot, as `--resolve-env` states them
     #: to the model. `depplan.validate` is lang-AGNOSTIC and by design knows
@@ -473,6 +509,34 @@ class LangPlugin(abc.ABC):
     @abc.abstractmethod
     def dep_warm_spec(self) -> DepWarmSpec:
         """Axis 2, as data. Warmed from manifest files only, never from the repo."""
+
+    def dep_warm_spec_for(self, env: EnvSpec, dep_plan: DepPlan | None) -> DepWarmSpec:
+        """`dep_warm_spec` for a plugin whose warm stage depends on plan and carve.
+
+        A second hook rather than an argument on the first, for the same reason
+        `post_restore_for` is one: what a warm stage resolves is a fact about the
+        REPO for a plan-driven plugin and a constant for every other, and
+        widening one signature would make five plugins accept two arguments they
+        have no use for.
+        """
+        return self.dep_warm_spec()
+
+    def pre_leakgate_blocks_for(
+        self, env: EnvSpec, dep_plan: DepPlan | None,
+    ) -> tuple[str, ...]:
+        """`pre_leakgate_blocks` for a plugin whose proof is scoped by the plan."""
+        return self.pre_leakgate_blocks(env)
+
+    def grader_fingerprint_globs_for(self, carved_relpaths) -> tuple[str, ...]:
+        """The globs to fingerprint, narrowed to what this carve actually grades.
+
+        Expanded HOST-SIDE before any environment is resolved, so they cannot
+        come from a plan. A monorepo's other modules keep their own test trees,
+        and locking those would pin files no graded task can reach -- which is
+        why a plugin whose graded surface is one module derives the globs from
+        the carve instead of declaring one repository's spelling.
+        """
+        return self.grader_fingerprint_globs
 
     def toolchain(self) -> str:
         """Axis 1 as a Dockerfile snippet."""
@@ -744,6 +808,7 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
         else:
             self.validate_dep_plan(dep_plan)
             gap = self._gap_body(dep_plan)
+        warm = self.dep_warm_spec_for(env, dep_plan)
         blocks = [
             '# syntax=docker/dockerfile:1.7',
             f'# Harbor task image -- {env.repo_name} ({self.name})',
@@ -752,7 +817,7 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
             '# HOST. The intact tree never enters ANY build context, so no layer holds',
             '# the answer and `docker save` has nothing to recover (plan A1).',
             '',
-            self.dep_warm_spec().render_stage(
+            warm.render_stage(
                 env, self.toolchain_spec().base_image, self.toolchain(),
             ) or None,
             f'FROM {self.toolchain_spec().base_image} AS {env.stage}',
@@ -761,13 +826,13 @@ echo "SOLVE OK (${{RESTORED}} file(s) restored from ${{SOLUTION}})"
             '',
             '# Dependencies arrive by COPY from a SEPARATE warm image. `FROM warm` would',
             '# inherit every layer that build happened to touch (invariant 7).',
-            self.dep_warm(),
+            warm.render(),
             '',
             f'COPY --from={env.repo_context} repo/ {env.workdir}',
             f'COPY --from={env.entry_context} tests/ {env.tests_dir}/',
             f'RUN mkdir -p {env.logs_dir}',
             '',
-            *self.pre_leakgate_blocks(env),
+            *self.pre_leakgate_blocks_for(env, dep_plan),
             '',
             '# Content leak gate: harbor shared/tooling/leakscan.sh, unmodified, over',
             '# the whole filesystem. The tripwires arrive on a BuildKit bind mount, so',

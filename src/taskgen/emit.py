@@ -408,7 +408,7 @@ def plan_carve(
         )
         from .gradedset import whole_suite_selection
 
-        fingerprint_globs = getattr(plugin, 'grader_fingerprint_globs', ())
+        fingerprint_globs = plugin.grader_fingerprint_globs_for(carve.carved_relpaths)
         fingerprint_relpaths: tuple[str, ...] = ()
         if fingerprint_globs:
             gs = scope_mod.GlobSet(fingerprint_globs)
@@ -853,6 +853,174 @@ def _cpp_grader_metadata(plan: CarvePlan) -> dict:
     return {'registered_tests': registered}
 
 
+#: Java's own test-method annotations, across JUnit 4 and 5. A class declaring
+#: any of them is a class the runner reports, which is what makes it a
+#: `TEST-*.xml`. `@Nested` is deliberately NOT here: a nested class counts
+#: because of the tests it declares, not because it is nested.
+_JUNIT_TEST_ANNOTATIONS: tuple[str, ...] = (
+    'Test', 'ParameterizedTest', 'RepeatedTest', 'TestFactory', 'TestTemplate',
+)
+
+#: Comments and literals are stripped before the scan so a `{` inside a string
+#: cannot shift brace depth and mis-attribute every later annotation. Newlines
+#: inside block comments are preserved so reported offsets stay meaningful.
+_JAVA_BLOCK_COMMENT = re.compile(r'/\*.*?\*/', re.DOTALL)
+_JAVA_LINE_COMMENT = re.compile(r'//[^\n]*')
+_JAVA_LITERAL = re.compile(
+    r'"""(?:\\.|[^\\])*?"""|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.DOTALL,
+)
+
+#: One pass over the stripped source, in source order: a type declaration with
+#: its modifiers, a brace either way, or a test annotation. `(?<![@.\w])` keeps
+#: `Foo.class` and `@interface` from reading as declarations.
+_JAVA_TOKENS = re.compile(
+    r'(?P<type>(?P<modifiers>(?:(?:public|protected|private|static|final|abstract'
+    r'|sealed|non-sealed|strictfp)\s+)*)'
+    r'(?<![@.\w])(?P<kind>class|interface|enum|record)\s+(?P<name>\w+))'
+    r'|(?P<open>\{)|(?P<close>\})'
+    r'|@(?:' + '|'.join(_JUNIT_TEST_ANNOTATIONS) + r')\b'
+)
+
+#: JUnit re-runs an inherited test method once per concrete subclass, and a
+#: `@Suite` re-runs whole classes it selects. Either makes the number of report
+#: files a function of the type graph rather than of the declarations, so the
+#: scan refuses instead of answering low.
+_JAVA_SUITE_ANNOTATION = re.compile(r'@(?:Suite|SelectClasses|SelectPackages)\b')
+
+def _junit_suite_classes(text: str, where: str) -> int:
+    """Test CLASSES a java source declares OUTRIGHT -- one `TEST-*.xml` each.
+
+    The independent half of java's under-enumeration guard, and the reason it
+    can be trusted: it reads the repository's own test sources rather than
+    anything the resolver said, and every construct whose report count depends
+    on something not written in this file makes it REFUSE rather than answer.
+
+    Counting is brace-depth-aware because `@Nested` is the whole difficulty:
+    JUnit writes a separate report for a nested class, and an outer class whose
+    test methods all live in nested classes writes none of its own. So an
+    annotation is attributed to the INNERMOST open type declaration, and a type
+    is counted when its body closes having been attributed at least one.
+    Anonymous classes and lambdas open braces without declaring a type, so they
+    keep their enclosing class's attribution -- which is correct, since a test
+    method cannot be declared in one.
+    """
+    if _JAVA_SUITE_ANNOTATION.search(text):
+        raise langs_base.LangError(
+            f'{where} declares a JUnit @Suite/@SelectClasses aggregation, so how '
+            'many report files the graded task writes depends on which classes '
+            'that suite selects and how often -- not on what this file '
+            'declares. Counting the declarations would under-count, and an '
+            'under-counted suite is one that is partly ungraded while every '
+            'gate still passes. Refusing instead'
+        )
+    stripped = _JAVA_LINE_COMMENT.sub(
+        '',
+        _JAVA_BLOCK_COMMENT.sub(lambda m: '\n' * m.group(0).count('\n'), text),
+    )
+    stripped = _JAVA_LITERAL.sub('""', stripped)
+
+    depth = 0
+    pending: tuple[str, bool] | None = None
+    open_types: list[list] = []
+    counted = 0
+    for match in _JAVA_TOKENS.finditer(stripped):
+        if match.group('type'):
+            inherits = (
+                'abstract' in match.group('modifiers').split()
+                or match.group('kind') == 'interface'
+            )
+            pending = (match.group('name'), inherits)
+        elif match.group('open'):
+            depth += 1
+            if pending is not None:
+                open_types.append([pending[0], depth, False, pending[1]])
+                pending = None
+        elif match.group('close'):
+            if open_types and open_types[-1][1] == depth:
+                name, _body, declared, inherits = open_types.pop()
+                if declared and inherits:
+                    raise langs_base.LangError(
+                        f'{where} declares test methods on the abstract type '
+                        f'{name!r}. JUnit runs those once per concrete subclass, '
+                        'so the number of report files depends on the type graph '
+                        'rather than on any one file, and a static count would '
+                        'under-count the suite. Refusing instead'
+                    )
+                counted += 1 if declared else 0
+            depth -= 1
+        elif open_types:
+            open_types[-1][2] = True
+    return counted
+
+
+def _java_carve_facts(plan: CarvePlan) -> langs_base.CarveFacts:
+    """What the host knows about a java carve, for the warm stage's fossil scan.
+
+    Never asks the plan: the namespace the leak assert looks for has to be the
+    one that was actually removed, and a namespace anyone else supplied is a
+    scan that can pass while the cache holds the answer. `package_roots_of_carve`
+    refuses rather than returning an empty subject.
+    """
+    from .langs import java as java_lang
+
+    carved = tuple(plan.carve.carved_relpaths)
+    return langs_base.CarveFacts(
+        root=common_root(carved),
+        package_roots=java_lang.package_roots_of_carve(carved),
+        file_count=len(carved),
+        grader_source_count=len([
+            rel for rel in plan.graded.fingerprint_relpaths if rel.endswith('.java')
+        ]),
+    )
+
+
+def _carve_facts(plan: CarvePlan) -> langs_base.CarveFacts:
+    """The carve as the image renderer needs it, for the languages that read it.
+
+    Empty for every plugin that does not describe its carve in a Dockerfile,
+    which keeps their rendered bytes exactly where they were.
+    """
+    return _java_carve_facts(plan) if plan.lang == 'java' else langs_base.CarveFacts()
+
+
+def _java_grader_metadata(plan: CarvePlan) -> dict:
+    """How many JUnit report files the intact tree declares, counted HOST-SIDE.
+
+    The independent half of java's under-enumeration guard. The plan states how
+    much of the suite it describes; this counts what the repository's own test
+    sources actually declare, and the plugin refuses when the two disagree. A
+    plan that silently described part of a suite would otherwise pin a floor
+    over that part and pass every later gate, because a shrunken denominator is
+    self-consistent at the wrong number.
+
+    WHICH module is scanned comes from the CARVE, not from the plan: the graded
+    module is decided by the operator's include globs, so letting the resolved
+    plan point the scan somewhere else would let a plan quietly narrow the very
+    thing it is being checked against.
+    """
+    from .langs import java as java_lang
+
+    module = java_lang.module_dir_of_carve(plan.carve.carved_relpaths)
+    test_root = java_lang.TEST_SOURCE_ROOT
+    root = plan.repo / module / test_root if module else plan.repo / test_root
+    sources = sorted(root.rglob('*.java')) if root.is_dir() else []
+    if not sources:
+        raise langs_base.LangError(
+            f'the carved module {module or "(root project)"!s} has no java test '
+            f'sources under {test_root}/, so there is nothing to grade the '
+            'carve against and no independent count to check the plan\'s suite '
+            'size with. A whole-suite java task needs a suite'
+        )
+    suites = sum(
+        _junit_suite_classes(
+            path.read_text(encoding='utf-8', errors='replace'),
+            path.relative_to(plan.repo).as_posix(),
+        )
+        for path in sources
+    )
+    return {'test_suites': suites, 'graded_module': module}
+
+
 def _candidate_validator(plugin, plan: CarvePlan):
     """Plan admissibility PLUS the host-side cross-checks the intact tree affords.
 
@@ -861,9 +1029,18 @@ def _candidate_validator(plugin, plan: CarvePlan):
     scripts are being written aborts a whole generate, while the same mismatch
     discovered here is one more resolver attempt with a precise message.
     """
-    if plan.lang != 'cpp':
+    if plan.lang not in ('cpp', 'java'):
         return plugin.validate_dep_plan
-    metadata = _cpp_grader_metadata(plan)
+    if plan.lang == 'java':
+        # Derived here as well as at entry-writing time so a carve whose package
+        # namespace cannot be established REFUSES before any image is built,
+        # rather than after the measure image has been paid for.
+        _java_carve_facts(plan)
+        # Only the SCOPE is a plan claim: the suite count is host-side and the
+        # resolver is never asked for it (it is shown test paths, not bodies).
+        metadata = {'graded_module': _java_grader_metadata(plan)['graded_module']}
+    else:
+        metadata = _cpp_grader_metadata(plan)
 
     def validate(dep_plan: DepPlan) -> None:
         plugin.validate_dep_plan(dep_plan)
@@ -892,12 +1069,16 @@ def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
             carve_root=carve_root,
             **_cpp_grader_metadata(plan),
         )
+    if plan.lang == 'java':
+        return plugin.render_test_sh(
+            graded_spec, dep_plan=dep_plan, **_java_grader_metadata(plan),
+        )
     return plugin.render_test_sh(graded_spec)
 
 
 def _measure_test_sh(plugin, plan: CarvePlan, dep_plan: DepPlan | None) -> str:
-    """Phase 1's script. Only c and cpp read the plan; the rest keep their signature."""
-    if plan.lang in ('c', 'cpp'):
+    """Phase 1's script. Only the harness-driven langs read the plan."""
+    if plan.lang in ('c', 'cpp', 'java'):
         return plugin.measure_test_sh(graded=plan.graded, dep_plan=dep_plan)
     return plugin.measure_test_sh(graded=plan.graded)
 
@@ -925,8 +1106,8 @@ def _retitle_test_command(plan: CarvePlan, plugin, dep_plan: DepPlan | None) -> 
 
 
 def _render_solve_sh(plugin, plan: CarvePlan, rels, dep_plan: DepPlan | None) -> str:
-    """The oracle. Only cpp's post-restore wipe is plan-driven; the rest are not."""
-    if plan.lang == 'cpp':
+    """The oracle. Only the plan-driven post-restore wipes read a plan."""
+    if plan.lang in ('cpp', 'java'):
         return plugin.render_solve_sh(rels, dep_plan=dep_plan)
     return plugin.render_solve_sh(rels)
 
@@ -990,7 +1171,7 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
     for rel, text in sorted(carve.originals.items()):
         _write(path / f'solution/carved/{rel}', text)
 
-    env = langs_base.EnvSpec(repo_name=repo_name)
+    env = langs_base.EnvSpec(repo_name=repo_name, carve=_carve_facts(plan))
     _write(path / 'environment/Dockerfile',
            plugin.render_dockerfile(env, dep_plan=dep_plan))
     _write(path / 'environment/Dockerfile.dockerignore', templates.DOCKERIGNORE)

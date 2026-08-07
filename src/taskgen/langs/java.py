@@ -38,26 +38,53 @@ the Oracle's decision matrix; Options B (measure-side warmup) and C (warm
 inside graded) were rejected as either invasive or impossible for a carved
 tree that never sees the widget answer.
 
-GRADER FINGERPRINT. `('tamboui-widgets/src/test/**',)` expands host-side at
-generate time to every file under widgets' test root (49 .java + resources
-/ metadata) and every path gets an sha256 baked inline via
-`fingerprint_gate_block`. The reference asset instead ships a
-`test-tree.sha256` file into `/opt/harbor-tooling` at image build time; the
-inline per-file lock is strictly stronger -- a solver cannot swap one test
+GRADER FINGERPRINT. `grader_fingerprint_globs_for` narrows to the CARVED
+module's own test root (`tamboui-widgets/src/test/**`), derived from the carve
+rather than declared, so a monorepo's other modules do not get locked with
+files no graded task can reach. It expands host-side at generate time to every
+file under that root (49 .java + resources / metadata) and every path gets an
+sha256 baked inline via `fingerprint_gate_block`. The reference asset instead
+ships a `test-tree.sha256` file into `/opt/harbor-tooling` at image build time;
+the inline per-file lock is strictly stronger -- a solver cannot swap one test
 file for another of matching aggregate hash, and the fingerprint document
 never lands on disk as a rewritable file inside the container.
 
-NO REPO-MAGIC NUMBERS IN PLUGIN SOURCE (mostly). 823 (JUnit test methods)
-threads through `graded.expected` -- the denominator measured host-side in
-phase 1 by `measure.py` running the intact tree's `:tamboui-widgets:test`
-once and summing `<testsuite tests=>` across every XML. The 49 test files
-lock in via the fingerprint dict, so the plugin does not repeat that count
-either. The one exception is `EXPECTED_SUITES = 69`: the JUnit `tests`
-attribute counts leaf methods, so `SUITES == 69` is a structural check that
-JUnit fanned out every declared class (a compile failure that skipped some
-classes would drop the suite count without necessarily dropping the test
-count if `@Disabled` masked them). It is threaded as a plugin ClassVar with
-a docstring rather than sprinkled through the rendered bash.
+NO REPO CONSTANTS IN THE RENDERER. 823 (JUnit test methods) threads through
+`graded.expected` -- measured host-side in phase 1 by `measure.py` running the
+intact tree's graded task once and summing `<testsuite tests=>` across every
+XML. Everything else the two scripts and the warm stage used to hardcode about
+java-tamboui -- the module, the graded gradle task, the JUnit results
+directory, the buildSrc convention build, the stale-output wipe, and the 69
+suite count -- is now `DepPlan.harness`, and `JAVA_TAMBOUI_HARNESS` is
+java-tamboui's own answer to it (the fallback is not a guess; it is the same
+bytes under a name).
+
+THE SUITE COUNT IS MEASURED, NOT DECLARED. `SUITES == 69` was the structural
+net that caught a graded run in which JUnit failed to fan out every declared
+class; a shrunken denominator is SELF-CONSISTENT at the wrong number, so
+measure, the equality floor and RED/GREEN would all pass while part of the suite
+went ungraded. The literal is replaced by an INDEPENDENT host-side count:
+`emit._java_grader_metadata` counts JUnit test CLASSES in the carved module's
+own test sources, brace-depth-aware so a `@Nested` class counts as the separate
+`TEST-*.xml` JUnit writes for it, and refuses to answer rather than answer low
+(see `_junit_suite_classes`). That number -- not a plugin constant and not a
+resolver's guess -- is what the shipped `EXPECTED_SUITES` gate asserts.
+
+It is NOT a plan slot, and that is a leak-boundary consequence rather than a
+preference: the count depends on class structure INSIDE the test files, the
+resolver is shown test PATHS only, and a slot whose correct value is
+underivable from a resolver's inputs is a slot that can only be guessed. The
+scope cross-check that IS answerable from paths -- which module the graded task
+and its report directory belong to -- stays plan-fed and is enforced against the
+carve by `_assert_scope_agrees`.
+
+THE LEAK SCAN'S SUBJECT COMES FROM THE CARVE. The warm stage asserts that
+nothing under `$GRADLE_USER_HOME` names the carved package namespace. That
+namespace is derived from the carved relpaths host-side (`CarveFacts`), never
+from the plan: a namespace a model supplied would be a fossil scan whose
+subject was guessed, and a wrong guess passes vacuously on every repo. A carve
+whose package root cannot be determined is REFUSED rather than scanned for
+nothing.
 
 BUILD PARALLELISM. Gradle honours its own `org.gradle.parallel=true` +
 `--parallel` heuristics on both configuration and execution; the 8 GB
@@ -76,20 +103,29 @@ step could have left carved bytes.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
+from ..depplan import (
+    DepPlan,
+    FlagValue,
+    HarnessValue,
+    TestValue,
+    canonicalize,
+    validate,
+)
 from . import base as B
-from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
+from .base import CarveFacts, DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
     'BAKED_CAPABILITIES',
     'BASE_IMAGE',
-    'EXPECTED_SUITES',
     'GRADER_FINGERPRINT_GLOBS',
+    'Harness',
     'JAVA_HOME',
     'JAVA_MEASURE_DEP_PLAN',
+    'JAVA_TAMBOUI_CARVE',
+    'JAVA_TAMBOUI_HARNESS',
     'JAVA_VERSION',
     'JavaPlugin',
     'MEASURE_NO_WARM_COMMENT',
@@ -97,7 +133,10 @@ __all__ = [
     'REQUIRED_PLAN_SLOTS',
     'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
-    'WIDGETS_MODULE',
+    'TEST_SOURCE_ROOT',
+    'module_dir_of_carve',
+    'package_roots_of_carve',
+    'read_harness',
 ]
 
 #: The JDK the base bakes and this task selects. settings.gradle.kts hard-fails
@@ -123,46 +162,61 @@ BASE_IMAGE = '426628337772.dkr.ecr.ap-south-2.amazonaws.com/triton/base-java@sha
 #: source is self-describing.
 GRADLE_USER_HOME = '/opt/gradle-home'
 
-#: The graded module and its default test path. Only tamboui-widgets is
-#: carved; every other module is intact in repoctx and configures normally.
-WIDGETS_MODULE = 'tamboui-widgets'
+#: java-tamboui's own harness as a `DepPlan.harness` section -- the fixed point
+#: of the refactor: rendered, it reproduces the scripts and the warm stage this
+#: plugin used to hardcode byte for byte. Every value is a fact about the
+#: java-tamboui REPOSITORY, which is exactly why none of it belongs here.
+#:
+#: The SUITE COUNT is deliberately absent: how many `TEST-*.xml` files JUnit
+#: writes depends on how many test CLASSES the sources declare (a `@Nested`
+#: class gets its own report, which is why java-tamboui's 49 test files produce
+#: 69 reports). That is a fact about test BODIES, and the resolver is shown test
+#: PATHS only -- so asking it would be asking for something its inputs cannot
+#: answer. It is counted HOST-SIDE instead, by `emit._java_grader_metadata`.
+JAVA_TAMBOUI_HARNESS: tuple[tuple[str, HarnessValue], ...] = (
+    ('buildsrc_path', ':buildSrc'),
+    ('project_label', 'java-tamboui'),
+    ('results_dir', 'tamboui-widgets/build/test-results/test'),
+    ('stale_paths', (
+        'tamboui-widgets/build', 'tamboui-widgets/.gradle', '.gradle',
+    )),
+    ('test_task', ':tamboui-widgets:test'),
+)
 
-#: The graded test command as prose. Rendered into instruction.md so the model
+#: java-tamboui's own CARVE, for the callers that hold no carve of their own
+#: (`render_dockerfile(EnvSpec(repo_name=...))`, every test written before the
+#: warm stage read one). Not a default a real generate can reach:
+#: `emit._java_carve_facts` derives these from the carved relpaths and REFUSES
+#: when it cannot, so the fossil scan a shipped image runs always names the
+#: namespace that was actually removed from THAT repo.
+JAVA_TAMBOUI_CARVE = CarveFacts(
+    root='tamboui-widgets/src/main/java',
+    package_roots=('dev/tamboui/widgets',),
+    file_count=85,
+    grader_source_count=49,
+)
+
+#: The graded test command as argv. Rendered into instruction.md so the model
 #: sees exactly what test.sh runs. `--rerun` defeats gradle's build-cache
 #: stale-green (spike caught this returning a cached PASS with zero test runs).
 #: `--offline` refuses the network; `--no-daemon` matches the reference and
 #: keeps each container invocation self-contained.
-TEST_COMMAND = (
-    f'gradle --offline --no-daemon --console=plain :{WIDGETS_MODULE}:test --rerun'
+_TAMBOUI_TEST_ARGV: tuple[str, ...] = (
+    'gradle', '--offline', '--no-daemon', '--console=plain',
+    ':tamboui-widgets:test', '--rerun',
 )
 
-#: What the plugin locks against tampering: every file under
-#: tamboui-widgets/src/test/ (49 .java files plus any resources / metadata).
-#: The whole test tree IS the grader; a solver who edited one to make the
-#: suite trivially pass would trip the per-file sha256 check inline in
-#: `render_test_sh` and score zero. Strictly stronger than the reference
-#: asset's aggregate-hash file at /opt/harbor-tooling/test-tree.sha256.
-GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = (
-    f'{WIDGETS_MODULE}/src/test/**',
-)
-
-#: The intact-tree suite count -- how many `TEST-*.xml` files JUnit writes for
-#: `:tamboui-widgets:test` when every source is present. 49 test SOURCE files
-#: fan out into 69 SUITE files (nested @Nested classes and parameterised
-#: providers produce more than one <testsuite> per source). The equality floor
-#: pins the test count (823) but not the suite count, so a compile failure
-#: that dropped ONE nested class while its declared tests still counted as
-#: @Disabled would sneak past. Gating on `SUITES == EXPECTED_SUITES` closes
-#: that hole structurally.
+#: What the plugin locks against tampering, when it has no carve to narrow to:
+#: every file under the graded module's `src/test/` (49 .java files plus any
+#: resources / metadata). The whole test tree IS the grader; a solver who edited
+#: one to make the suite trivially pass would trip the per-file sha256 check
+#: inline in `render_test_sh` and score zero. Strictly stronger than the
+#: reference asset's aggregate-hash file at /opt/harbor-tooling/test-tree.sha256.
 #:
-#: This is the one repo-magic number the plugin source declares as a literal.
-#: 823 threads through `graded.expected` because measure.py can pin it in
-#: `graded.lock.json`; the plan's measure schema (`{"tests_total":N,"graded":[]}`)
-#: does not carry a second scalar, so pinning the suite count would need a new
-#: primitive. It is safe as a ClassVar because it is a property of the pinned
-#: test tree, not of the host: the fingerprint gate refuses to grade if any
-#: pinned file changed, so `EXPECTED_SUITES` cannot drift under it.
-EXPECTED_SUITES = 69
+#: `grader_fingerprint_globs_for` narrows this to the CARVED module, because a
+#: monorepo's other modules have test trees no graded task can reach and locking
+#: those pins files the verifier never runs.
+GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('*/src/test/**', 'src/test/**')
 
 _LOGS_DEFAULT = '${VERIFIER_DIR:-' + B.LOGS_DIR + '}'
 _MEASURE_LOGS_DEFAULT = '${MEASURE_DIR:-' + B.LOGS_DIR + '}'
@@ -244,10 +298,51 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'package_manager must be gradle: the gap writes gradle.properties and pins '
     'the compile JVM through it',
     'test_invocation["command"] must be a non-empty list of argv tokens: the '
-    'command that runs the whole graded suite, e.g. ["gradle", "test"]',
+    'command that runs the whole graded suite, and it must NAME '
+    'harness["test_task"], e.g. ["gradle", "--offline", "--no-daemon", '
+    '"--console=plain", ":my-module:test", "--rerun"]. A command that runs a '
+    'different task than the one the results directory belongs to grades one '
+    'module and measures another',
     'toolchain_version must be the mise JDK identifier, '
     'distribution-then-version, e.g. "temurin-25.0.4+7.0.LTS": the gap selects '
     'it by that exact string and derives the runtime pin from its major',
+    'SCOPE, and it overrides the general "enumerate every corpus" rule for '
+    'java: this task grades exactly ONE gradle module -- the one whose main '
+    'sources are removed -- and NOT the whole build. A multi-module repository '
+    'is the NORMAL case and is never a reason to REFUSE: do not refuse because '
+    'a root `test` task fans out, because several modules own separate '
+    '`:module:test` tasks, or because each writes its own test-results '
+    'directory. Name the single module under test. If you cannot tell which '
+    'one it is, name your best candidate and answer anyway -- the harness knows '
+    'which module was carved, checks your answer against it before anything is '
+    'built, and names the right module in a repair message you can act on. An '
+    'unnecessary REFUSE produces no task at all, which is strictly worse than '
+    'one repairable guess',
+    'harness is REQUIRED for java and describes THIS repository\'s own test '
+    'harness; it is what the graded verifier script and the dependency-warming '
+    'stage are rendered from. State it from the build manifests and the TEST '
+    'FILE PATHS you were given, and from nothing else. '
+    'harness["test_task"] is the ABSOLUTE gradle task path of the graded test '
+    'task for that ONE module, leading colon included, e.g. ":my-module:test" '
+    '(":test" for a single-project build). It must be a concrete module task, '
+    'never an aggregate lifecycle task. The verifier derives the '
+    '`:dependencies` task it proves the offline cache against from the same '
+    'project path',
+    'harness["results_dir"] is the repo-relative directory gradle writes the '
+    'JUnit `TEST-*.xml` reports into for that ONE task -- the gradle default '
+    'is "<module>/build/test-results/test". One directory, matching the one '
+    'module test_task names; the other modules keep their own and are not '
+    'graded by this task',
+    'harness["stale_paths"] lists the build-output directories the oracle wipes '
+    'after it restores, e.g. ["my-module/build", "my-module/.gradle", '
+    '".gradle"]. Gradle reports a cached PASS from a previous run with zero '
+    'recompiled code, so name EVERY directory the graded task writes into; '
+    'this list may not be empty',
+    'harness["buildsrc_path"] is the gradle project path of a convention build '
+    'that must be assembled before dependencies resolve, e.g. ":buildSrc". '
+    'Answer "" when the repository has no buildSrc directory -- a repo without '
+    'one must not be asserted to have one. harness["project_label"] is the '
+    'project\'s own name and is prose only; it may be ""',
 )
 
 #: The one package manager java's gap has prose (and a properties file) for.
@@ -288,6 +383,307 @@ def _test_tokens(
         'plan that does not state what it was resolved to RUN cannot be checked '
         'against the image it produced'
     )
+
+
+def _slot_error(key: str, want: str) -> B.LangError:
+    return B.LangError(
+        f'the java harness needs harness[{key!r}]: {want}. Without it the '
+        'rendered verifier would either grade nothing or grade a suite nobody '
+        'described, and a denominator nobody described is not a floor'
+    )
+
+
+def _tuple_slot(values: Mapping[str, HarnessValue], key: str,
+                want: str, *, required: bool = False) -> tuple[str, ...]:
+    raw = values.get(key)
+    if raw is None:
+        if required:
+            raise _slot_error(key, want)
+        return ()
+    if isinstance(raw, (bool, int)):
+        raise _slot_error(key, f'{want} (a list of strings, not a scalar)')
+    tokens = (raw,) if isinstance(raw, str) else tuple(raw)
+    if required and not tokens:
+        raise _slot_error(key, want)
+    return tokens
+
+
+def _str_slot(values: Mapping[str, HarnessValue], key: str,
+              want: str, *, required: bool = False) -> str:
+    raw = values.get(key)
+    if raw is None or raw == '':
+        if required:
+            raise _slot_error(key, want)
+        return ''
+    if not isinstance(raw, str):
+        raise _slot_error(key, f'{want} (a single string)')
+    return raw
+
+
+def _int_slot(values: Mapping[str, HarnessValue], key: str, want: str) -> int:
+    raw = values.get(key)
+    if isinstance(raw, bool) or raw is None:
+        raise _slot_error(key, want)
+    if isinstance(raw, int):
+        parsed = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        parsed = int(raw)
+    else:
+        raise _slot_error(key, f'{want} (a whole number)')
+    if parsed < 1:
+        raise _slot_error(key, f'{want} (at least 1; zero would grade nothing)')
+    return parsed
+
+
+def _require_relative(path: str, key: str) -> str:
+    """A repo-relative path, or a refusal. `..` escapes the tree it describes."""
+    if path.startswith('/') or path.split('/')[0] == '..' or '/../' in path:
+        raise _slot_error(
+            key,
+            f'a repo-relative path, but {path!r} is absolute or climbs out of '
+            'the checkout; the verifier resolves it against ${REPO} and a path '
+            'that escapes there names something no carve controls',
+        )
+    return path
+
+
+@dataclass(frozen=True)
+class Harness:
+    """A java test harness as data: run it, find its reports, size its suite.
+
+    Everything the two rendered scripts and the warm stage used to hardcode
+    about the java-tamboui REPO, read off `DepPlan.harness`. `read_harness` is
+    the only constructor, so a slot that is missing, mistyped or inconsistent
+    with its siblings becomes a `LangError` before any container exists rather
+    than a shell script that counts an empty directory and reports a floor of
+    zero.
+    """
+
+    test_task: str
+    results_dir: str
+    stale_paths: tuple[str, ...]
+    buildsrc_path: str
+    project_label: str
+
+    @property
+    def project_path(self) -> str:
+        """`:tamboui-widgets` -- the gradle project the graded task belongs to.
+
+        `''` for a single-project build, whose task path is `:test`; that is
+        also what makes `dependencies_task` come out as `:dependencies` there.
+        """
+        return self.test_task.rsplit(':', 1)[0]
+
+    @property
+    def dependencies_task(self) -> str:
+        return f'{self.project_path}:dependencies'
+
+    @property
+    def buildsrc_task(self) -> str:
+        return f'{self.buildsrc_path}:assemble'
+
+    @property
+    def buildsrc_dir(self) -> str:
+        """`:buildSrc` as the directory the carve assert stats: `buildSrc`."""
+        return self.buildsrc_path.strip(':').replace(':', '/')
+
+
+def read_harness(plan: DepPlan) -> Harness:
+    """`plan.harness` as the record the renderers read, or a `LangError`.
+
+    Every check here is reachable from the refine loop, so every message names
+    the slot and says what a correct value looks like: a resolver that gets one
+    wrong must be able to repair it without being shown the repository.
+    """
+    values = {key: value for key, value in canonicalize(plan).harness}
+    harness = Harness(
+        test_task=_str_slot(
+            values, 'test_task',
+            'the absolute gradle task path of the graded test task, leading '
+            'colon included, e.g. ":my-module:test"',
+            required=True,
+        ),
+        results_dir=_require_relative(
+            _str_slot(
+                values, 'results_dir',
+                'the repo-relative directory gradle writes the JUnit '
+                '`TEST-*.xml` reports into for the graded task',
+                required=True,
+            ),
+            'results_dir',
+        ),
+        stale_paths=_tuple_slot(
+            values, 'stale_paths',
+            'the build-output directories the oracle wipes after it restores, '
+            'so no cached gradle output can report a pass with zero recompiled '
+            'code',
+            required=True,
+        ),
+        buildsrc_path=_str_slot(
+            values, 'buildsrc_path',
+            'the gradle project path of a convention build that must be '
+            'assembled before dependencies resolve, or "" for a repo with no '
+            'buildSrc',
+        ),
+        project_label=_str_slot(
+            values, 'project_label', "the project's own name",
+        ),
+    )
+    for key, path in (('test_task', harness.test_task),
+                      ('buildsrc_path', harness.buildsrc_path)):
+        if path and not path.startswith(':'):
+            raise _slot_error(
+                key,
+                f'an ABSOLUTE gradle project path starting with ":", but '
+                f'{path!r} does not. A relative task path resolves against '
+                "gradle's current project, which is not a property this "
+                'renderer can see or pin',
+            )
+    if not harness.test_task.rpartition(':')[2]:
+        raise _slot_error(
+            'test_task',
+            f'a task path whose last segment NAMES a task, but {harness.test_task!r} '
+            'ends at a project path. e.g. ":my-module:test"',
+        )
+    for path in harness.stale_paths:
+        _require_relative(path, 'stale_paths')
+    return harness
+
+
+#: How a java source root separates the module from the package namespace.
+#: `src/<sourceSet>/java` is the maven-and-gradle layout every JVM build tool
+#: reimplements, so the segment AFTER `java` is the package root and the segment
+#: BEFORE `src` is the module -- the only two facts the carve has to yield.
+_JAVA_SOURCE_MARKER = 'java'
+_SRC_SEGMENT = 'src'
+
+#: Gradle's `test` task compiles the `test` source set, whose conventional root
+#: this is. It is what the grader calls the oracle tree, and what
+#: `emit._java_grader_metadata` counts JUnit classes under.
+TEST_SOURCE_ROOT = 'src/test'
+
+
+def module_dir_of_carve(carved_relpaths) -> str:
+    """The repo-relative directory of the module the carve removed code from.
+
+    `tamboui-widgets/src/main/java/dev/tamboui/widgets/X.java` -> `tamboui-widgets`;
+    `src/main/java/...` -> `''`, the root project. Derived from the CARVE rather
+    than from the plan because which module is graded is decided by the operator
+    who chose the include globs, not by whoever resolved the environment -- and
+    a plan that grades a module nobody carved is the mis-scope this feeds the
+    cross-check to catch.
+    """
+    modules = set()
+    for rel in carved_relpaths:
+        parts = str(rel).split('/')
+        if _SRC_SEGMENT not in parts:
+            raise B.LangError(
+                f'the java carve holds {rel!r}, which sits under no `src/` '
+                'source root, so the module it belongs to cannot be '
+                'determined. The graded gradle task, the report directory and '
+                'the fingerprint are all scoped to one module; refusing rather '
+                'than guessing which'
+            )
+        modules.add('/'.join(parts[:parts.index(_SRC_SEGMENT)]))
+    if len(modules) != 1:
+        raise B.LangError(
+            f'the java carve spans {len(modules)} modules '
+            f'({", ".join(sorted(repr(m) for m in modules))}), but the graded '
+            'surface is ONE gradle task with ONE report directory. Carving '
+            'across modules would leave every module but the graded one '
+            'stubbed and ungraded, so it is refused rather than partly measured'
+        )
+    return modules.pop()
+
+
+def package_roots_of_carve(carved_relpaths) -> tuple[str, ...]:
+    """The package namespace(s) the carve removed, relative to the source root.
+
+    THE LEAK SCAN'S SUBJECT. Compiled java carries its package as a UTF8
+    constant in every `.class` and as a path in every jar entry, so the warm
+    stage's fossil scan looks for exactly this string. It is derived from the
+    carved paths and never from a plan: a namespace a model supplied would be a
+    scan whose subject was guessed, and on a repo whose guess was wrong the scan
+    passes vacuously while the cache holds the answer.
+
+    Returns the COMMON prefix per source root rather than one entry per file,
+    because `dev/tamboui/widgets` subsumes `dev/tamboui/widgets/tabs` and a scan
+    for the parent finds every child. An empty prefix -- carved classes in the
+    default package, or sitting directly under the source root -- is REFUSED:
+    a `-path '**'` scan matches the whole cache and proves nothing.
+    """
+    roots: list[tuple[str, ...]] = []
+    for rel in carved_relpaths:
+        parts = str(rel).split('/')
+        if _JAVA_SOURCE_MARKER not in parts[:-1]:
+            raise B.LangError(
+                f'the java carve holds {rel!r}, which sits under no `java` '
+                'source root, so the package namespace it removed cannot be '
+                'read off its path. The warm stage asserts that namespace is '
+                "absent from the gradle cache, and a scan whose subject is "
+                'unknown is a scan that passes vacuously -- refusing instead'
+            )
+        index = len(parts) - 1 - parts[::-1].index(_JAVA_SOURCE_MARKER)
+        roots.append(tuple(parts[index + 1:-1]))
+    if not roots:
+        raise B.LangError(
+            'the java carve removed no files, so there is no package namespace '
+            'for the warm stage to prove absent from the gradle cache'
+        )
+    common = roots[0]
+    for parts in roots[1:]:
+        keep = 0
+        while keep < min(len(common), len(parts)) and common[keep] == parts[keep]:
+            keep += 1
+        common = common[:keep]
+    if not common:
+        raise B.LangError(
+            'the carved java sources share no package namespace (they sit in '
+            'the default package or span unrelated packages), so the warm '
+            "stage's fossil scan would have to look for the empty string -- "
+            'which matches the whole dependency cache and proves nothing. '
+            'Refusing rather than shipping a leak assert that cannot fail'
+        )
+    return ('/'.join(common),)
+
+
+_ENGLISH_TITLE: tuple[str, ...] = (
+    'Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight',
+)
+
+
+def _carved_nouns(package_roots: tuple[str, ...]) -> tuple[str, str]:
+    """`('widget', 'widgets')` -- how the warm stage's COMMENTS name the carve.
+
+    The leaf of the carved package namespace, which is the word a java project
+    already chose for the thing it removed. Reaches comments only: no rendered
+    INSTRUCTION is derived from it, so a naive de-pluralisation costs at worst a
+    slightly odd sentence and can never change what the image does.
+    """
+    plural = package_roots[0].rsplit('/', 1)[-1] if package_roots else 'carved'
+    singular = plural[:-1] if plural.endswith('s') and not plural.endswith('ss') else plural
+    return singular, plural
+
+
+def _quoted_roots(package_roots: tuple[str, ...]) -> str:
+    return ', '.join(f"'{root}'" for root in package_roots)
+
+
+def _dotted_roots(package_roots: tuple[str, ...]) -> str:
+    """The namespaces as java spells them in a class file's constant pool."""
+    return ', '.join(root.replace('/', '.') for root in package_roots)
+
+
+def _find_path_expr(package_roots: tuple[str, ...]) -> str:
+    """`find`'s primary for "names any carved namespace", parenthesised only if needed.
+
+    A single root renders as the bare `-path ... -print` a one-package carve has
+    always produced; several are OR-ed inside `\\( \\)`, because `find`'s implicit
+    AND binds tighter than `-o` and `-path A -o -path B -print` would print only
+    the B matches -- reporting a leak as clean.
+    """
+    tests = ' -o '.join(f"-path '*{root}*'" for root in package_roots)
+    return f'{tests} -print' if len(package_roots) == 1 else f'\\( {tests} \\) -print'
 
 
 def _jdk_parts(toolchain_version: str) -> tuple[str, str]:
@@ -335,7 +731,8 @@ def _java_measure_dep_plan() -> DepPlan:
         apt_packages=(),
         install_commands=(),
         build_flags=(('baked_jdks', BAKED_JDKS),),
-        test_invocation=(('command', tuple(TEST_COMMAND.split())),),
+        test_invocation=(('command', _TAMBOUI_TEST_ARGV),),
+        harness=JAVA_TAMBOUI_HARNESS,
         needs_git_metadata=False,
     )
     validate(plan)
@@ -345,6 +742,23 @@ def _java_measure_dep_plan() -> DepPlan:
 #: java's canonical, validated environment plan. Module-level so a test can
 #: assert the rendered gap against it without re-deriving the facts it states.
 JAVA_MEASURE_DEP_PLAN: DepPlan = _java_measure_dep_plan()
+
+
+def _test_command(plan: DepPlan) -> str:
+    """The graded command as the one prose line instruction.md shows.
+
+    Derived from the plan rather than spelled again: the argv is already the
+    authority the two scripts render from, and a second spelling of it is how
+    the instruction the model reads starts describing a command the grader does
+    not run.
+    """
+    return ' '.join(_test_tokens(plan.test_invocation, 'command'))
+
+
+#: The graded command as prose, for instruction.md and the graded set.
+#: java-tamboui's, because it is derived from java-tamboui's plan -- a resolved
+#: plan replaces it through `test_command_from_plan` before an entry is written.
+TEST_COMMAND = _test_command(JAVA_MEASURE_DEP_PLAN)
 
 
 class JavaPlugin(B.LangPlugin):
@@ -361,7 +775,9 @@ class JavaPlugin(B.LangPlugin):
 
     #: See `emit.plan_carve`: whole-suite plugins can declare intact-tree
     #: globs to fingerprint. Empty for rust; ('tests/**','Makefile') for c;
-    #: ('Tests/**',) for cpp; ('tamboui-widgets/src/test/**',) for java.
+    #: the three spellings of a test dir for cpp; the graded module's own
+    #: `src/test/**` for java, narrowed to the carve by
+    #: `grader_fingerprint_globs_for`.
     grader_fingerprint_globs: ClassVar[tuple[str, ...]] = GRADER_FINGERPRINT_GLOBS
 
     #: The same facts `toolchain_spec().install_block` asserts at build time,
@@ -376,10 +792,97 @@ class JavaPlugin(B.LangPlugin):
     required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
-    widgets_module: ClassVar[str] = WIDGETS_MODULE
-    expected_suites: ClassVar[int] = EXPECTED_SUITES
     java_home: ClassVar[str] = JAVA_HOME
     gradle_user_home: ClassVar[str] = GRADLE_USER_HOME
+
+    def _harness(self, dep_plan: DepPlan | None) -> tuple[DepPlan, Harness]:
+        """The plan the harness comes from, and the harness itself.
+
+        `dep_plan=None` is the pre-resolution path (`--no-resolve-env`, and
+        every caller written before the harness was plan-driven). It falls back
+        to java-tamboui's own canonical plan, which is exactly the environment
+        those callers were hardcoded against -- so the fallback is not a guess,
+        it is the same bytes under a name.
+        """
+        plan = canonicalize(JAVA_MEASURE_DEP_PLAN if dep_plan is None else dep_plan)
+        return plan, read_harness(plan)
+
+    @staticmethod
+    def _carve(env: EnvSpec | None) -> CarveFacts:
+        """What the host carved, or java-tamboui's own carve for a caller with none.
+
+        A caller holding a `root` but no `package_roots` is REFUSED rather than
+        silently given the fallback: that shape means a carve WAS derived and
+        its namespace could not be, and quietly substituting another
+        repository's namespace is precisely the vacuous fossil scan this whole
+        derivation exists to make impossible.
+        """
+        carve = env.carve if env is not None else CarveFacts()
+        if not carve.root and not carve.package_roots:
+            return JAVA_TAMBOUI_CARVE
+        if not carve.package_roots:
+            raise B.LangError(
+                f'the carve at {carve.root!r} yielded no java package root, so '
+                "the warm stage's fossil scan has no namespace to prove absent "
+                'from the gradle cache. A scan whose subject is unknown passes '
+                'vacuously on every repository; refusing to render one'
+            )
+        return carve
+
+    @staticmethod
+    def _assert_scope_agrees(harness: Harness, graded_module: str) -> None:
+        """THE MIS-SCOPE GUARD: the plan grades the module the carve stubbed.
+
+        The other half of what replaced `EXPECTED_SUITES` (the first half being
+        the host-side suite count `render_test_sh` bakes in). `graded_module`
+        comes from the CARVE, so a plan naming a DIFFERENT module -- one whose
+        sources are all still present -- is refused before anything is built.
+        That is the worst failure this language can have: such a task grades a
+        module the carve never touched, so the stub scores a perfect suite and
+        RED and GREEN are indistinguishable.
+
+        Both messages name the module the carve actually stubbed, so a resolver
+        that guessed wrong repairs in one attempt instead of REFUSING -- which
+        matters, because the resolver is shown test PATHS only and several
+        modules' paths look alike.
+        """
+        scope = f'{graded_module}/' if graded_module else ''
+        if not harness.results_dir.startswith(scope):
+            raise B.LangError(
+                f'harness["results_dir"] is {harness.results_dir!r}, which is '
+                f'not inside the module the carve stubbed ({graded_module!r}). '
+                'The verifier would count reports produced by a module whose '
+                'sources are all still present, score a perfect suite against '
+                'them, and never run the graded code at all'
+            )
+        if graded_module and f':{graded_module}:' not in harness.test_task:
+            raise B.LangError(
+                f'harness["test_task"] is {harness.test_task!r}, which does not '
+                f'name the module the carve stubbed ({graded_module!r}). The '
+                'graded task and the carve must describe one module, or the '
+                'task under test is not the code that was removed'
+            )
+
+    def assert_repo_agrees(self, plan: DepPlan, *, graded_module: str) -> None:
+        """`validate_dep_plan` plus what only the CARVE can answer."""
+        self._assert_scope_agrees(read_harness(plan), str(graded_module))
+
+    def test_command_from_plan(self, dep_plan: DepPlan | None) -> str:
+        """What the rendered scripts ACTUALLY run, for instruction.md to quote."""
+        plan, _harness = self._harness(dep_plan)
+        return _test_command(plan)
+
+    def grader_fingerprint_globs_for(self, carved_relpaths) -> tuple[str, ...]:
+        """The carved module's own test tree, and no other module's.
+
+        `('*/src/test/**', 'src/test/**')` matches every module in a monorepo,
+        and locking java-tamboui's other four modules would pin ~200 files the
+        graded task never reads -- while moving the shipped test.sh for a repo
+        whose layout did not change. Narrowing to the module the carve stubbed
+        is both the correct scope and the stable one.
+        """
+        module = module_dir_of_carve(carved_relpaths)
+        return (f'{module}/src/test/**' if module else 'src/test/**',)
 
     # --- axis 1 -----------------------------------------------------------
 
@@ -404,21 +907,32 @@ class JavaPlugin(B.LangPlugin):
     # --- axis 2 -----------------------------------------------------------
 
     def dep_warm_spec(self) -> DepWarmSpec:
-        """Resolve-only warm stage: no widget bytecode possible, gradle-home clean.
+        """The warm stage for a caller holding neither a plan nor a carve."""
+        return self.dep_warm_spec_for(None, None)
+
+    def dep_warm_spec_for(
+        self, env: EnvSpec | None, dep_plan: DepPlan | None,
+    ) -> DepWarmSpec:
+        """Resolve-only warm stage: no carved bytecode possible, gradle-home clean.
 
         `files_needed=()` because the framework's single-line COPY concat
         mangles directory layout for the ~30 build files gradle needs across
-        modules and buildSrc. The stage_block below COPYs the whole carved
-        repoctx instead -- which by construction has NO widget src/main/java
-        files -- and drives Gradle through a resolve-only pass that never
-        produces widget bytecode. The scrub + widget-absence assert at the
-        end is the load-bearing leak proof.
+        modules and a convention build. The stage_block below COPYs the whole
+        carved repoctx instead -- which by construction has NO sources under the
+        carved source root -- and drives Gradle through a resolve-only pass that
+        never produces bytecode for the carved package. The scrub + namespace-
+        absence assert at the end is the load-bearing leak proof, and its
+        subject comes from the CARVE (`env.carve`), never from the plan.
 
         `copy_paths=(('/opt/gradle-home', '/opt/gradle-home'),)` makes the
         framework emit `COPY --from=warm /opt/gradle-home /opt/gradle-home`
         into the graded stage (invariant 7: COPY --from=warm only, never
         FROM warm).
         """
+        _plan, harness = self._harness(dep_plan)
+        carve = self._carve(env)
+        noun, plural = _carved_nouns(carve.package_roots)
+        buildsrc = harness.buildsrc_dir
         workdir = B.WORKDIR
         # Kotlin init script defined inline. `<<'INIT_EOF'` disables shell
         # expansion so ${project.path} et al survive verbatim into the file.
@@ -443,26 +957,68 @@ class JavaPlugin(B.LangPlugin):
         ]
         init_body = '\n'.join(init_script_lines)
 
+        carve_assert = [
+            f'    test "$(find {workdir}/{carve.root} '
+            "-name '*.java' 2>/dev/null | wc -l)\" -eq 0",
+        ]
+        if buildsrc:
+            carve_assert = [
+                carve_assert[0] + '; \\',
+                f'    test "$(find {workdir}/{buildsrc}/src/main '
+                "-type f 2>/dev/null | wc -l)\" -gt 0",
+            ]
+            carve_note = [
+                f'# Assert the carve landed as expected: no {noun} main sources, {buildsrc}',
+                f'# convention plugins present, {plural} test tree intact '
+                f'({carve.grader_source_count} files, per',
+                '# the fingerprint the graded stage will lock).',
+            ]
+        else:
+            carve_note = [
+                f'# Assert the carve landed as expected: no {noun} main sources, and the',
+                f'# {plural} test tree intact ({carve.grader_source_count} files, per the',
+                '# fingerprint the graded stage will lock).',
+            ]
+
+        buildsrc_pass = [
+            f"#   1) {harness.buildsrc_task} compiles {buildsrc}'s Kotlin convention",
+            "#      plugins into $GRADLE_USER_HOME's instrumented-jar cache. NOT",
+            f"#      {harness.buildsrc_path}:build (which triggers "
+            f"{harness.buildsrc_path}:compileTestJava,",
+            "#      whose testCompileClasspath resolves junit-jupiter WITHOUT a",
+            f"#      version -- {harness.project_label}'s {buildsrc} references "
+            'it as a plain',
+            "#      dependency instead of via a BOM, and gradle fails the whole",
+            "#      task rather than skip the version-less coord).",
+        ] if buildsrc else []
+        first = len(buildsrc_pass) and 1
+        warm_passes = [
+            *buildsrc_pass,
+            f"#   {first + 1}) harborResolveAll .resolve()s every configuration in every",
+            "#      subproject (compileClasspath, testCompileClasspath,",
+            "#      testRuntimeClasspath, annotationProcessor, ...) so no config",
+            "#      the graded run touches is unresolved.",
+            f"#   {first + 2}) --stop kills the daemon before scrub so no daemon-owned lock",
+            "#      files under $GRADLE_USER_HOME/daemon would survive.",
+        ]
+
         stage_block = '\n'.join([
-            '# The carved repoctx into the warm stage. tamboui-widgets/src/main/java',
-            '# is empty by construction (85 files carved), so no widget code can be',
+            f'# The carved repoctx into the warm stage. {carve.root}',
+            f'# is empty by construction ({carve.file_count} files carved), '
+            f'so no {noun} code can be',
             '# compiled here. Every other module is intact -- resolve-only needs the',
             '# whole project tree to CONFIGURE the build graph.',
             f'COPY --from={B.REPO_CONTEXT} repo/ {workdir}/',
             '',
-            '# Assert the carve landed as expected: no widget main sources, buildSrc',
-            '# convention plugins present, widgets test tree intact (49 files, per',
-            '# the fingerprint the graded stage will lock).',
+            *carve_note,
             'RUN set -eux; \\',
-            f'    test "$(find {workdir}/{WIDGETS_MODULE}/src/main/java '
-            "-name '*.java' 2>/dev/null | wc -l)\" -eq 0; \\",
-            f'    test "$(find {workdir}/buildSrc/src/main '
-            "-type f 2>/dev/null | wc -l)\" -gt 0",
+            *carve_assert,
             '',
             '# Resolve-only init script. `harborResolveAll` iterates every project',
-            '# (including buildSrc) and calls .resolve() on every resolvable',
+            (f'# (including {buildsrc}) and calls .resolve() on every resolvable'
+             if buildsrc else '# and calls .resolve() on every resolvable'),
             '# configuration -- downloads every jar the later --offline run will',
-            "# ask for, without compiling anything derived from widget sources.",
+            f"# ask for, without compiling anything derived from {noun} sources.",
             "# `<<'HARBOR_INIT_EOF'` disables shell expansion so Kotlin's ${...}",
             '# survives into the file verbatim.',
             f'RUN cat > /tmp/harbor-resolve.init.gradle.kts '
@@ -470,31 +1026,21 @@ class JavaPlugin(B.LangPlugin):
             init_body,
             'HARBOR_INIT_EOF',
             '',
-            '# Warm the cache. Three passes matching the Oracle design:',
-            "#   1) :buildSrc:assemble compiles buildSrc's Kotlin convention",
-            "#      plugins into $GRADLE_USER_HOME's instrumented-jar cache. NOT",
-            "#      :buildSrc:build (which triggers :buildSrc:compileTestJava,",
-            "#      whose testCompileClasspath resolves junit-jupiter WITHOUT a",
-            "#      version -- java-tamboui's buildSrc references it as a plain",
-            "#      dependency instead of via a BOM, and gradle fails the whole",
-            "#      task rather than skip the version-less coord).",
-            "#   2) harborResolveAll .resolve()s every configuration in every",
-            "#      subproject (compileClasspath, testCompileClasspath,",
-            "#      testRuntimeClasspath, annotationProcessor, ...) so no config",
-            "#      the graded run touches is unresolved.",
-            "#   3) --stop kills the daemon before scrub so no daemon-owned lock",
-            "#      files under $GRADLE_USER_HOME/daemon would survive.",
+            f'# Warm the cache. {_ENGLISH_TITLE[first + 2]} passes '
+            'matching the Oracle design:',
+            *warm_passes,
             'RUN set -eux; \\',
             f'    cd {workdir}; \\',
             '    gradle --version; \\',
-            '    gradle --no-daemon --console=plain :buildSrc:assemble; \\',
+            *([f'    gradle --no-daemon --console=plain {harness.buildsrc_task}; \\']
+              if buildsrc else []),
             '    gradle --no-daemon --console=plain '
             '-I /tmp/harbor-resolve.init.gradle.kts harborResolveAll; \\',
             '    gradle --no-daemon --stop || true; \\',
             '    rm -f /tmp/harbor-resolve.init.gradle.kts',
             '',
             '# Scrub the cache. build-cache-1 holds task OUTPUTS keyed by input',
-            '# hash -- for :tamboui-widgets:compileJava that would be the answer',
+            f'# hash -- for {harness.project_path}:compileJava that would be the answer',
             "# outright. Dropped wholesale; the graded run's inputs (carved) are",
             '# gone anyway. daemon/workers/notifications/kotlin-profile are scratch.',
             'RUN set -eux; \\',
@@ -505,23 +1051,23 @@ class JavaPlugin(B.LangPlugin):
             f'           {GRADLE_USER_HOME}/kotlin-profile',
             '',
             '# The load-bearing leak assert. Nothing anywhere under gradle-home',
-            "# may name 'dev/tamboui/widgets': bytecode holds FQNs as UTF8",
+            f"# may name {_quoted_roots(carve.package_roots)}: bytecode holds FQNs as UTF8",
             '# constants, jars hold entry names in the central directory, and',
             '# either would be a decompile-back-to-source leak of the worst kind.',
             '# The resolve-only path above should never produce such artifacts',
-            '# (no widget sources to compile), but this assert stops a future',
+            f'# (no {noun} sources to compile), but this assert stops a future',
             '# stage-graph change from silently smuggling them through.',
             'RUN set -eu; \\',
             f'    hits=$(find {GRADLE_USER_HOME} '
-            "-path '*dev/tamboui/widgets*' -print 2>/dev/null || true); \\",
+            f'{_find_path_expr(carve.package_roots)} 2>/dev/null || true); \\',
             '    if [ -n "$hits" ]; then \\',
-            f'        echo "LEAK: {GRADLE_USER_HOME} holds dev.tamboui.widgets '
-            'artifacts:" >&2; \\',
+            f'        echo "LEAK: {GRADLE_USER_HOME} holds '
+            f'{_dotted_roots(carve.package_roots)} artifacts:" >&2; \\',
             '        echo "$hits" >&2; \\',
             '        exit 1; \\',
             '    fi; \\',
-            f'    echo "ASSERT: {GRADLE_USER_HOME} carries no dev.tamboui.widgets '
-            'symbols or paths"',
+            f'    echo "ASSERT: {GRADLE_USER_HOME} carries no '
+            f'{_dotted_roots(carve.package_roots)} symbols or paths"',
         ]) + '\n'
 
         return DepWarmSpec(
@@ -533,6 +1079,12 @@ class JavaPlugin(B.LangPlugin):
     # --- axes 3-6 ---------------------------------------------------------
 
     def pre_leakgate_blocks(self, env: EnvSpec) -> tuple[str, ...]:
+        """The plan-free proof, for a caller with no resolved environment."""
+        return self.pre_leakgate_blocks_for(env, None)
+
+    def pre_leakgate_blocks_for(
+        self, env: EnvSpec, dep_plan: DepPlan | None,
+    ) -> tuple[str, ...]:
         """The offline-sufficiency proof + project-cache scrub. Mandatory.
 
         Runs AFTER the carved-tree COPY and the warm-cache COPY but BEFORE the
@@ -547,10 +1099,11 @@ class JavaPlugin(B.LangPlugin):
         from-scratch offline -- a stale-cached-artifact PASS after the
         oracle restore would otherwise be a subtle false green.
         """
+        _plan, harness = self._harness(dep_plan)
         workdir = env.workdir
         proof = '\n'.join([
             '# Offline-sufficiency proof: prove the warm cache covers every',
-            '# configuration the graded :tamboui-widgets:test task needs, at',
+            f'# configuration the graded {harness.test_task} task needs, at',
             '# BUILD time (network refused via --offline), so a genuine cache',
             '# gap fails the image build rather than surfacing later as a',
             '# black-box compile error inside the graded container.',
@@ -560,7 +1113,7 @@ class JavaPlugin(B.LangPlugin):
             'compileClasspath annotationProcessor testAnnotationProcessor; do \\',
             '        echo "=== --offline :dependencies --configuration $cfg ==="; \\',
             '        gradle --offline --no-daemon --console=plain '
-            f':{WIDGETS_MODULE}:dependencies --configuration "$cfg" \\',
+            f'{harness.dependencies_task} --configuration "$cfg" \\',
             '            > "/tmp/deps-${cfg}.log" 2>&1 \\',
             '            || { tail -60 "/tmp/deps-${cfg}.log" >&2; \\',
             '                 echo "OFFLINE PROOF FAILED for ${cfg}" >&2; \\',
@@ -599,11 +1152,26 @@ class JavaPlugin(B.LangPlugin):
         *,
         expected: int | None = None,
         fingerprint: Mapping[str, str] | None = None,
+        test_suites: int | None = None,
+        graded_module: str | None = None,
+        dep_plan: DepPlan | None = None,
     ) -> str:
         expected = graded.expected if expected is None else int(expected)
         fingerprint = graded.fingerprint_sha256 if fingerprint is None else fingerprint
-        test_cmd = graded.test_command or TEST_COMMAND
-        results_dir = f'{WIDGETS_MODULE}/build/test-results/test'
+        if test_suites is None or graded_module is None:
+            raise B.LangError(
+                'java plugin needs test_suites and graded_module threaded from '
+                'the intact tree at generate time; emit._render_test_sh '
+                'supplies them (no repo constants in the plugin source)'
+            )
+        plan, harness = self._harness(dep_plan)
+        self._assert_scope_agrees(harness, str(graded_module))
+        test_cmd = _test_command(plan)
+        results_dir = harness.results_dir
+        grader_tree = (
+            f'{graded_module}/{TEST_SOURCE_ROOT}' if graded_module
+            else TEST_SOURCE_ROOT
+        )
 
         # Python heredoc for the JUnit XML tally. `<<'PY_EOF'` disables shell
         # expansion so nothing in the parser needs escaping.
@@ -627,7 +1195,7 @@ class JavaPlugin(B.LangPlugin):
         return '\n'.join([
             '#!/usr/bin/env bash',
             f'# Harbor verifier -- java (equality floor, {expected} JUnit tests '
-            f'across {EXPECTED_SUITES} suites).',
+            f'across {test_suites} suites).',
             '#',
             '# EQUALITY floor. Each JUnit test is a separate method invocation,',
             '# a per-test failure does not abort the JVM, and a compile failure',
@@ -656,10 +1224,10 @@ class JavaPlugin(B.LangPlugin):
             '',
             'cd "${REPO}" || fail "no ${REPO}"',
             '',
-            f'EXPECTED_SUITES={EXPECTED_SUITES}',
+            f'EXPECTED_SUITES={test_suites}',
             '',
             '# --- integrity guards -----------------------------------------------',
-            '# tamboui-widgets/src/test IS the grader. The per-file lock below',
+            f'# {grader_tree} IS the grader. The per-file lock below',
             '# was captured host-side from the intact tree at generate time and',
             '# refuses to grade if any pinned file changed. Strictly stronger',
             "# than the reference asset's aggregate-hash file at",
@@ -778,8 +1346,14 @@ class JavaPlugin(B.LangPlugin):
             '',
         ])
 
-    def measure_test_sh(self, *, graded: GradedSet | None = None, **kwargs) -> str:
-        """Phase 1: run the WHOLE :tamboui-widgets:test against the intact tree.
+    def measure_test_sh(
+        self,
+        *,
+        graded: GradedSet | None = None,
+        dep_plan: DepPlan | None = None,
+        **kwargs,
+    ) -> str:
+        """Phase 1: run the WHOLE graded gradle task against the intact tree.
 
         Floor-FREE by construction. `measure` writes tests_total = the summed
         `<testsuite tests=>` across every produced XML; a build that broke
@@ -791,7 +1365,8 @@ class JavaPlugin(B.LangPlugin):
         matches the shipped test.sh.
         """
         del graded, kwargs
-        results_dir = f'{WIDGETS_MODULE}/build/test-results/test'
+        plan, harness = self._harness(dep_plan)
+        results_dir = harness.results_dir
         xml_parser_lines = [
             "import glob, os, sys, xml.etree.ElementTree as ET",
             "results = sys.argv[1]",
@@ -826,7 +1401,7 @@ class JavaPlugin(B.LangPlugin):
             "# measure image's Dockerfile already ran the suite once at build",
             '# time (that is how the cache got warm), so without --rerun this',
             '# would hit the cache and report the same numbers without running.',
-            f'{TEST_COMMAND} > "${{MEASURE_LOG}}" 2>&1 || true',
+            f'{_test_command(plan)} > "${{MEASURE_LOG}}" 2>&1 || true',
             'tail -40 "${MEASURE_LOG}"',
             '',
             "TALLY=$(python3 - \"${RESULTS}\" <<'PY_EOF'",
@@ -848,17 +1423,21 @@ class JavaPlugin(B.LangPlugin):
     # --- axis 7 -----------------------------------------------------------
 
     def post_restore_block(self) -> str:
+        return self.post_restore_for(None)
+
+    def post_restore_for(self, dep_plan: DepPlan | None) -> str:
         """Invalidate stale gradle build output so GREEN rebuilds honestly.
 
         The `--rerun` in test.sh handles task-level caching, but leftover
         artifacts under `build/` from a previous partial run would let a
         JUnit XML from before the oracle restore linger on disk. The scrub
-        keeps the post-restore state predictable.
+        keeps the post-restore state predictable. WHICH directories is the
+        plan's answer, not this method's -- a module's own `build/` is that
+        repository's name for one, not gradle's.
         """
-        return (
-            'rm -rf "${REPO}/tamboui-widgets/build" '
-            '"${REPO}/tamboui-widgets/.gradle" '
-            '"${REPO}/.gradle"'
+        _plan, harness = self._harness(dep_plan)
+        return 'rm -rf ' + ' '.join(
+            f'"${{REPO}}/{path}"' for path in harness.stale_paths
         )
 
     # --- axis 8 + the image ----------------------------------------------
@@ -892,6 +1471,15 @@ class JavaPlugin(B.LangPlugin):
             _flag_str(plan.build_flags, key)
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
+        harness = read_harness(plan)
+        if harness.test_task not in _test_tokens(plan.test_invocation, 'command'):
+            raise B.LangError(
+                f'test_invocation["command"] does not name '
+                f'harness["test_task"] ({harness.test_task!r}): the command '
+                'the verifier runs and the task whose reports it counts must '
+                'be the same task, or the suite is measured in one module and '
+                'graded in another'
+            )
 
     def _gap_body(self, plan: DepPlan) -> str:
         """java's toolchain bytes, rendered from a plan instead of a literal.
@@ -991,8 +1579,8 @@ class JavaPlugin(B.LangPlugin):
         """The stripped Dockerfile for the never-ship measure image (phase 1).
 
         Same toolchain (JDK25 install byte-identical to the graded one for
-        BuildKit layer reuse) plus a build-time warm-and-run of
-        :tamboui-widgets:test against the INTACT tree. That single run does
+        BuildKit layer reuse) plus a build-time warm-and-run of the plan's
+        graded task against the INTACT tree. That single run does
         double duty: it downloads every dependency the graded --offline run
         will need (network is allowed at BUILD time), and it produces the
         JUnit XML the measure script can re-count later at container time
@@ -1009,6 +1597,7 @@ class JavaPlugin(B.LangPlugin):
         renders the bytes it always did.
         """
         base_image = self.toolchain_spec().base_image
+        _plan, harness = self._harness(dep_plan)
         gap = (
             '\n'.join([self.toolchain(), '', MEASURE_NO_WARM_COMMENT])
             if dep_plan is None
@@ -1043,7 +1632,7 @@ class JavaPlugin(B.LangPlugin):
             '# re-counts later at container time with --offline --rerun.',
             'RUN set -eux; \\',
             f'    cd {env.workdir}; \\',
-            f'    gradle --no-daemon --console=plain :{WIDGETS_MODULE}:test; \\',
+            f'    gradle --no-daemon --console=plain {harness.test_task}; \\',
             '    gradle --no-daemon --stop || true',
             '',
             '# --- measure script (COPYed, not carved-tree, so lives in a layer) ---',
