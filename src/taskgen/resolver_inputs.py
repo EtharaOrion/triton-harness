@@ -167,7 +167,15 @@ TEST_NAME_PATTERNS: Mapping[str, tuple[str, ...]] = {
     # describe a harness from. Also the leak-SAFER reading -- the test rule runs
     # before the manifest rule, so a name listed here can never be opened.
     'c': ('*_test.c', 'test.c', 'test_*.c', 'test_*.sh', 'tests.c'),
-    'cpp': ('*_test.cc', '*_test.cpp', 'test_*.cc', 'test_*.cpp'),
+    # `*Test(s).cpp`/`.cc` for cpp: the PascalCase suffix is as common in C++ as
+    # the snake_case prefix, and a repo spelling its files that way left the
+    # resolver an EMPTY test-path list -- nothing to describe a harness from.
+    # Leak-SAFER too: the test rule runs before the manifest rule, so a name
+    # listed here can never be opened for its content.
+    'cpp': (
+        '*Test.cc', '*Test.cpp', '*Tests.cc', '*Tests.cpp',
+        '*_test.cc', '*_test.cpp', 'test_*.cc', 'test_*.cpp',
+    ),
     'java': ('*Test.java', '*TestCase.java', '*Tests.java'),
     'csharp': ('*Test.cs', '*Tests.cs'),
 }

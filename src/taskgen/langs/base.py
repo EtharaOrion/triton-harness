@@ -508,13 +508,23 @@ class LangPlugin(abc.ABC):
         """Hook for languages that must invalidate something after a restore."""
         return ''
 
-    def render_solve_sh(self, carved_relpaths) -> str:
+    def post_restore_for(self, dep_plan: DepPlan | None) -> str:
+        """`post_restore_block` for a plugin whose wipe depends on the plan.
+
+        A second hook rather than an argument on the first: the directories a
+        restore invalidates are a fact about the REPO for a plan-driven plugin
+        and a constant for every other, and widening one signature would make
+        five plugins accept a plan they have no use for.
+        """
+        return self.post_restore_block()
+
+    def render_solve_sh(self, carved_relpaths, *, dep_plan: DepPlan | None = None) -> str:
         """The oracle, restoring from the RUN-TIME MOUNT -- never from a layer."""
         rels = tuple(sorted({Path(r).as_posix() for r in carved_relpaths}))
         if not rels:
             raise LangError('refusing to render an oracle that restores nothing')
         restores = '\n'.join(f"restore '{rel}'" for rel in rels)
-        post = self.post_restore_block()
+        post = self.post_restore_for(dep_plan)
         post_block = f'\n{post}\n' if post else ''
         return f"""#!/usr/bin/env bash
 # Oracle -- restores the carved files of a {self.name} task.

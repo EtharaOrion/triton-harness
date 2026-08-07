@@ -54,10 +54,11 @@ DEFAULT_TEST_GLOBS: dict[str, tuple[str, ...]] = {
     # tests/unit/. --include glob for the carve is 'src/runtime/**' and cannot
     # match here, but the guard is enforced anyway so no scope can opt out.
     'c': ('tests/**',),
-    # cpp-Rux: the graded oracle is Tests/Unit/*.cpp linked into rux-tests
-    # (capital T, per repo layout). --include for the carve is Compiler/**
-    # and cannot match here, but the guard is enforced anyway.
-    'cpp': ('Tests/**',),
+    # cpp: the graded oracle is the repo's test tree, under all three spellings
+    # C++ projects use for it -- cpp-Rux's capital `Tests/` is one repository's
+    # layout, not the language's, and a guard that only knew that spelling let
+    # a `--include` glob carve the tests of every other project.
+    'cpp': ('Tests/**', 'test/**', 'tests/**'),
     # java-tamboui: the graded oracle is tamboui-widgets/src/test/java (49
     # files). --include for the carve is tamboui-widgets/src/main/java/** and
     # cannot match here (main and test live in different source roots), but

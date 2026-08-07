@@ -47,6 +47,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -774,6 +775,103 @@ def _c_grader_metadata(plan: CarvePlan, dep_plan: DepPlan | None) -> dict:
     return {'corpus_counts': corpus_counts, 'vendored_counts': vendored_counts}
 
 
+#: CMake files that describe the repo's own registrations. A generated
+#: `CTestTestfile.cmake` is excluded by name: it is build OUTPUT, it restates
+#: every `add_test` a second time, and counting it would make the independent
+#: signal depend on whether this checkout had been built before.
+_CMAKE_NAMES: tuple[str, ...] = ('CMakeLists.txt',)
+_CMAKE_SUFFIX = '.cmake'
+_CMAKE_GENERATED: frozenset[str] = frozenset({'CTestTestfile.cmake'})
+_ADD_TEST = re.compile(r'^\s*add_test\s*\(', re.IGNORECASE)
+
+#: CMake blocks that run their body an unknown number of times. An `add_test`
+#: inside one registers once per call or per iteration, so counting the SOURCE
+#: line would under-count -- which is the exact failure this scan exists to
+#: catch, so it refuses to answer rather than answering low.
+_CMAKE_REPEATED = re.compile(r'^\s*(function|macro|foreach|while)\s*\(', re.IGNORECASE)
+_CMAKE_REPEATED_END = re.compile(
+    r'^\s*end(function|macro|foreach|while)\s*\(', re.IGNORECASE,
+)
+
+
+def _count_add_test(text: str, where: str) -> int:
+    """`add_test` registrations a cmake file states OUTRIGHT, or a refusal.
+
+    Static counting is only sound for calls at the top level of a file. One
+    inside a function, macro, foreach or while runs as many times as it is
+    invoked, and a scan that returned 1 for a helper called ten times would
+    hand back a number smaller than the truth -- the under-enumeration this
+    whole cross-check exists to make impossible.
+    """
+    depth = 0
+    found = 0
+    for line in text.splitlines():
+        if _CMAKE_REPEATED.match(line):
+            depth += 1
+        elif _CMAKE_REPEATED_END.match(line):
+            depth = max(depth - 1, 0)
+        elif _ADD_TEST.match(line):
+            if depth:
+                raise langs_base.LangError(
+                    f'{where} registers a ctest from inside a repeated cmake '
+                    'block (function, macro, foreach or while), so how many '
+                    'tests the build registers cannot be established by '
+                    'reading the file -- it depends on how often the block '
+                    'runs. Counting the source line would under-count, and an '
+                    'under-counted registry is a suite that is partly ungraded '
+                    'while every gate still passes. Refusing instead'
+                )
+            found += 1
+    return found
+
+
+def _cpp_grader_metadata(plan: CarvePlan) -> dict:
+    """How many tests the intact tree registers with ctest, counted HOST-SIDE.
+
+    The independent half of cpp's under-enumeration guard. The plan states how
+    much of the suite it describes; this counts what the repository actually
+    registers, without asking the resolver anything, and the plugin refuses when
+    the two disagree. A plan that silently described part of a suite would
+    otherwise pin a floor over that part and pass every later gate, because a
+    shrunken denominator is self-consistent at the wrong number.
+
+    Takes no plan on purpose: this is the INDEPENDENT signal, so letting the
+    resolved plan decide which directories it looks in would let a plan quietly
+    narrow the thing it is being checked against.
+    """
+    registered = 0
+    for path in sorted(plan.repo.rglob('*')):
+        rel = path.relative_to(plan.repo)
+        if not path.is_file() or '.git' in rel.parts[:-1]:
+            continue
+        if rel.name in _CMAKE_GENERATED:
+            continue
+        if rel.name in _CMAKE_NAMES or rel.name.endswith(_CMAKE_SUFFIX):
+            registered += _count_add_test(
+                path.read_text(encoding='utf-8', errors='replace'), rel.as_posix(),
+            )
+    return {'registered_tests': registered}
+
+
+def _candidate_validator(plugin, plan: CarvePlan):
+    """Plan admissibility PLUS the host-side cross-checks the intact tree affords.
+
+    Bound here rather than left to entry-writing time because the refine loop
+    can repair what it is told BEFORE a build: a mismatch discovered while the
+    scripts are being written aborts a whole generate, while the same mismatch
+    discovered here is one more resolver attempt with a precise message.
+    """
+    if plan.lang != 'cpp':
+        return plugin.validate_dep_plan
+    metadata = _cpp_grader_metadata(plan)
+
+    def validate(dep_plan: DepPlan) -> None:
+        plugin.validate_dep_plan(dep_plan)
+        plugin.assert_repo_agrees(dep_plan, **metadata)
+
+    return validate
+
+
 def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
                     dep_plan: DepPlan | None = None) -> str:
     if plan.lang == 'go':
@@ -787,14 +885,50 @@ def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
             carve_root=carve_root,
             **_c_grader_metadata(plan, dep_plan),
         )
+    if plan.lang == 'cpp':
+        return plugin.render_test_sh(
+            graded_spec,
+            dep_plan=dep_plan,
+            carve_root=carve_root,
+            **_cpp_grader_metadata(plan),
+        )
     return plugin.render_test_sh(graded_spec)
 
 
 def _measure_test_sh(plugin, plan: CarvePlan, dep_plan: DepPlan | None) -> str:
-    """Phase 1's script. Only c reads the plan; the others keep their signature."""
-    if plan.lang == 'c':
+    """Phase 1's script. Only c and cpp read the plan; the rest keep their signature."""
+    if plan.lang in ('c', 'cpp'):
         return plugin.measure_test_sh(graded=plan.graded, dep_plan=dep_plan)
     return plugin.measure_test_sh(graded=plan.graded)
+
+
+def _retitle_test_command(plan: CarvePlan, plugin, dep_plan: DepPlan | None) -> CarvePlan:
+    """Re-point `graded.test_command` at what the RESOLVED plan makes test.sh run.
+
+    The carve happens before the environment is resolved, so the graded set is
+    born holding the plugin's default command. For a plugin whose scripts are
+    rendered from the plan that default can be a different repository's command,
+    and instruction.md quotes it to the model being evaluated -- so a task would
+    tell the solver to run something its own verifier never runs.
+    """
+    import dataclasses
+
+    command = getattr(plugin, 'test_command_from_plan', None)
+    if command is None:
+        return plan
+    resolved = command(dep_plan)
+    if not resolved or resolved == plan.graded.test_command:
+        return plan
+    return dataclasses.replace(
+        plan, graded=dataclasses.replace(plan.graded, test_command=resolved),
+    )
+
+
+def _render_solve_sh(plugin, plan: CarvePlan, rels, dep_plan: DepPlan | None) -> str:
+    """The oracle. Only cpp's post-restore wipe is plan-driven; the rest are not."""
+    if plan.lang == 'cpp':
+        return plugin.render_solve_sh(rels, dep_plan=dep_plan)
+    return plugin.render_solve_sh(rels)
 
 
 def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
@@ -851,7 +985,8 @@ def _write_entry(inp: ContextInputs, context_type: str, out: Path, meta: dict,
            executable=True)
 
     _write(path / 'solution/solve.sh',
-           plugin.render_solve_sh(carve.carved_relpaths), executable=True)
+           _render_solve_sh(plugin, plan, carve.carved_relpaths, dep_plan),
+           executable=True)
     for rel, text in sorted(carve.originals.items()):
         _write(path / f'solution/carved/{rel}', text)
 
@@ -930,6 +1065,7 @@ def emit_all(repo, out, package_base: str = 'src/', file: str | None = None,
             plan, plugin, out, echo=echo,
             resolve_env=resolving, resolver=resolver,
         )
+        plan = _retitle_test_command(plan, plugin, dep_plan)
 
     inp = ContextInputs.build(
         repo=plan.repo, repo_name=plan.repo_name, target=plan.target,
@@ -1305,7 +1441,7 @@ def _measure_and_pin(plan: CarvePlan, plugin, out: Path, *, echo=print,
         refined = _resolve_env_plan(
             resolver, plan, base_image,
             build_and_measure=_run_measure,
-            validate_candidate=plugin.validate_dep_plan,
+            validate_candidate=_candidate_validator(plugin, plan),
             echo=echo, clock=clock,
         )
         lock = refined.lock

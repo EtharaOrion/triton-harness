@@ -66,6 +66,13 @@ def graded():
     )
 
 
+def render(plugin, graded, **kwargs):
+    """cpp-Rux's own render: the intact tree registers ONE ctest, carve is Compiler/."""
+    kwargs.setdefault('registered_tests', 1)
+    kwargs.setdefault('carve_root', 'Compiler')
+    return plugin.render_test_sh(graded, **kwargs)
+
+
 def test_plugin_declares_its_five_axes(plugin):
     assert plugin.name == 'cpp'
     assert plugin.toml_family == 'A'
@@ -97,8 +104,13 @@ def test_test_command_uses_parallel_4_and_not_unbounded_parallel(plugin):
 
 
 def test_harness_files_are_the_seven_named_reference_files(plugin):
-    """The 7 must match the reference test.sh's belt-and-braces existence check."""
-    assert plugin.harness_files == (
+    """The 7 must match the reference test.sh's belt-and-braces existence check.
+
+    They now live in cpp-Rux's own `DepPlan.harness` rather than in the plugin,
+    which is the point of the slice -- the assertion is unchanged, only where
+    the list is read from.
+    """
+    assert CPP.read_harness(CPP.CPP_MEASURE_DEP_PLAN).harness_files == (
         'Tests/Unit/CMakeLists.txt',
         'Tests/Unit/Main.cpp',
         'Tests/Unit/SemanticTests.cpp',
@@ -128,9 +140,15 @@ def test_whole_suite_selection_accepts_fingerprint_relpaths():
 
 
 def test_default_test_globs_covers_capital_tests_dir():
-    """cpp-Rux uses Tests/ (capital T); the guard must refuse to carve it."""
+    """cpp-Rux uses Tests/ (capital T); the guard must refuse to carve it.
+
+    The other two spellings are guarded too: `Tests/` is one repository's
+    layout, and a guard that knew only it let a --include glob carve the tests
+    of every C++ project that spells the directory `test/` or `tests/`.
+    """
     from taskgen.scope import DEFAULT_TEST_GLOBS
-    assert DEFAULT_TEST_GLOBS['cpp'] == ('Tests/**',)
+    assert 'Tests/**' in DEFAULT_TEST_GLOBS['cpp']
+    assert DEFAULT_TEST_GLOBS['cpp'] == ('Tests/**', 'test/**', 'tests/**')
 
 
 def test_stub_phrase_for_cpp_matches_delete_semantics():
@@ -202,39 +220,39 @@ def test_no_pre_leakgate_blocks(plugin):
 
 def test_render_test_sh_bakes_expected_from_graded(plugin, graded):
     """170 is threaded from graded.expected -- NOT a literal in the plugin source."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'EXPECTED=170' in script
 
 
 def test_render_test_sh_uses_parallel_4_not_unbounded(plugin, graded):
     """The OOM-safe build parallelism must appear in the rendered grader."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'cmake --build Build --config Release --parallel 4' in script
     assert 'cmake --build Build --config Release --parallel\n' not in script
 
 
 def test_render_test_sh_bakes_fingerprint_checks(plugin, graded):
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'check_sha256' in script
     assert "check_sha256 'Tests/Unit/CMakeLists.txt' '" + ('a' * 64) + "'" in script
     assert "check_sha256 'Tests/Unit/Main.cpp' '" + ('b' * 64) + "'" in script
 
 
 def test_render_test_sh_asserts_the_seven_harness_files_exist(plugin, graded):
-    script = plugin.render_test_sh(graded)
-    for rel in plugin.harness_files:
+    script = render(plugin, graded)
+    for rel in CPP.read_harness(CPP.CPP_MEASURE_DEP_PLAN).harness_files:
         assert rel in script
     assert 'graded harness file missing' in script
 
 
 def test_render_test_sh_removes_stale_build_and_bin_before_configure(plugin, graded):
     """A stale rux-tests binary would let ctest report green with 0 regenerated code."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'rm -rf Build Bin' in script
 
 
 def test_render_test_sh_runs_configure_build_ctest_and_doctest_directly(plugin, graded):
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'cmake -S . -B Build -G Ninja' in script
     assert '-DRUX_WERROR=ON' in script
     assert '-DRUX_BUILD_TESTS=ON' in script
@@ -244,20 +262,20 @@ def test_render_test_sh_runs_configure_build_ctest_and_doctest_directly(plugin, 
 
 def test_render_test_sh_gates_ctest_registered_exactly_one(plugin, graded):
     """Rux registers exactly ONE ctest (`UnitTests`); anything else is tampering."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert '"${CTEST_RAN}" -eq 1' in script
 
 
 def test_render_test_sh_gates_ctest_pct_at_100(plugin, graded):
     """The one registered ctest must be green -- 100% is the honest gate."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert '"${CTEST_PCT:-0}" -eq 100' in script
 
 
 def test_render_test_sh_gates_nassert_strictly_positive(plugin, graded):
     """Structural anti-gaming: a stripped-out REQUIRE suite is caught here even
     before the fingerprint (though the fingerprint catches it too)."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert '"${NASSERT}" -gt 0' in script
 
 
@@ -270,7 +288,7 @@ def test_render_test_sh_does_not_hardcode_repo_magic_numbers(plugin, graded):
     number in the plugin source. This test filters out comment lines before
     checking. 2900 (assertions) and 312 (fingerprint count) must not appear at all.
     """
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     non_comment = '\n'.join(
         ln for ln in script.splitlines() if not ln.lstrip().startswith('#')
     )
@@ -285,7 +303,7 @@ def test_render_test_sh_does_not_hardcode_repo_magic_numbers(plugin, graded):
 
 def test_render_test_sh_emits_five_key_schema(plugin, graded):
     """The 5 canonical keys must be present and in a shape verify.py can read."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     for key in B.REWARD_KEYS:
         assert f'"{key}"' in script
 
@@ -293,7 +311,7 @@ def test_render_test_sh_emits_five_key_schema(plugin, graded):
 def test_render_test_sh_extends_reward_json_with_doctest_extras(plugin, graded):
     """Reference grader reports assertion tallies + failure counts; verify.py
     ignores extras but downstream telemetry uses them."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'assertions_total' in script
     assert 'assertions_passed' in script
     assert 'assertions_failed' in script
@@ -304,7 +322,7 @@ def test_render_test_sh_extends_reward_json_with_doctest_extras(plugin, graded):
 
 def test_render_test_sh_starts_with_zero_and_ends_with_exit_zero(plugin, graded):
     """Fail-closed: the zero lands first and the script always exits 0."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert 'emit 0.0 0 "${EXPECTED}" 0.0' in script
     assert script.rstrip().endswith('exit 0')
 
@@ -313,7 +331,7 @@ def test_render_test_sh_binary_requires_doctest_exit_zero(plugin, graded):
     """A case that aborts a REQUIRE mid-way lowers the assertion count without
     lowering the case count; only doctest exit==0 proves the whole binary ran
     to a natural end."""
-    script = plugin.render_test_sh(graded)
+    script = render(plugin, graded)
     assert '"${DOCTEST_STATUS}" -ne 0' in script
 
 

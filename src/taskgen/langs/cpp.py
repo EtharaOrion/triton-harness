@@ -65,61 +65,84 @@ symbols could survive).
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import ClassVar, Mapping
 
-from ..depplan import DepPlan, FlagValue, TestValue, canonicalize, validate
+from ..depplan import (
+    DepPlan,
+    FlagValue,
+    HarnessValue,
+    TestValue,
+    canonicalize,
+    validate,
+)
 from . import base as B
 from .base import DepWarmSpec, EnvSpec, GradedSet, ToolchainSpec
 
 __all__ = [
     'BAKED_CAPABILITIES',
     'CPP_MEASURE_DEP_PLAN',
+    'CPP_RUX_HARNESS',
     'CppPlugin',
     'GRADER_FINGERPRINT_GLOBS',
-    'HARNESS_FILES',
+    'Harness',
+    'MAX_BUILD_PARALLEL',
     'MEASURE_NO_WARM_COMMENT',
     'REQUIRED_BUILD_FLAGS',
     'REQUIRED_PLAN_SLOTS',
     'REQUIRED_TEST_INVOCATION_KEYS',
     'TEST_COMMAND',
+    'read_harness',
 ]
 
-#: The 7 harness files whose presence the graded verifier refuses to score
-#: without. These files ARE the doctest oracle (Main.cpp registers the driver,
-#: the four *Tests.cpp files own the TEST_CASE bodies, doctest.h is the
-#: framework header); a solver who deleted or rewrote any of them to make the
-#: suite trivially pass would score 0. Per-file fingerprinting via Tests/**
-#: below is what protects their CONTENTS; this list is the presence check.
-HARNESS_FILES: tuple[str, ...] = (
-    'Tests/Unit/CMakeLists.txt',
-    'Tests/Unit/Main.cpp',
-    'Tests/Unit/SemanticTests.cpp',
-    'Tests/Unit/CodegenTests.cpp',
-    'Tests/Unit/OptimizerTests.cpp',
-    'Tests/Unit/GoldenDiagnosticsTests.cpp',
-    'Tests/Unit/ThirdParty/doctest.h',
+#: cpp-Rux's own harness as a `DepPlan.harness` section -- the fixed point of
+#: the refactor: rendered, it reproduces the scripts this plugin used to
+#: hardcode byte for byte. Every value is a fact about the cpp-Rux REPOSITORY,
+#: which is exactly why none of it belongs in the plugin.
+#:
+#: `harness_files` are the files whose PRESENCE the graded verifier refuses to
+#: score without: they ARE the doctest oracle (Main.cpp registers the driver,
+#: the *Tests.cpp files own the TEST_CASE bodies, doctest.h is the framework
+#: header). Per-file fingerprinting protects their CONTENTS; this list is the
+#: presence check. `registered_tests` is how many tests the build registers
+#: with ctest -- the structural net that used to be a bare `-eq 1`.
+CPP_RUX_HARNESS: tuple[tuple[str, HarnessValue], ...] = (
+    ('build_artifacts', ('Bin/Tests/Unit/rux-tests',)),
+    ('harness_files', (
+        'Tests/Unit/CMakeLists.txt',
+        'Tests/Unit/Main.cpp',
+        'Tests/Unit/SemanticTests.cpp',
+        'Tests/Unit/CodegenTests.cpp',
+        'Tests/Unit/OptimizerTests.cpp',
+        'Tests/Unit/GoldenDiagnosticsTests.cpp',
+        'Tests/Unit/ThirdParty/doctest.h',
+    )),
+    ('harness_files_note', 'doctest driver, doctest.h and the four *Tests.cpp bodies'),
+    ('project_label', 'Rux'),
+    ('registered_test_names', ('UnitTests',)),
+    ('registered_tests', 1),
+    ('stale_paths', ('Build', 'Bin')),
 )
 
-#: The graded build+run command as prose. `--parallel 4` is load-bearing (see
-#: module docstring); do NOT change to unbounded `--parallel`. Rendered into
-#: instruction.md so the model sees what test.sh actually runs.
-TEST_COMMAND = (
-    'cmake -S . -B Build -G Ninja -DCMAKE_BUILD_TYPE=Release '
-    '-DRUX_WERROR=ON -DRUX_BUILD_TESTS=ON '
-    '&& cmake --build Build --config Release --parallel 4 '
-    '&& ctest --test-dir Build --output-on-failure -C Release'
-)
+#: What the plugin locks against tampering: the repo's test tree, under any of
+#: the three spellings C++ projects use for it. The aggregate-hash reference
+#: lock (`/opt/harbor/tests.sha256`) is replaced with an inlined PER-FILE lock
+#: built host-side at generate time from the intact tree -- strictly stronger,
+#: because a solver can no longer swap one test file for another of the same
+#: aggregate size + hash chain.
+#:
+#: THREE globs rather than cpp-Rux's one `Tests/**`: these are expanded by
+#: `emit.plan_carve` BEFORE any environment is resolved, so they cannot come
+#: from the plan, and a plugin that only knew one repository's capital-T
+#: layout refused every project that spells the directory `test/` or `tests/`.
+#: Only the globs that actually match contribute, so a repo using one spelling
+#: locks exactly the files it always did.
+GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('Tests/**', 'test/**', 'tests/**')
 
-#: What the plugin locks against tampering: every file under Tests/. The
-#: aggregate-hash reference lock (`/opt/harbor/tests.sha256`) is replaced with
-#: an inlined PER-FILE lock built host-side at generate time from the intact
-#: tree -- strictly stronger, because a solver can no longer swap one file for
-#: another of the same aggregate size + hash chain. The top-level CMakeLists
-#: is NOT fingerprinted: it is not part of the doctest oracle, and the build
-#: gates (RUX_BUILD_TESTS=ON, TEST_BIN presence, ctest registered==1,
-#: doctest cases == EXPECTED) catch any tampering that would matter.
-GRADER_FINGERPRINT_GLOBS: tuple[str, ...] = ('Tests/**',)
+#: The ceiling this grader puts on `cmake --build --parallel N` (see the module
+#: docstring): a per-LANGUAGE memory fact, not a per-repo one, so it is enforced
+#: against whatever the plan asks for rather than read out of it.
+MAX_BUILD_PARALLEL = 4
 
 #: apt+kitware install block. Transcribed VERBATIM from the reference
 #: environment/Dockerfile (rux-lang/Rux, MIT) -- rendered here as a module
@@ -211,7 +234,10 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'binary and the repo is configured through it',
     'test_invocation["build"] must be a non-empty list of argv tokens: the '
     'command that compiles the configured tree, e.g. ["cmake", "--build", '
-    '"Build"]',
+    '"Build"]. Leave "--parallel" out unless the repo needs a specific value: '
+    f'the grader caps it at {MAX_BUILD_PARALLEL} and adds it for you, because '
+    'a C++ translation unit peaks near 1.5 GB and an unbounded --parallel is '
+    'OOM-killed on a big-core host',
     'test_invocation["configure"] must be a non-empty list of argv tokens: the '
     'command that configures the build tree, e.g. ["cmake", "-S", ".", "-B", '
     '"Build"]',
@@ -221,6 +247,37 @@ REQUIRED_PLAN_SLOTS: tuple[str, ...] = (
     'toolchain_version must carry at least major.minor.patch, e.g. "14.2.0": it '
     'is the C++ compiler version, the build-time pin asserts it verbatim, and '
     'its major component selects the gcc-N/g++-N binaries',
+    'harness is REQUIRED for cpp and describes THIS repository\'s own test '
+    'harness; it is what the graded verifier script is rendered from. State it '
+    'from the build manifests and the TEST FILE PATHS you were given, and from '
+    'nothing else. harness["build_artifacts"] is a list holding EXACTLY ONE '
+    'repo-relative path: the doctest executable the build produces and the '
+    'verifier runs directly, e.g. ["Bin/Tests/Unit/unit-tests"]. Read it off '
+    'the target\'s RUNTIME_OUTPUT_DIRECTORY and its target name; a wrong path '
+    'makes the whole plan unmeasurable, not merely suboptimal',
+    'harness["stale_paths"] lists the build-output directories the verifier '
+    'wipes before it configures, e.g. ["Build", "Bin"]. A stale still-passing '
+    'binary left in the image would let the suite report green with zero '
+    'regenerated code, so name EVERY directory the configure and build steps '
+    'write into. Empty is allowed only for a build that writes nowhere',
+    'harness["registered_tests"] is an INTEGER: how many tests the configured '
+    'build registers with ctest (one per add_test in the CMake files). It is '
+    'cross-checked against an independent host-side scan of the intact tree, '
+    'and a disagreement REFUSES the plan -- because a suite you under-count is '
+    'a suite that is partly ungraded, and a shrunken denominator still passes '
+    'every gate. harness["registered_test_names"] names them, in declaration '
+    'order, and must have exactly that many entries (or be empty). This '
+    'verifier grades ONE doctest binary, so registered_tests must equal the '
+    'length of build_artifacts: a repo registering several test executables '
+    'is REFUSED loudly rather than graded on the first one',
+    'harness["harness_files"] lists the repo-relative files whose PRESENCE the '
+    'verifier refuses to score without -- the test driver, the framework '
+    'header and the files owning the test bodies. The per-file fingerprint '
+    'protects their contents; this is the belt-and-braces existence check. '
+    'Empty is allowed. harness["harness_files_note"] is an optional short '
+    'phrase naming them in prose, e.g. "the driver, doctest.h and the test '
+    'bodies"; harness["project_label"] is the project\'s own name, e.g. the '
+    'argument of the CMake project() call. Both are prose only and may be ""',
 )
 
 #: The one package manager cpp's gap has prose (and a version pin) for. `make`
@@ -278,6 +335,226 @@ def _compiler_major(toolchain_version: str) -> str:
     return major
 
 
+def _parallelism(build_tokens: tuple[str, ...]) -> tuple[tuple[str, ...], int]:
+    """The build argv with this grader's OOM ceiling enforced, and that ceiling.
+
+    The cap is the plugin's, not the plan's (module docstring: 64 concurrent
+    cc1plus at ~1.5 GB each is OOM-killed at the 8 GB the task declares). A plan
+    that says nothing gets it added; a plan that asks for more is REFUSED rather
+    than silently narrowed, because a resolver told its value was honoured while
+    it was not is a resolver that cannot repair anything.
+    """
+    if '--parallel' not in build_tokens:
+        return (*build_tokens, '--parallel', str(MAX_BUILD_PARALLEL)), MAX_BUILD_PARALLEL
+    index = build_tokens.index('--parallel')
+    value = build_tokens[index + 1] if index + 1 < len(build_tokens) else ''
+    if not value.isdigit() or not 1 <= int(value) <= MAX_BUILD_PARALLEL:
+        raise B.LangError(
+            f'test_invocation["build"] asks for `--parallel {value}`; the cpp '
+            f'grader caps build parallelism at {MAX_BUILD_PARALLEL}. Each C++ '
+            'translation unit peaks near 1.5 GB and the shipped task declares '
+            '8 GB, so an unbounded or larger --parallel is OOM-killed on a '
+            'big-core host. Drop the flag and the renderer adds the cap itself'
+        )
+    return build_tokens, int(value)
+
+
+def _configure_lines(argv: tuple[str, ...], log_var: str) -> list[str]:
+    """The configure argv as a shell continuation: tool line, then one -D each.
+
+    Cache variables get a line apiece because a configure line is the one place
+    a reader diffs a task against upstream CI, and a fifteen-token single line
+    is unreadable. The split point is the first `-D`, so a plan that declares no
+    cache variables renders one line and nothing else.
+    """
+    split = max(
+        next((i for i, token in enumerate(argv) if token.startswith('-D')), len(argv)),
+        1,
+    )
+    return [
+        ' '.join(argv[:split]) + ' \\',
+        *[f'      {token} \\' for token in argv[split:]],
+        f'      > "${{{log_var}}}" 2>&1',
+    ]
+
+
+def _werror_var(configure: tuple[str, ...]) -> str:
+    """The repo's warnings-as-errors cache variable, if its configure sets one.
+
+    The rendered rationale for building the regenerated code under -Werror is
+    only true of a repo that asks for it, so it is emitted only when the plan's
+    own configure argv turns such a switch ON. It cannot move into the plan as
+    prose: `DepPlan` refuses `;` and `()` in every token, and weakening that
+    gate to carry a comment would be trading the metacharacter guarantee for a
+    sentence.
+    """
+    for token in configure:
+        name, _, value = token.removeprefix('-D').partition('=')
+        if token.startswith('-D') and value == 'ON' and name.endswith('WERROR'):
+            return name
+    return ''
+
+
+_ENGLISH: tuple[str, ...] = (
+    'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
+    'nine', 'ten',
+)
+
+
+def _english(n: int) -> str:
+    return _ENGLISH[n] if 0 <= n < len(_ENGLISH) else str(n)
+
+
+def _dir_phrase(directories) -> str:
+    """`Build/ and Bin/` -- how the rendered comments name a set of directories."""
+    return ' and '.join(f'{d}/' for d in directories)
+
+
+def _slot_error(key: str, want: str) -> B.LangError:
+    return B.LangError(
+        f'the cpp harness needs harness[{key!r}]: {want}. Without it the '
+        'rendered verifier would either grade nothing or grade a suite nobody '
+        'described, and a denominator nobody described is not a floor'
+    )
+
+
+def _tuple_slot(values: Mapping[str, HarnessValue], key: str,
+                want: str, *, required: bool = False) -> tuple[str, ...]:
+    raw = values.get(key)
+    if raw is None:
+        if required:
+            raise _slot_error(key, want)
+        return ()
+    if isinstance(raw, (bool, int)):
+        raise _slot_error(key, f'{want} (a list of strings, not a scalar)')
+    tokens = (raw,) if isinstance(raw, str) else tuple(raw)
+    if required and not tokens:
+        raise _slot_error(key, want)
+    return tokens
+
+
+def _str_slot(values: Mapping[str, HarnessValue], key: str, want: str) -> str:
+    raw = values.get(key)
+    if raw is None or raw == '':
+        return ''
+    if not isinstance(raw, str):
+        raise _slot_error(key, f'{want} (a single string)')
+    return raw
+
+
+def _int_slot(values: Mapping[str, HarnessValue], key: str, want: str) -> int:
+    raw = values.get(key)
+    if isinstance(raw, bool) or raw is None:
+        raise _slot_error(key, want)
+    if isinstance(raw, int):
+        parsed = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        parsed = int(raw)
+    else:
+        raise _slot_error(key, f'{want} (a whole number)')
+    if parsed < 1:
+        raise _slot_error(key, f'{want} (at least 1; zero would grade nothing)')
+    return parsed
+
+
+@dataclass(frozen=True)
+class Harness:
+    """A cpp test harness as data: build it, find its binary, decide its cases.
+
+    Everything the two rendered scripts used to hardcode about the cpp-Rux REPO,
+    read off `DepPlan.harness`. `read_harness` is the only constructor, so a
+    slot that is missing, mistyped or inconsistent with its siblings becomes a
+    `LangError` before any container exists rather than a shell script that
+    looks for a binary nobody builds and reports a floor of zero.
+    """
+
+    build_artifacts: tuple[str, ...]
+    stale_paths: tuple[str, ...]
+    harness_files: tuple[str, ...]
+    harness_files_note: str
+    project_label: str
+    registered_tests: int
+    registered_test_names: tuple[str, ...]
+
+    @property
+    def test_binary(self) -> str:
+        return self.build_artifacts[0]
+
+    @property
+    def test_binary_name(self) -> str:
+        return self.test_binary.rsplit('/', 1)[-1]
+
+
+def read_harness(plan: DepPlan) -> Harness:
+    """`plan.harness` as the record the two renderers read, or a `LangError`.
+
+    Every check here is reachable from the refine loop, so every message names
+    the slot and says what a correct value looks like: a resolver that gets one
+    wrong must be able to repair it without being shown the repository.
+    """
+    values = {key: value for key, value in canonicalize(plan).harness}
+    harness = Harness(
+        build_artifacts=_tuple_slot(
+            values, 'build_artifacts',
+            'the repo-relative path of the doctest executable the build '
+            'produces and the verifier runs directly',
+            required=True,
+        ),
+        stale_paths=_tuple_slot(
+            values, 'stale_paths',
+            'the build-output directories wiped before the configure step, so '
+            'no stale binary can report a cached pass',
+        ),
+        harness_files=_tuple_slot(
+            values, 'harness_files',
+            'the repo-relative files whose presence the verifier refuses to '
+            'score without',
+        ),
+        harness_files_note=_str_slot(
+            values, 'harness_files_note',
+            'a short prose phrase naming the harness files',
+        ),
+        project_label=_str_slot(
+            values, 'project_label', "the project's own name",
+        ),
+        registered_tests=_int_slot(
+            values, 'registered_tests',
+            'how many tests the configured build registers with ctest',
+        ),
+        registered_test_names=_tuple_slot(
+            values, 'registered_test_names',
+            'the names of the tests the build registers with ctest, in '
+            'declaration order',
+        ),
+    )
+    names = harness.registered_test_names
+    if names and len(names) != harness.registered_tests:
+        raise B.LangError(
+            f'harness["registered_test_names"] has {len(names)} entries but '
+            f'registered_tests is {harness.registered_tests}; the two describe '
+            'the same ctest registry, and a list shorter than the count is a '
+            'registration nobody named'
+        )
+    if len(harness.build_artifacts) != harness.registered_tests:
+        raise B.LangError(
+            f'harness["registered_tests"] is {harness.registered_tests} but '
+            f'build_artifacts names {len(harness.build_artifacts)} executable(s). '
+            'Every ctest registration must name the binary this verifier runs, '
+            'or the registrations it does not name are graded by nobody and the '
+            'denominator silently shrinks to the part of the suite that was '
+            'described'
+        )
+    if len(harness.build_artifacts) != 1:
+        raise B.LangError(
+            'the cpp verifier grades ONE doctest binary: it runs it directly '
+            'and reads a single `[doctest] test cases:` summary. This plan '
+            f'describes {len(harness.build_artifacts)} graded binaries, whose '
+            'cases this renderer cannot sum -- so it REFUSES rather than '
+            'pinning a floor over the first one and leaving the rest ungraded'
+        )
+    return harness
+
+
 def _cpp_measure_dep_plan() -> DepPlan:
     """cpp's own environment as the record a resolver would have to produce.
 
@@ -322,6 +599,7 @@ def _cpp_measure_dep_plan() -> DepPlan:
                 '-C', 'Release',
             )),
         ),
+        harness=CPP_RUX_HARNESS,
         needs_git_metadata=False,
     )
     validate(plan)
@@ -331,6 +609,29 @@ def _cpp_measure_dep_plan() -> DepPlan:
 #: cpp's canonical, validated environment plan. Module-level so a test can
 #: assert the rendered gap against it without re-deriving the facts it states.
 CPP_MEASURE_DEP_PLAN: DepPlan = _cpp_measure_dep_plan()
+
+
+def _test_command(plan: DepPlan) -> str:
+    """`configure && build && test` as the one prose line instruction.md shows.
+
+    Derived from the plan rather than spelled again: the three argv vectors are
+    already the authority the two scripts render from, and a second spelling of
+    them is how the instruction the model reads starts describing a command the
+    grader does not run.
+    """
+    build, _ = _parallelism(_test_tokens(plan.test_invocation, 'build'))
+    steps = (
+        _test_tokens(plan.test_invocation, 'configure'),
+        build,
+        _test_tokens(plan.test_invocation, 'test'),
+    )
+    return ' && '.join(' '.join(step) for step in steps)
+
+
+#: The graded build+run command as prose, for instruction.md and the graded set.
+#: cpp-Rux's, because it is derived from cpp-Rux's plan -- a resolved plan
+#: replaces it through `test_command_from_plan` before an entry is written.
+TEST_COMMAND = _test_command(CPP_MEASURE_DEP_PLAN)
 
 
 class CppPlugin(B.LangPlugin):
@@ -343,8 +644,8 @@ class CppPlugin(B.LangPlugin):
     synthesizes_git: ClassVar[bool] = False
 
     #: See `emit.plan_carve`: whole-suite plugins can declare a set of intact-
-    #: tree globs to fingerprint. Empty for rust; ('tests/**', 'Makefile')
-    #: for c; ('Tests/**',) for cpp (Rux uses capital Tests/ per repo layout).
+    #: tree globs to fingerprint. Empty for rust; ('tests/**', 'Makefile') for
+    #: c; the three spellings of a C++ test tree here.
     grader_fingerprint_globs: ClassVar[tuple[str, ...]] = GRADER_FINGERPRINT_GLOBS
 
     #: The same facts `toolchain_spec().install_block` asserts at build time,
@@ -359,7 +660,11 @@ class CppPlugin(B.LangPlugin):
     required_plan_slots: ClassVar[tuple[str, ...]] = REQUIRED_PLAN_SLOTS
 
     test_command: ClassVar[str] = TEST_COMMAND
-    harness_files: ClassVar[tuple[str, ...]] = HARNESS_FILES
+
+    def test_command_from_plan(self, dep_plan: DepPlan | None) -> str:
+        """What the rendered scripts ACTUALLY run, for instruction.md to quote."""
+        plan, _harness = self._harness(dep_plan)
+        return _test_command(plan)
 
     # --- axis 1 -----------------------------------------------------------
 
@@ -384,22 +689,137 @@ class CppPlugin(B.LangPlugin):
 
     # --- axes 3-6 ---------------------------------------------------------
 
+    def _harness(self, dep_plan: DepPlan | None) -> tuple[DepPlan, Harness]:
+        """The plan the harness comes from, and the harness itself.
+
+        `dep_plan=None` is the pre-resolution path (`--no-resolve-env`, and
+        every caller written before the harness was plan-driven). It falls back
+        to cpp-Rux's own canonical plan, which is exactly the environment those
+        callers were hardcoded against -- so the fallback is not a guess, it is
+        the same bytes under a name.
+        """
+        plan = canonicalize(CPP_MEASURE_DEP_PLAN if dep_plan is None else dep_plan)
+        return plan, read_harness(plan)
+
+    def assert_repo_agrees(self, plan: DepPlan, *, registered_tests: int) -> None:
+        """`validate_dep_plan` plus what only the INTACT tree can answer."""
+        self._assert_registry_agrees(read_harness(plan), int(registered_tests))
+
+    @staticmethod
+    def _assert_registry_agrees(harness: Harness, registered_tests: int) -> None:
+        """THE UNDER-ENUMERATION GUARD, and the reason `-eq 1` could be relaxed.
+
+        `CTEST_RAN -eq 1` used to be the net that caught a plan describing less
+        of the suite than the repo has. Once the count comes from the plan the
+        net is gone, and a plan that under-enumerates is the dangerous failure:
+        a shrunken denominator is SELF-CONSISTENT at the wrong number, so every
+        downstream gate -- measure, the equality floor, RED/GREEN -- passes
+        while part of the suite is ungraded and never missed.
+
+        The replacement is an INDEPENDENT signal: `emit._cpp_grader_metadata`
+        counts the `add_test()` registrations in the intact tree's own CMake
+        files, host-side, without asking the resolver anything. The plan and the
+        repository have to agree, and a disagreement REFUSES loudly rather than
+        pinning a floor over whichever number happened to be smaller.
+        """
+        if harness.registered_tests != registered_tests:
+            raise B.LangError(
+                f'the plan says the build registers {harness.registered_tests} '
+                f'ctest test(s), but the intact tree registers '
+                f'{registered_tests} (add_test calls counted host-side in its '
+                'CMake files). A plan that under-enumerates the suite pins a '
+                'floor over only the part it described, and a shrunken '
+                'denominator is self-consistent at the wrong number -- every '
+                'later gate would pass while the rest of the suite went '
+                'ungraded. Restate harness["registered_tests"] (and the '
+                'build_artifacts it must match) from the repository'
+            )
+
     def render_test_sh(
         self,
         graded: GradedSet,
         *,
         expected: int | None = None,
         fingerprint: Mapping[str, str] | None = None,
+        registered_tests: int | None = None,
+        carve_root: str | None = None,
+        dep_plan: DepPlan | None = None,
     ) -> str:
         expected = graded.expected if expected is None else int(expected)
         fingerprint = graded.fingerprint_sha256 if fingerprint is None else fingerprint
+        if registered_tests is None:
+            raise B.LangError(
+                'cpp plugin needs registered_tests threaded from the intact tree '
+                'at generate time; emit._render_test_sh supplies it (no '
+                'repo-magic numbers in the plugin source)'
+            )
+        plan, harness = self._harness(dep_plan)
+        self._assert_registry_agrees(harness, int(registered_tests))
 
-        harness_check = '\n'.join([
-            'for f in \\',
-            ' \\\n'.join(f'        {rel}' for rel in HARNESS_FILES) + '; do',
-            '    [ -f "$f" ] || fail "graded harness file missing: $f"',
-            'done',
-        ])
+        configure = _test_tokens(plan.test_invocation, 'configure')
+        build, parallel = _parallelism(_test_tokens(plan.test_invocation, 'build'))
+        ctest = _test_tokens(plan.test_invocation, 'test')
+        manager = plan.package_manager
+        major = _compiler_major(plan.toolchain_version)
+        cc, cxx = f'gcc-{major}', f'g++-{major}'
+        binary, bin_name = harness.test_binary, harness.test_binary_name
+        stale = harness.stale_paths
+        registered = harness.registered_tests
+        names = harness.registered_test_names
+        plural = '' if registered == 1 else 's'
+        be = 'is' if registered == 1 else 'are'
+        oracle = _dir_phrase(
+            sorted({path.split('/', 1)[0] for path in fingerprint})
+        ) or 'The graded test'
+        carved_glob = f'{carve_root}/*' if carve_root else 'the carved tree'
+
+        if registered == 1 and harness.project_label and names:
+            registry = (
+                f'{harness.project_label} registers `{names[0]}`, '
+                f'the single {bin_name} binary'
+            )
+        elif names:
+            registry = 'the build registers ' + ', '.join(f'`{n}`' for n in names)
+        else:
+            registry = f'the build registers {_english(registered)} ctest test{plural}'
+        single = f' (the single {bin_name} binary)' if registered == 1 else ''
+
+        presence: list[str] = []
+        if harness.harness_files:
+            note = harness.harness_files_note
+            presence = [
+                '',
+                '# Belt and braces on top of the fingerprint: the '
+                f'{len(harness.harness_files)} named harness files',
+                *([f'# ({note}) must all', '# still be present.'] if note
+                  else ['# must all still be present.']),
+                'for f in \\',
+                ' \\\n'.join(f'        {rel}' for rel in harness.harness_files) + '; do',
+                '    [ -f "$f" ] || fail "graded harness file missing: $f"',
+                'done',
+            ]
+
+        cleanup: list[str] = []
+        if stale:
+            them = 'them' if len(stale) > 1 else 'it'
+            cleanup = [
+                '',
+                '# --- clean previous artifacts ---------------------------------------',
+                f'# {_dir_phrase(stale)} {"are" if len(stale) > 1 else "is"} removed '
+                'unconditionally. The image ships without',
+                f'# {them}, but a stale still-passing {bin_name} binary inside the same',
+                '# container would let ctest report green with zero regenerated code.',
+                f'# Removing {them} makes a cached PASS structurally impossible.',
+                f'rm -rf {" ".join(stale)}',
+            ]
+
+        werror = _werror_var(configure)
+        strictness = [
+            f'# {werror}=ON matches upstream CI exactly (macOS.yml). Regenerated',
+            '# code must be clean under -Wall -Wextra -Wpedantic -Wshadow -Werror;',
+            f'# the oracle sources compile warning-free under {cxx} with these flags,',
+            '# so the gate is known to be satisfiable.',
+        ] if werror else []
 
         return '\n'.join([
             '#!/usr/bin/env bash',
@@ -411,11 +831,14 @@ class CppPlugin(B.LangPlugin):
             f'# The denominator ({expected}) was measured once against the intact tree',
             '# in phase 1 (measure.py) and pinned in graded.lock.json.',
             '#',
-            '# BUILD PARALLELISM: `cmake --build ... --parallel 4`, NOT the reference',
+            f'# BUILD PARALLELISM: `{manager} --build ... --parallel {parallel}`, '
+            'NOT the reference',
             '# unbounded `--parallel`. On a big-core aarch64 host the unbounded form',
             '# spawns one cc1plus per core, each peaking ~1.5 GB on C++26 -O3, and is',
-            '# OOM-killed at any reasonable cgroup memory cap. 4 processes * ~1.5 GB',
-            '# ~ 6 GB sits comfortably under the task.toml-declared 8 GB memory_mb.',
+            f'# OOM-killed at any reasonable cgroup memory cap. {parallel} processes '
+            '* ~1.5 GB',
+            f'# ~ {parallel * 3 // 2} GB sits comfortably under the task.toml-declared '
+            '8 GB memory_mb.',
             '#',
             "# Harbor ignores this script's exit code; /logs/verifier/reward.json is",
             '# the single source of truth and is written on EVERY path.',
@@ -424,13 +847,13 @@ class CppPlugin(B.LangPlugin):
             '',
             f'REPO=${{REPO:-{B.WORKDIR}}}',
             B.reward_emitter_block(_LOGS_DEFAULT),
-            'CONFIGURE_LOG="${VERIFIER_DIR}/cmake-configure.log"',
-            'BUILD_LOG="${VERIFIER_DIR}/cmake-build.log"',
+            f'CONFIGURE_LOG="${{VERIFIER_DIR}}/{manager}-configure.log"',
+            f'BUILD_LOG="${{VERIFIER_DIR}}/{manager}-build.log"',
             'CTEST_LOG="${VERIFIER_DIR}/ctest.log"',
             'DOCTEST_LOG="${VERIFIER_DIR}/doctest.log"',
             '',
-            '# COMPILED is set to 1.0 only after cmake --build actually links the',
-            '# rux-tests binary in THIS run. Kept as a shell variable so the',
+            f'# COMPILED is set to 1.0 only after {manager} --build actually links the',
+            f'# {bin_name} binary in THIS run. Kept as a shell variable so the',
             '# fail-closed helper quotes the current value on every early exit --',
             '# a build that failed halfway must not be reported as compiled=1 by an',
             '# earlier optimistic setting.',
@@ -441,56 +864,41 @@ class CppPlugin(B.LangPlugin):
             'cd "${REPO}" || fail "no ${REPO}"',
             '',
             '# --- integrity guards -----------------------------------------------',
-            '# Tests/ tree is the doctest oracle. The per-file lock below was',
+            f'# {oracle} tree is the doctest oracle. The per-file lock below was',
             '# captured host-side from the intact tree at generate time and refuses',
             '# to grade if any pinned file changed. Strictly stronger than the',
             '# reference aggregate lock: a solver cannot swap one test file for',
             '# another of matching aggregate hash.',
             B.fingerprint_gate_block(fingerprint, repo_var='${REPO}'),
+            *presence,
+            *cleanup,
             '',
-            '# Belt and braces on top of the fingerprint: the 7 named harness files',
-            '# (doctest driver, doctest.h and the four *Tests.cpp bodies) must all',
-            '# still be present.',
-            harness_check,
-            '',
-            '# --- clean previous artifacts ---------------------------------------',
-            '# Build/ and Bin/ are removed unconditionally. The image ships without',
-            '# them, but a stale still-passing rux-tests binary inside the same',
-            '# container would let ctest report green with zero regenerated code.',
-            '# Removing them makes a cached PASS structurally impossible.',
-            'rm -rf Build Bin',
-            '',
-            'export CC=gcc-14 CXX=g++-14',
-            'echo "VERIFIER: $(cmake --version | head -1), $(g++-14 --version | head -1)'
+            f'export CC={cc} CXX={cxx}',
+            f'echo "VERIFIER: $({manager} --version | head -1), '
+            f'$({cxx} --version | head -1)'
             ', ninja $(ninja --version)"',
             '',
             '# --- configure ------------------------------------------------------',
-            '# RUX_WERROR=ON matches upstream CI exactly (macOS.yml). Regenerated',
-            '# code must be clean under -Wall -Wextra -Wpedantic -Wshadow -Werror;',
-            '# the oracle sources compile warning-free under g++-14 with these flags,',
-            '# so the gate is known to be satisfiable.',
-            'cmake -S . -B Build -G Ninja \\',
-            '      -DCMAKE_BUILD_TYPE=Release \\',
-            '      -DRUX_WERROR=ON \\',
-            '      -DRUX_BUILD_TESTS=ON \\',
-            '      > "${CONFIGURE_LOG}" 2>&1',
+            *strictness,
+            *_configure_lines(configure, 'CONFIGURE_LOG'),
             'CONFIGURE_STATUS=$?',
             'if [ "${CONFIGURE_STATUS}" -ne 0 ]; then',
-            '    echo "--- tail of cmake-configure.log ---" >&2',
+            f'    echo "--- tail of {manager}-configure.log ---" >&2',
             '    tail -40 "${CONFIGURE_LOG}" >&2',
-            '    echo "VERIFIER: cmake configure failed (expected while Compiler/* is'
+            f'    echo "VERIFIER: {manager} configure failed (expected while '
+            f'{carved_glob} is'
             ' carved)" >&2',
             '    emit 0.0 0 "${EXPECTED}" 0.0 0.0',
             '    exit 0',
             'fi',
             'echo "VERIFIER: configure OK"',
             '',
-            '# --- build (parallel 4, load-bearing) -------------------------------',
-            'cmake --build Build --config Release --parallel 4 \\',
+            f'# --- build (parallel {parallel}, load-bearing) '.ljust(70, '-'),
+            f'{" ".join(build)} \\',
             '      > "${BUILD_LOG}" 2>&1',
             'BUILD_STATUS=$?',
             'if [ "${BUILD_STATUS}" -ne 0 ]; then',
-            '    echo "--- tail of cmake-build.log ---" >&2',
+            f'    echo "--- tail of {manager}-build.log ---" >&2',
             '    tail -60 "${BUILD_LOG}" >&2',
             '    echo "VERIFIER: build failed (compiled=0, tests cannot run)" >&2',
             '    emit 0.0 0 "${EXPECTED}" 0.0 0.0',
@@ -498,7 +906,7 @@ class CppPlugin(B.LangPlugin):
             'fi',
             '',
             '# The test binary must have been produced by THIS build.',
-            'TEST_BIN=Bin/Tests/Unit/rux-tests',
+            f'TEST_BIN={binary}',
             '[ -x "${TEST_BIN}" ] || fail "${TEST_BIN} was not produced by the build"',
             '',
             'COMPILED=1.0',
@@ -507,9 +915,10 @@ class CppPlugin(B.LangPlugin):
             '# --- ctest ----------------------------------------------------------',
             '# ctest exits non-zero as soon as any doctest case fails; under graded',
             '# reward that is the ordinary partial-credit path, NOT an error. What',
-            '# ctest IS used for is the structural check that exactly one test is',
-            '# registered (Rux registers `UnitTests`, the single rux-tests binary).',
-            'ctest --test-dir Build --output-on-failure -C Release \\',
+            '# ctest IS used for is the structural check that exactly '
+            f'{_english(registered)} test{plural} {be}',
+            f'# registered ({registry}).',
+            f'{" ".join(ctest)} \\',
             '      > "${CTEST_LOG}" 2>&1',
             'CTEST_STATUS=$?',
             'tail -30 "${CTEST_LOG}"',
@@ -525,11 +934,13 @@ class CppPlugin(B.LangPlugin):
             "CTEST_RAN=$(echo \"${CTEST_SUMMARY}\""
             " | sed -n 's/.*out of \\([0-9]\\+\\).*/\\1/p')",
             '[ -n "${CTEST_RAN}" ] || fail "could not parse the ctest test count"',
-            # Structural: Rux registers exactly ONE ctest. Not a repo-magic number
-            # (an assertion about the harness shape, not the test corpus size).
-            '[ "${CTEST_RAN}" -eq 1 ] \\',
-            '    || fail "ctest registered ${CTEST_RAN} tests, expected exactly 1'
-            ' (the single rux-tests binary)"',
+            # The registry size comes from the PLAN and is cross-checked against
+            # the intact tree host-side (`_assert_registry_agrees`), so this
+            # stays a structural assertion about the harness shape rather than
+            # a repo-magic number the plugin invented.
+            f'[ "${{CTEST_RAN}}" -eq {registered} ] \\',
+            f'    || fail "ctest registered ${{CTEST_RAN}} tests, expected exactly '
+            f'{registered}{single}"',
             'echo "VERIFIER: ctest exit=${CTEST_STATUS} pct=${CTEST_PCT}%'
             ' registered-tests=${CTEST_RAN}"',
             '',
@@ -578,17 +989,21 @@ class CppPlugin(B.LangPlugin):
             '',
             '# --- structural anti-gaming gates (no repo-magic literals) ----------',
             '# nassert > 0: the doctest suite actually executed assertions. A rebuilt',
-            '# binary with every REQUIRE stripped would print `test cases: 170 | 170',
+            f'# binary with every REQUIRE stripped would print `test cases: {expected}'
+            f' | {expected}',
             '# passed` with zero assertions -- the fingerprint gate above catches',
             '# that by hash, and this catches it structurally too.',
-            '# CTEST_PCT == 100: the single registered ctest was green (the DOCTEST_STATUS',
+            f'# CTEST_PCT == 100: the {"single" if registered == 1 else _english(registered)}'
+            f' registered ctest{plural} '
+            f'{"was" if registered == 1 else "were"} green (the DOCTEST_STATUS',
             '# gate below in the BINARY reproduces the all-or-nothing semantics).',
             '[ "${NASSERT}" -gt 0 ] \\',
             '    || fail "doctest ran no assertions -- the test suite is empty or a'
             ' compiled-out no-op"',
             '[ "${CTEST_PCT:-0}" -eq 100 ] \\',
-            '    || fail "ctest reported ${CTEST_PCT}% (need 100% since exactly 1 test'
-            ' is registered)"',
+            '    || fail "ctest reported ${CTEST_PCT}% (need 100% since exactly '
+            f'{registered} test{plural}'
+            f' {be} registered)"',
             '[ "${CASES_PASSED}" -le "${EXPECTED}" ] \\',
             '    || fail "nonsensical tally: ${CASES_PASSED} passed out of ${EXPECTED}"',
             '',
@@ -628,15 +1043,27 @@ class CppPlugin(B.LangPlugin):
             '',
         ])
 
-    def measure_test_sh(self, *, graded: GradedSet | None = None, **kwargs) -> str:
-        """Phase 1: build the intact tree, run rux-tests, count doctest cases.
+    def measure_test_sh(
+        self,
+        *,
+        graded: GradedSet | None = None,
+        dep_plan: DepPlan | None = None,
+        **kwargs,
+    ) -> str:
+        """Phase 1: build the intact tree, run the test binary, count doctest cases.
 
         Floor-FREE by construction. `measure` writes tests_total = the doctest
         `test cases: N` summary; a build that broke halfway registers as 0 and
-        `parse_measure_json` rejects zero. Uses `--parallel 4` for the same OOM
-        reasons documented in render_test_sh (measure runs on the SAME host).
+        `parse_measure_json` rejects zero. Keeps the capped `--parallel` for the
+        same OOM reasons documented in render_test_sh (measure runs on the SAME
+        host).
         """
         del graded, kwargs
+        plan, harness = self._harness(dep_plan)
+        configure = _test_tokens(plan.test_invocation, 'configure')
+        build, _parallel = _parallelism(_test_tokens(plan.test_invocation, 'build'))
+        manager = plan.package_manager
+        major = _compiler_major(plan.toolchain_version)
         return '\n'.join([
             '#!/usr/bin/env bash',
             '# Harbor MEASURE (phase 1) -- cpp. Floor-FREE by construction; the pinned',
@@ -646,19 +1073,15 @@ class CppPlugin(B.LangPlugin):
             '',
             f'REPO=${{REPO:-{B.WORKDIR}}}',
             B.measure_emitter_block(_MEASURE_LOGS_DEFAULT),
-            'CONFIGURE_LOG="${MEASURE_DIR}/cmake-configure.log"',
-            'BUILD_LOG="${MEASURE_DIR}/cmake-build.log"',
+            f'CONFIGURE_LOG="${{MEASURE_DIR}}/{manager}-configure.log"',
+            f'BUILD_LOG="${{MEASURE_DIR}}/{manager}-build.log"',
             'DOCTEST_LOG="${MEASURE_DIR}/doctest.log"',
             '',
             'cd "${REPO}" || { echo "no ${REPO}" >&2; measure 0 \'\'; exit 0; }',
             '',
-            'export CC=gcc-14 CXX=g++-14',
+            f'export CC=gcc-{major} CXX=g++-{major}',
             '',
-            'cmake -S . -B Build -G Ninja \\',
-            '      -DCMAKE_BUILD_TYPE=Release \\',
-            '      -DRUX_WERROR=ON \\',
-            '      -DRUX_BUILD_TESTS=ON \\',
-            '      > "${CONFIGURE_LOG}" 2>&1',
+            *_configure_lines(configure, 'CONFIGURE_LOG'),
             'if [ $? -ne 0 ]; then',
             '    tail -40 "${CONFIGURE_LOG}" >&2',
             '    echo "measure: intact configure failed" >&2',
@@ -666,7 +1089,7 @@ class CppPlugin(B.LangPlugin):
             '    exit 0',
             'fi',
             '',
-            'cmake --build Build --config Release --parallel 4 \\',
+            f'{" ".join(build)} \\',
             '      > "${BUILD_LOG}" 2>&1',
             'if [ $? -ne 0 ]; then',
             '    tail -60 "${BUILD_LOG}" >&2',
@@ -675,7 +1098,7 @@ class CppPlugin(B.LangPlugin):
             '    exit 0',
             'fi',
             '',
-            'TEST_BIN=Bin/Tests/Unit/rux-tests',
+            f'TEST_BIN={harness.test_binary}',
             'if [ ! -x "${TEST_BIN}" ]; then',
             '    echo "measure: no ${TEST_BIN} produced by intact build" >&2',
             '    measure 0 \'\'',
@@ -698,16 +1121,25 @@ class CppPlugin(B.LangPlugin):
     # --- axis 7 -----------------------------------------------------------
 
     def post_restore_block(self) -> str:
+        return self.post_restore_for(None)
+
+    def post_restore_for(self, dep_plan: DepPlan | None) -> str:
         """Invalidate stale build output so GREEN rebuilds honestly.
 
-        Mirrors the reference solve.sh which does `rm -rf $REPO/Build $REPO/Bin`
-        after copying carved/ back over the Compiler/* subtree. The grader's own
-        `rm -rf Build Bin` at the top of render_test_sh would catch this too,
-        but doing it in the oracle keeps the post-restore state identical to
-        what the reference solve.sh produces (`diff -r` between the two states
-        should be empty).
+        Mirrors the reference solve.sh which wipes the build-output directories
+        after copying carved/ back. The grader's own `rm -rf` at the top of
+        render_test_sh would catch this too, but doing it in the oracle keeps
+        the post-restore state identical to what the reference solve.sh
+        produces (`diff -r` between the two states should be empty). WHICH
+        directories is the plan's answer, not this method's -- `Build`/`Bin`
+        are cpp-Rux's names for them, not C++'s.
         """
-        return 'rm -rf "${REPO}/Build" "${REPO}/Bin"'
+        _plan, harness = self._harness(dep_plan)
+        if not harness.stale_paths:
+            return ''
+        return 'rm -rf ' + ' '.join(
+            f'"${{REPO}}/{path}"' for path in harness.stale_paths
+        )
 
     # --- axis 8 + the image ----------------------------------------------
 
@@ -740,6 +1172,8 @@ class CppPlugin(B.LangPlugin):
             _flag_str(plan.build_flags, key)
         for key in REQUIRED_TEST_INVOCATION_KEYS:
             _test_tokens(plan.test_invocation, key)
+        _parallelism(_test_tokens(plan.test_invocation, 'build'))
+        read_harness(plan)
 
     def _gap_body(self, plan: DepPlan) -> str:
         """cpp's toolchain bytes, rendered from a plan instead of a literal.
