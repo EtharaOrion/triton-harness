@@ -953,6 +953,136 @@ def _junit_suite_classes(text: str, where: str) -> int:
     return counted
 
 
+#: Cargo's integration-test root. Every `.rs` directly inside it is one target,
+#: and so is every subdirectory holding a `main.rs`; a subdirectory holding only
+#: a `mod.rs` is a shared helper module and is deliberately NOT one.
+_CARGO_TESTS_DIR = 'tests'
+_CARGO_TARGET_MAIN = 'main.rs'
+
+
+def _cargo_integration_targets(repo: Path) -> tuple[str, ...]:
+    """The integration-test targets the intact crate declares, counted HOST-SIDE.
+
+    The independent half of rust's under-enumeration guard, and the reason it
+    can be trusted: it reads the repository's own manifest and test tree rather
+    than anything the resolver said, and every construct whose target count
+    depends on something not written there makes it REFUSE rather than answer
+    low.
+
+    Cargo's rules, in the order they apply: auto-discovery adds `tests/*.rs` and
+    `tests/<dir>/main.rs` unless `autotests = false`; an explicit `[[test]]`
+    adds its own `name`, and when it carries a `path` it REPLACES the
+    auto-discovered target for that file rather than adding a second one.
+    """
+    manifest_path = repo / 'Cargo.toml'
+    if not manifest_path.is_file():
+        raise langs_base.LangError(
+            'the carved crate has no Cargo.toml at the repository root, so the '
+            'cargo integration targets cannot be enumerated and the plan\'s '
+            'harness list has nothing independent to be checked against'
+        )
+    try:
+        manifest = tomllib.loads(manifest_path.read_text(encoding='utf-8'))
+    except tomllib.TOMLDecodeError as exc:
+        raise langs_base.LangError(
+            f'Cargo.toml at the repository root does not parse as TOML ({exc}), '
+            'so the integration targets it declares cannot be established'
+        ) from exc
+
+    package = manifest.get('package')
+    if not isinstance(package, dict):
+        raise langs_base.LangError(
+            'the repository root Cargo.toml declares no [package], so it is a '
+            'bare workspace manifest. A whole-suite rust task grades ONE '
+            'package\'s integration suite, and which package that is cannot be '
+            'established from a virtual manifest'
+        )
+
+    autotests = package.get('autotests', True)
+    if not isinstance(autotests, bool):
+        raise langs_base.LangError(
+            f'Cargo.toml sets autotests = {autotests!r}, which is not a boolean. '
+            'Whether cargo auto-discovers targets under tests/ decides how many '
+            'there are, so a value that cannot be read is a count that cannot be '
+            'trusted'
+        )
+
+    auto: dict[str, str] = {}
+    tests_dir = repo / _CARGO_TESTS_DIR
+    if autotests and tests_dir.is_dir():
+        for entry in sorted(tests_dir.iterdir()):
+            if entry.is_file() and entry.suffix == '.rs':
+                auto[f'{_CARGO_TESTS_DIR}/{entry.name}'] = entry.stem
+            elif entry.is_dir() and (entry / _CARGO_TARGET_MAIN).is_file():
+                auto[
+                    f'{_CARGO_TESTS_DIR}/{entry.name}/{_CARGO_TARGET_MAIN}'
+                ] = entry.name
+
+    explicit: set[str] = set()
+    declared = manifest.get('test', [])
+    if not isinstance(declared, list):
+        raise langs_base.LangError(
+            'Cargo.toml declares [test] as a table rather than [[test]] entries, '
+            'so the integration targets it names cannot be enumerated'
+        )
+    for index, entry in enumerate(declared):
+        if not isinstance(entry, dict) or not isinstance(entry.get('name'), str):
+            raise langs_base.LangError(
+                f'the [[test]] entry at index {index} in Cargo.toml declares no '
+                'string `name`, so the target it registers cannot be named -- and '
+                'a target nobody can name cannot be checked against the plan'
+            )
+        if entry.get('harness') is False:
+            raise langs_base.LangError(
+                f'the [[test]] target {entry["name"]!r} sets harness = false, so '
+                'it runs a custom main and prints no libtest `test result:` '
+                'summary line. The rust verifier counts one summary per target '
+                'and would refuse every run; how many tests such a target '
+                'contains cannot be read from its output at all. Refusing instead'
+            )
+        if entry.get('required-features'):
+            raise langs_base.LangError(
+                f'the [[test]] target {entry["name"]!r} declares '
+                'required-features, so whether it builds at all depends on which '
+                'features the graded run enables rather than on anything written '
+                'in the manifest. A target that silently vanishes under the '
+                'default feature set is an ungraded part of the suite. Refusing '
+                'instead'
+            )
+        path = entry.get('path')
+        if isinstance(path, str):
+            auto.pop(path, None)
+        explicit.add(entry['name'])
+
+    return tuple(sorted(set(auto.values()) | explicit))
+
+
+def _rust_grader_metadata(plan: CarvePlan, dep_plan: DepPlan | None) -> dict:
+    """What the intact tree says about the rust suite, without asking the plan.
+
+    `integration_targets` is the under-enumeration guard's independent signal.
+    `corpus_count` is taken over the directory and glob the PLAN declares --
+    the plan is allowed to say WHERE its corpus is, but not how much of it
+    exists, so a declared corpus that is not there is caught rather than
+    rendering a gate that can never pass.
+    """
+    from .langs import rust as rust_lang
+
+    harness = rust_lang.read_harness(
+        dep_plan if dep_plan is not None else rust_lang.RUST_MEASURE_DEP_PLAN
+    )
+    corpus_count = 0
+    if harness.has_corpus:
+        corpus_root = plan.repo / harness.corpus_dir
+        corpus_count = len([
+            p for p in corpus_root.rglob(harness.corpus_pattern) if p.is_file()
+        ]) if corpus_root.is_dir() else 0
+    return {
+        'integration_targets': _cargo_integration_targets(plan.repo),
+        'corpus_count': corpus_count,
+    }
+
+
 def _java_carve_facts(plan: CarvePlan) -> langs_base.CarveFacts:
     """What the host knows about a java carve, for the warm stage's fossil scan.
 
@@ -1029,8 +1159,20 @@ def _candidate_validator(plugin, plan: CarvePlan):
     scripts are being written aborts a whole generate, while the same mismatch
     discovered here is one more resolver attempt with a precise message.
     """
-    if plan.lang not in ('cpp', 'java'):
+    if plan.lang not in ('cpp', 'java', 'rust'):
         return plugin.validate_dep_plan
+    if plan.lang == 'rust':
+        # Derived per CANDIDATE rather than once, because `corpus_count` is
+        # taken over the directory each candidate plan names -- a plan that
+        # points its corpus gate at a directory holding nothing has to be the
+        # one that gets refused.
+        def validate_rust(dep_plan: DepPlan) -> None:
+            plugin.validate_dep_plan(dep_plan)
+            plugin.assert_repo_agrees(
+                dep_plan, **_rust_grader_metadata(plan, dep_plan),
+            )
+
+        return validate_rust
     if plan.lang == 'java':
         # Derived here as well as at entry-writing time so a carve whose package
         # namespace cannot be established REFUSES before any image is built,
@@ -1073,12 +1215,20 @@ def _render_test_sh(plugin, plan: CarvePlan, graded_spec, carve_root: str,
         return plugin.render_test_sh(
             graded_spec, dep_plan=dep_plan, **_java_grader_metadata(plan),
         )
+    if plan.lang == 'rust':
+        return plugin.render_test_sh(
+            graded_spec,
+            dep_plan=dep_plan,
+            integration_targets=len(
+                _rust_grader_metadata(plan, dep_plan)['integration_targets']
+            ),
+        )
     return plugin.render_test_sh(graded_spec)
 
 
 def _measure_test_sh(plugin, plan: CarvePlan, dep_plan: DepPlan | None) -> str:
     """Phase 1's script. Only the harness-driven langs read the plan."""
-    if plan.lang in ('c', 'cpp', 'java'):
+    if plan.lang in ('c', 'cpp', 'java', 'rust'):
         return plugin.measure_test_sh(graded=plan.graded, dep_plan=dep_plan)
     return plugin.measure_test_sh(graded=plan.graded)
 
